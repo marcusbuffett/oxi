@@ -1,0 +1,35 @@
+[Event "Test Game 1"]
+[Site "Test"]
+[Date "2024.01.01"]
+[Round "1"]
+[White "Player1"]
+[Black "Player2"]
+[Result "1-0"]
+[WhiteElo "1500"]
+[BlackElo "1500"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 1-0
+
+[Event "Test Game 2"]
+[Site "Test"]
+[Date "2024.01.01"]
+[Round "2"]
+[White "Player3"]
+[Black "Player4"]
+[Result "0-1"]
+[WhiteElo "1600"]
+[BlackElo "1400"]
+
+1. e4 c5 2. Nf3 d6 3. d4 0-1
+
+[Event "Test Game 3"]
+[Site "Test"]
+[Date "2024.01.01"]
+[Round "3"]
+[White "Player5"]
+[Black "Player6"]
+[Result "1-0"]
+[WhiteElo "1550"]
+[BlackElo "1450"]
+
+1. d4 Nf6 2. c4 e6 3. Nc3 1-0

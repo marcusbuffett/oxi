@@ -1,0 +1,41 @@
+[Event "Rated Rapid game"]
+[Site "https://lichess.org/1234"]
+[Date "2023.01.01"]
+[Round "-"]
+[White "Player1"]
+[Black "Player2"]
+[Result "1-0"]
+[WhiteElo "1500"]
+[BlackElo "1600"]
+[TimeControl "600+0"]
+[Termination "Normal"]
+
+1. e4 { [%clk 0:09:58] } 1... e5 { [%clk 0:09:57] } 2. Nf3 { [%clk 0:09:55] } 2... Nc6 { [%clk 0:09:54] } 3. Bb5 { [%clk 0:09:52] } 3... a6 { [%clk 0:09:51] } 4. Ba4 { [%clk 0:09:49] } 4... Nf6 { [%clk 0:09:48] } 5. O-O { [%clk 0:09:46] } 5... Be7 { [%clk 0:09:45] } 6. Re1 { [%clk 0:09:43] } 6... b5 { [%clk 0:09:42] } 7. Bb3 { [%clk 0:09:40] } 7... O-O { [%clk 0:09:39] } 8. c3 { [%clk 0:09:37] } 8... d5 { [%clk 0:09:36] } 9. exd5 { [%clk 0:09:34] } 9... Nxd5 { [%clk 0:09:33] } 10. Nxe5 { [%clk 0:09:31] } 10... Nxe5 { [%clk 0:09:30] } 11. Rxe5 { [%clk 0:09:28] } 11... c6 { [%clk 0:09:27] } 12. d4 { [%clk 0:09:25] } 12... Bd6 { [%clk 0:09:24] } 13. Re1 { [%clk 0:09:22] } 13... Qh4 { [%clk 0:09:21] } 14. g3 { [%clk 0:09:19] } 14... Qh3 { [%clk 0:09:18] } 15. Re4 { [%clk 0:09:16] } 1-0
+
+[Event "Rated Rapid game"]
+[Site "https://lichess.org/5678"]
+[Date "2023.01.02"]
+[Round "-"]
+[White "Player3"]
+[Black "Player4"]
+[Result "0-1"]
+[WhiteElo "1400"]
+[BlackElo "1450"]
+[TimeControl "600+0"]
+[Termination "Normal"]
+
+1. d4 { [%clk 0:09:59] } 1... Nf6 { [%clk 0:09:58] } 2. c4 { [%clk 0:09:56] } 2... e6 { [%clk 0:09:55] } 3. Nc3 { [%clk 0:09:53] } 3... Bb4 { [%clk 0:09:52] } 4. Qc2 { [%clk 0:09:50] } 4... d5 { [%clk 0:09:49] } 5. cxd5 { [%clk 0:09:47] } 5... exd5 { [%clk 0:09:46] } 6. Bg5 { [%clk 0:09:44] } 6... h6 { [%clk 0:09:43] } 7. Bh4 { [%clk 0:09:41] } 7... c5 { [%clk 0:09:40] } 8. dxc5 { [%clk 0:09:38] } 8... g5 { [%clk 0:09:37] } 9. Bg3 { [%clk 0:09:35] } 9... Ne4 { [%clk 0:09:34] } 10. e3 { [%clk 0:09:32] } 10... Qa5 { [%clk 0:09:31] } 0-1
+
+[Event "Rated Rapid game"]
+[Site "https://lichess.org/9012"]
+[Date "2023.01.03"]
+[Round "-"]
+[White "Player5"]
+[Black "Player6"]
+[Result "1/2-1/2"]
+[WhiteElo "1550"]
+[BlackElo "1575"]
+[TimeControl "600+0"]
+[Termination "Normal"]
+
+1. e4 { [%clk 0:09:58] } 1... c5 { [%clk 0:09:57] } 2. Nf3 { [%clk 0:09:55] } 2... d6 { [%clk 0:09:54] } 3. d4 { [%clk 0:09:52] } 3... cxd4 { [%clk 0:09:51] } 4. Nxd4 { [%clk 0:09:49] } 4... Nf6 { [%clk 0:09:48] } 5. Nc3 { [%clk 0:09:46] } 5... a6 { [%clk 0:09:45] } 6. Be3 { [%clk 0:09:43] } 6... e5 { [%clk 0:09:42] } 7. Nb3 { [%clk 0:09:40] } 7... Be6 { [%clk 0:09:39] } 8. f3 { [%clk 0:09:37] } 8... Be7 { [%clk 0:09:36] } 9. Qd2 { [%clk 0:09:34] } 9... O-O { [%clk 0:09:33] } 10. O-O-O { [%clk 0:09:31] } 10... Nbd7 { [%clk 0:09:30] } 1/2-1/2

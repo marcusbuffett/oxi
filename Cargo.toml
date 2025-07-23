@@ -1,0 +1,45 @@
+[package]
+name = "oxi"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "oxi"
+path = "src/main.rs"
+
+
+[target.'cfg(target_os = "macos")'.dependencies]
+burn = { version = "0.18", features = ["default", "train", "metal"]}
+[target.'cfg(target_os = "linux")'.dependencies]
+burn = { version = "0.18", features = ["default", "train", "cuda"]}
+
+[dependencies]
+burn-train = "0.18"
+burn-ndarray = "0.18"
+burn-cuda = { version = "0.18", optional = true }
+burn-candle = "0.18"
+clap = { version = "*", features = ["derive"] }
+serde = { version = "*", features = ["derive"] }
+serde_yaml = "*"
+shakmaty = "*"
+pgn-reader = {git = "https://github.com/marcusbuffett/rust-pgn-reader", branch = "master"}
+tokio = { version = "*", features = ["full"] }
+indicatif = "*"
+anyhow = "*"
+tracing = "*"
+tracing-subscriber = "*"
+reqwest = { version = "*", features = ["json", "stream"] }
+flate2 = "*"
+zstd = "*"
+once_cell = "*"
+futures-util = "*"
+
+[dev-dependencies]
+tempfile = "*"
+burn-autodiff = "0.18"
+insta = "*"
+
+[features]
+default = []
+metal = []
+cuda = []
