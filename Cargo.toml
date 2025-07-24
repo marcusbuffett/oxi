@@ -33,6 +33,9 @@ flate2 = "*"
 zstd = "*"
 once_cell = "*"
 futures-util = "*"
+num_cpus = "*"
+rand = "*"
+statrs = "*"
 
 [dev-dependencies]
 tempfile = "*"

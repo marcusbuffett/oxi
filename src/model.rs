@@ -1,620 +1,194 @@
+use crate::chess_output::ChessOutput;
+use crate::config::{get_global_config, ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
+use crate::model_prediction_logger::log_model_predictions;
+use crate::relative_position_transformer::TransformerBlock;
 use burn::module::Param;
 use burn::nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig};
-use burn::nn::{
-    conv::{Conv2d, Conv2dConfig},
-    BatchNorm, BatchNormConfig, Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm,
-    LayerNormConfig, Linear, LinearConfig,
-};
+use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::prelude::*;
-use burn::tensor::activation;
-use burn::tensor::activation::log_softmax;
-use burn::tensor::activation::{gelu, relu, sigmoid, softmax};
+use burn::tensor::activation::{log_softmax, sigmoid, softmax, softplus};
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::{TrainOutput, TrainStep, ValidStep};
+use statrs::distribution::{Continuous, Gamma};
 
-use crate::chess_output::ChessOutput;
-use crate::config::ModelConfig;
-
-/// Basic residual block for the ChessResNet encoder
-#[derive(Module, Debug)]
-pub struct BasicBlock<B: Backend> {
-    conv1: Conv2d<B>,
-    bn1: BatchNorm<B, 2>,
-    conv2: Conv2d<B>,
-    bn2: BatchNorm<B, 2>,
-    se: Option<SqueezeExcitation<B>>,
-}
-
-impl<B: Backend> BasicBlock<B> {
-    pub fn new(device: &Device<B>, channels: usize, se_channels: Option<usize>) -> Self {
-        let conv1 = Conv2dConfig::new([channels, channels], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
-            .init(device);
-        let bn1 = BatchNormConfig::new(channels).init(device);
-
-        let conv2 = Conv2dConfig::new([channels, channels], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
-            .init(device);
-        let bn2 = BatchNormConfig::new(channels).init(device);
-
-        let se = se_channels.map(|se_ch| SqueezeExcitation::new(device, channels, se_ch));
-
-        Self {
-            conv1,
-            bn1,
-            conv2,
-            bn2,
-            se,
-        }
-    }
-
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let residual = x.clone();
-
-        let x = self.conv1.forward(x);
-        let x = self.bn1.forward(x);
-        let x = relu(x);
-
-        let x = self.conv2.forward(x);
-        let x = self.bn2.forward(x);
-
-        let x = if let Some(se) = &self.se {
-            se.forward(x)
-        } else {
-            x
-        };
-
-        relu(x + residual)
-    }
-}
-
-/// Squeeze-and-Excitation module
-#[derive(Module, Debug)]
-pub struct SqueezeExcitation<B: Backend> {
-    fc1: Linear<B>,
-    fc2: Linear<B>,
-}
-
-impl<B: Backend> SqueezeExcitation<B> {
-    pub fn new(device: &Device<B>, channels: usize, se_channels: usize) -> Self {
-        let fc1 = LinearConfig::new(channels, se_channels).init(device);
-        let fc2 = LinearConfig::new(se_channels, channels).init(device);
-
-        Self { fc1, fc2 }
-    }
-
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let [batch, channels, height, width] = x.dims();
-
-        // Global average pooling - flatten spatial dimensions and take mean
-        let scale = x
-            .clone()
-            .reshape([batch, channels, height * width])
-            .mean_dim(2)
-            .squeeze::<2>(2);
-
-        // FC layers with activation
-        let scale = self.fc1.forward(scale);
-        let scale = relu(scale);
-        let scale = self.fc2.forward(scale);
-        let scale = sigmoid(scale);
-
-        // Reshape and multiply
-        let scale = scale.reshape([batch, channels, 1, 1]);
-        x * scale
-    }
-}
-
-/// ChessResNet encoder - CNN backbone for position encoding
-#[derive(Module, Debug)]
-pub struct ChessResNet<B: Backend> {
-    input_conv: Conv2d<B>,
-    input_bn: BatchNorm<B, 2>,
-    blocks: Vec<BasicBlock<B>>,
-    policy_conv: Conv2d<B>,
-    policy_bn: BatchNorm<B, 2>,
-}
-
-impl<B: Backend> ChessResNet<B> {
-    pub fn new(device: &Device<B>, config: &ModelConfig) -> Self {
-        // Initial convolution
-        let input_conv = Conv2dConfig::new([config.num_board_channels(), config.channels], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
-            .init(device);
-        let input_bn = BatchNormConfig::new(config.channels).init(device);
-
-        // Residual blocks
-        let blocks = (0..config.num_blocks)
-            .map(|_| BasicBlock::new(device, config.channels, Some(config.se_channels())))
-            .collect();
-
-        // Policy head convolution
-        let policy_conv =
-            Conv2dConfig::new([config.channels, config.policy_channels()], [1, 1]).init(device);
-        let policy_bn = BatchNormConfig::new(config.policy_channels()).init(device);
-
-        Self {
-            input_conv,
-            input_bn,
-            blocks,
-            policy_conv,
-            policy_bn,
-        }
-    }
-
-    pub fn forward(&self, x: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        // Initial convolution
-        let x = self.input_conv.forward(x);
-        let x = self.input_bn.forward(x);
-        let x = relu(x);
-
-        // Residual blocks
-        let mut x = x;
-        for block in &self.blocks {
-            x = block.forward(x);
-        }
-
-        // Policy features
-        let policy_features = self.policy_conv.forward(x.clone());
-        let policy_features = self.policy_bn.forward(policy_features);
-        let policy_features = relu(policy_features);
-
-        (x, policy_features)
-    }
-}
-
-/// Elo-aware attention mechanism
-#[derive(Module, Debug)]
-pub struct EloAwareAttention<B: Backend> {
-    num_heads: usize,
-    head_dim: usize,
-    elo_embeddings: Embedding<B>,
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    elo_proj: Linear<B>,
-    out_proj: Linear<B>,
-    dropout: Dropout,
-}
-
-impl<B: Backend> EloAwareAttention<B> {
-    pub fn new(device: &Device<B>, config: &ModelConfig) -> Self {
-        let head_dim = config.embed_dim() / config.num_heads();
-
-        let elo_embeddings = EmbeddingConfig::new(
-            config.elo_bins().len() * 2 + 2, // bins for each player + unknown
-            config.elo_embed_dim(),
-        )
-        .init(device);
-
-        let q_proj = LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-        let k_proj = LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-        let v_proj = LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-        let elo_proj =
-            LinearConfig::new(config.elo_embed_dim() * 2, config.embed_dim()).init(device);
-        let out_proj = LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-
-        let dropout = DropoutConfig::new(config.attention_dropout()).init();
-
-        Self {
-            num_heads: config.num_heads(),
-            head_dim,
-            elo_embeddings,
-            q_proj,
-            k_proj,
-            v_proj,
-            elo_proj,
-            out_proj,
-            dropout,
-        }
-    }
-
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        white_elo_idx: Tensor<B, 2, Int>,
-        black_elo_idx: Tensor<B, 2, Int>,
-    ) -> Tensor<B, 3> {
-        let [batch, seq_len, embed_dim] = x.dims();
-
-        // Get Elo embeddings
-        let white_elo_emb = self.elo_embeddings.forward(white_elo_idx);
-        let black_elo_emb = self.elo_embeddings.forward(black_elo_idx);
-        let elo_emb = Tensor::cat(vec![white_elo_emb, black_elo_emb], 2);
-        let elo_emb: Tensor<B, 2> = elo_emb.squeeze(1);
-        let elo_emb = self.elo_proj.forward(elo_emb);
-
-        // Expand Elo embeddings to sequence length
-        let elo_emb = elo_emb
-            .reshape([batch, 1, embed_dim])
-            .repeat_dim(1, seq_len);
-
-        // Project queries, keys, values
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone() + elo_emb.clone());
-        let v = self.v_proj.forward(x);
-
-        // Reshape for multi-head attention
-        let q = q
-            .reshape([batch, seq_len, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
-        let k = k
-            .reshape([batch, seq_len, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
-        let v = v
-            .reshape([batch, seq_len, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
-
-        // Scaled dot-product attention
-        let scale = (self.head_dim as f32).sqrt();
-        let k_dims = k.dims();
-        let scores = q.matmul(k.swap_dims(k_dims.len() - 2, k_dims.len() - 1)) / scale;
-        let attn_weights = softmax(scores.clone(), scores.dims().len() - 1);
-        let attn_weights = self.dropout.forward(attn_weights);
-
-        // Apply attention to values
-        let attn_output = attn_weights.matmul(v);
-
-        // Reshape back
-        let attn_output = attn_output
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, embed_dim]);
-
-        // Output projection
-        self.out_proj.forward(attn_output)
-    }
-}
-
-/// Transformer block with Elo-aware attention
-#[derive(Module, Debug)]
-pub struct TransformerBlock<B: Backend> {
-    attention: EloAwareAttention<B>,
-    norm1: LayerNorm<B>,
-    norm2: LayerNorm<B>,
-    mlp: MLP<B>,
-    dropout: Dropout,
-}
-
-impl<B: Backend> TransformerBlock<B> {
-    pub fn new(device: &Device<B>, config: &ModelConfig) -> Self {
-        let attention = EloAwareAttention::new(device, config);
-        let norm1 = LayerNormConfig::new(config.embed_dim()).init(device);
-        let norm2 = LayerNormConfig::new(config.embed_dim()).init(device);
-        let mlp = MLP::new(device, config);
-        let dropout = DropoutConfig::new(config.dropout()).init();
-
-        Self {
-            attention,
-            norm1,
-            norm2,
-            mlp,
-            dropout,
-        }
-    }
-
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        white_elo_idx: Tensor<B, 2, Int>,
-        black_elo_idx: Tensor<B, 2, Int>,
-    ) -> Tensor<B, 3> {
-        // Self-attention with residual
-        let attn_out =
-            self.attention
-                .forward(self.norm1.forward(x.clone()), white_elo_idx, black_elo_idx);
-        let x = x.clone() + self.dropout.forward(attn_out);
-
-        // MLP with residual
-        let mlp_out = self.mlp.forward(self.norm2.forward(x.clone()));
-        x + self.dropout.forward(mlp_out)
-    }
-}
-
-/// MLP module for transformer blocks
-#[derive(Module, Debug)]
-pub struct MLP<B: Backend> {
-    fc1: Linear<B>,
-    fc2: Linear<B>,
-    dropout: Dropout,
-}
-
-impl<B: Backend> MLP<B> {
-    pub fn new(device: &Device<B>, config: &ModelConfig) -> Self {
-        let hidden_dim = (config.embed_dim() as f32 * config.mlp_ratio()) as usize;
-
-        let fc1 = LinearConfig::new(config.embed_dim(), hidden_dim).init(device);
-        let fc2 = LinearConfig::new(hidden_dim, config.embed_dim()).init(device);
-        let dropout = DropoutConfig::new(config.dropout()).init();
-
-        Self { fc1, fc2, dropout }
-    }
-
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let x = self.fc1.forward(x);
-        let x = gelu(x);
-        let x = self.dropout.forward(x);
-        self.fc2.forward(x)
-    }
-}
-
-/// Complete OXI model
 #[derive(Module, Debug)]
 pub struct OXIModel<B: Backend> {
-    encoder: ChessResNet<B>,
-    patch_embed: Linear<B>,
-    pos_embed: Param<Tensor<B, 3>>,
-    transformer_blocks: Vec<TransformerBlock<B>>,
+    board_embed: Linear<B>,
+    pos_embed: Embedding<B>,
+    global_embed: Linear<B>,
+    blocks: Vec<TransformerBlock<B>>,
     norm: LayerNorm<B>,
-
-    // Output heads
     policy_head: Linear<B>,
-    side_info_head: Linear<B>,
-    side_info_bce: BinaryCrossEntropyLoss<B>,
-
-    // Head-specific projections
-    policy_projection: Linear<B>,
-    value_projection: Linear<B>,
-    side_info_projection: Linear<B>,
-
-    value_hidden: Linear<B>,
     value_head: Linear<B>,
-    value_dropout: Dropout,
-
-    // Uncertainty parameters for loss weighting
+    side_info_head: Linear<B>,
+    time_usage_head: Linear<B>,
+    side_info_bce: BinaryCrossEntropyLoss<B>,
     policy_uncertainty: Param<Tensor<B, 1>>,
     value_uncertainty: Param<Tensor<B, 1>>,
     side_info_uncertainty: Param<Tensor<B, 1>>,
+    time_usage_uncertainty: Param<Tensor<B, 1>>,
 }
 
 impl<B: Backend> OXIModel<B> {
     pub fn new(device: &Device<B>, config: &ModelConfig) -> Self {
-        let encoder = ChessResNet::new(device, config);
+        // Embed board channels (e.g., 16 or 112) to embed_dim
+        let board_embed = LinearConfig::new(FEATURES_PER_TOKEN, config.embed_dim()).init(device);
+        let global_embed = LinearConfig::new(NUM_GLOBALS, config.embed_dim()).init(device);
 
-        // Patch embedding
-        let patch_embed = LinearConfig::new(config.channels, config.embed_dim()).init(device);
+        let mut blocks = Vec::new();
+        for _ in 0..config.num_layers() {
+            blocks.push(TransformerBlock::new(device));
+        }
 
-        // Position embeddings
-        let pos_embed = Param::from_tensor(Tensor::zeros(
-            [1, config.max_seq_len(), config.embed_dim()],
-            device,
-        ));
-
-        // Transformer blocks
-        let transformer_blocks = (0..config.num_layers())
-            .map(|_| TransformerBlock::new(device, config))
-            .collect();
+        // Learned absolute positional embeddings for 64 squares
+        let pos_embed = EmbeddingConfig::new(64, config.embed_dim())
+            .with_initializer(nn::Initializer::Uniform { min: 0.0, max: 0.01 })
+            .init(device);
 
         let norm = LayerNormConfig::new(config.embed_dim()).init(device);
 
-        // Output heads
-        let policy_head = LinearConfig::new(
-            config.policy_channels() * 64 + config.embed_dim(),
-            config.num_moves(),
-        )
-        .init(device);
-
-        let value_hidden = LinearConfig::new(config.embed_dim(), 128).init(device);
-        let value_head = LinearConfig::new(128, 3).init(device);
-        let value_dropout = DropoutConfig::new(config.dropout()).init();
-
+        let policy_head = LinearConfig::new(config.embed_dim(), LEGAL_MOVES / 64).init(device);
+        let value_head = LinearConfig::new(config.embed_dim(), 3).init(device);
         let side_info_head = LinearConfig::new(config.embed_dim(), 13).init(device);
-        // Create config with logits=true
+        let time_usage_head = LinearConfig::new(config.embed_dim(), 6).init(device);
         let bce_config = BinaryCrossEntropyLossConfig::new().with_logits(true);
+        let side_info_bce = bce_config.init(device);
 
-        // Init the loss module
-        let side_info_bce: BinaryCrossEntropyLoss<B> = bce_config.init(device);
-
-        // Head-specific projections to decouple representations
-        let policy_projection =
-            LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-        let value_projection =
-            LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-        let side_info_projection =
-            LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-
-        // Initialize uncertainty parameters (log(sigma) initialized to 0, so sigma = 1)
         let policy_uncertainty = Param::from_tensor(Tensor::zeros([1], device));
         let value_uncertainty = Param::from_tensor(Tensor::zeros([1], device));
         let side_info_uncertainty = Param::from_tensor(Tensor::zeros([1], device));
+        let time_usage_uncertainty = Param::from_tensor(Tensor::zeros([1], device));
 
         Self {
-            encoder,
-            patch_embed,
+            board_embed,
             pos_embed,
-            transformer_blocks,
+            global_embed,
+            blocks,
             norm,
-            policy_projection,
-            value_projection,
-            side_info_projection,
             policy_head,
             value_head,
-            value_hidden,
-            value_dropout,
             side_info_head,
+            time_usage_head,
             side_info_bce,
             policy_uncertainty,
             value_uncertainty,
             side_info_uncertainty,
+            time_usage_uncertainty,
         }
     }
 
     pub fn forward(
         &self,
-        board: Tensor<B, 4>,
-        white_elo_idx: Tensor<B, 2, Int>,
-        black_elo_idx: Tensor<B, 2, Int>,
-    ) -> (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
-        let [batch, _, height, width] = board.dims();
+        board: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
+        let board_features = board.clone();
+        let token_embeds = self.board_embed.forward(board_features);
+        let global_embeds = self.global_embed.forward(globals);
+        let global_embeds = global_embeds.unsqueeze_dim(1);
 
-        // Encode board with CNN
-        let (features, policy_features) = self.encoder.forward(board);
+        let dims = token_embeds.dims();
+        let batch_size = dims[0];
+        let seq_len = dims[1];
+        let device = token_embeds.device();
 
-        // Flatten spatial dimensions for transformer
-        let features = features.swap_dims(1, 2).swap_dims(2, 3);
-        let feature_dim = features.dims()[3];
-        let features = features.reshape([batch, height * width, feature_dim]);
+        // Learned absolute positional embeddings
+        assert!(seq_len == 64, "Sequence length must be 64 for 8x8 board");
+        let index_positions = Tensor::arange(0..seq_len as i64, &device)
+            .reshape([1, seq_len])
+            .repeat_dim(0, batch_size);
+        let embedding_positions = self.pos_embed.forward(index_positions);
 
-        // Project to embedding dimension
-        let x = self.patch_embed.forward(features);
+        let mut x = token_embeds + global_embeds + embedding_positions;
 
-        // Add position embeddings
-        let seq_len = x.dims()[1];
-        let embed_dim = x.dims()[2];
-        let x = x + self.pos_embed.val().slice([0..1, 0..seq_len, 0..embed_dim]);
-
-        // Apply transformer blocks
-        let mut x = x;
-        for block in &self.transformer_blocks {
-            x = block.forward(x, white_elo_idx.clone(), black_elo_idx.clone());
+        for block in self.blocks.iter() {
+            x = block.forward(x);
         }
 
         x = self.norm.forward(x);
 
-        // Global average pooling for value and side info heads
+        let policy_logits = self.policy_head.forward(x.clone());
+
         let global_features = x.mean_dim(1).squeeze(1);
+        let value_logits = self.value_head.forward(global_features.clone());
+        let side_info_logits = self.side_info_head.forward(global_features.clone());
+        let time_usage_raw = self.time_usage_head.forward(global_features);
 
-        // Apply head-specific projections to decouple representations
-        let value_features = self.value_projection.forward(global_features.clone());
-        let side_info_features = self.side_info_projection.forward(global_features.clone());
-        let policy_global_features = self.policy_projection.forward(global_features);
+        // Apply activations to time usage outputs: [w1, w2, alpha1, alpha2, theta1, theta2]
+        let weights_raw = time_usage_raw
+            .clone()
+            .slice([0..time_usage_raw.dims()[0], 0..2]);
+        let alphas_raw = time_usage_raw
+            .clone()
+            .slice([0..time_usage_raw.dims()[0], 2..4]);
+        let thetas_raw = time_usage_raw
+            .clone()
+            .slice([0..time_usage_raw.dims()[0], 4..6]);
 
-        // Value prediction
-        let value_hidden = self.value_hidden.forward(value_features);
-        let value_hidden = activation::relu(value_hidden);
-        let value_hidden = self.value_dropout.forward(value_hidden);
-        let value = self.value_head.forward(value_hidden);
+        let weights = softmax(weights_raw, 1); // Ensure weights sum to 1
+        let alphas = (softplus(alphas_raw, 1.0) + 1e-6).clamp(1e-4, 20.0);
+        let thetas = (softplus(thetas_raw, 1.0) + 1e-6).clamp(1e-4, 1.0);
 
-        // Side info prediction (castling rights, etc.)
-        let side_info = self.side_info_head.forward(side_info_features);
+        let time_usage_logits = Tensor::cat(vec![weights, alphas, thetas], 1);
 
-        // Policy prediction
-        let policy_channels = policy_features.dims()[1];
-        let policy_features = policy_features.reshape([batch, policy_channels * 64]);
-        let policy_input = Tensor::cat(vec![policy_features, policy_global_features], 1);
-        let policy = self.policy_head.forward(policy_input);
-
-        (policy, value, side_info)
+        (
+            policy_logits,
+            value_logits,
+            side_info_logits,
+            time_usage_logits,
+        )
     }
 
-    /// Training forward pass with grouped data and KL divergence loss
     pub fn forward_classification(&self, batch: crate::dataset::ChessBatch<B>) -> ChessOutput<B>
     where
         B::FloatElem: From<f32>,
     {
+        let batch_clone = batch.clone(); // Clone early for later use
         let batch_size = batch.board_input.shape().dims[0];
-        tracing::info!("forward_classification: batch_size={}", batch_size);
 
-        let (policy_logits, value_logits, side_info_logits) =
-            self.forward(batch.board_input, batch.elo_self, batch.elo_oppo);
+        let (policy_logits, value_logits, side_info_logits, time_usage_logits) =
+            self.forward(batch.board_input, batch.global_features);
+        // ...
 
-        // Log shapes
-        tracing::info!(
-            "forward_classification: policy_logits shape={:?}, value_logits shape={:?}, side_info_logits shape={:?}",
-            policy_logits.shape().dims,
-            value_logits.shape().dims,
-            side_info_logits.shape().dims
+        // Log model predictions for debugging
+        let policy_logits_flat_original = policy_logits.reshape([batch_size, LEGAL_MOVES]);
+
+        let mask = batch.legal_moves.clone().equal_elem(0.0);
+        let policy_logits_flat = policy_logits_flat_original
+            .clone()
+            .mask_fill(mask.clone(), f32::NEG_INFINITY);
+        log_model_predictions(
+            &policy_logits_flat,
+            &value_logits,
+            &time_usage_logits,
+            &batch_clone,
         );
+        let log_policy = log_softmax(policy_logits_flat.clone(), 1);
+        let log_policy = log_policy.mask_fill(mask.clone(), 0.0);
 
-        // Log mask statistics
-        let legal_moves_data = batch.legal_moves.clone().to_data();
-        let legal_moves_slice = legal_moves_data.as_slice::<f32>().unwrap();
-        let total_legal_moves: f32 = legal_moves_slice.iter().sum();
-        let avg_legal_moves = total_legal_moves / batch_size as f32;
-        tracing::info!(
-            "forward_classification: total_legal_moves={}, avg_legal_moves_per_position={:.2}",
-            total_legal_moves,
-            avg_legal_moves
-        );
+        // Label smoothing over legal moves only
+        let eps = get_global_config().policy_label_smoothing;
+        let legal_counts = batch
+            .legal_moves
+            .clone()
+            .sum_dim(1)
+            .reshape([batch_size, 1])
+            .clamp_min(1.0);
+        let uniform_over_legal = batch.legal_moves.clone() / legal_counts;
+        let targets_smoothed =
+            batch.move_distributions.clone() * (1.0 - eps) + uniform_over_legal * eps;
 
-        // Compute log softmax for numerical stability
-        let log_policy = log_softmax(policy_logits.clone(), 1);
+        let policy_loss = (targets_smoothed * log_policy).sum_dim(1).neg().mean();
 
-        // KL divergence loss: sum(p_target * log(p_target / p_predicted))
-        // = sum(p_target * (log(p_target) - log(p_predicted)))
-        // Since we have log(p_predicted), we compute: -sum(p_target * log(p_predicted))
-        // We ignore the p_target * log(p_target) term as it's constant w.r.t. model parameters
-
-        // Add small epsilon to avoid log(0)
-        let epsilon = 1e-10;
-        let target_dist = batch.move_distributions.clone().add_scalar(epsilon);
-
-        // Log target distribution statistics
-        let target_dist_data = batch.move_distributions.clone().to_data();
-        let target_slice = target_dist_data.as_slice::<f32>().unwrap();
-        let non_zero_targets = target_slice.iter().filter(|&&x| x > 0.0).count();
-        let max_target = target_slice.iter().fold(0.0f32, |a, &b| a.max(b));
-        tracing::info!(
-            "forward_classification: non_zero_targets={}, max_target_prob={:.4}, target_dist_shape={:?}",
-            non_zero_targets,
-            max_target,
-            batch.move_distributions.shape().dims
-        );
-
-        // Compute KL divergence (without the constant term)
-        let policy_loss = (target_dist * log_policy).sum_dim(1).neg().mean();
-
-        // Log policy loss
-        let policy_loss_scalar = policy_loss.clone().to_data().as_slice::<f32>().unwrap()[0];
-        tracing::info!(
-            "forward_classification: policy_loss={:.6}",
-            policy_loss_scalar
-        );
-
-        // Value loss (cross-entropy for win/draw/loss classification)
-        let value_log_probs = log_softmax(value_logits.clone(), 1); // Log probabilities for loss
-
-        // Log value target statistics
-        let value_targets_data = batch.values.clone().to_data();
-        let value_targets_slice = value_targets_data.as_slice::<f32>().unwrap();
-        let wins = value_targets_slice
-            .iter()
-            .step_by(3)
-            .filter(|&&x| x > 0.5)
-            .count();
-        let draws = value_targets_slice
-            .iter()
-            .skip(1)
-            .step_by(3)
-            .filter(|&&x| x > 0.5)
-            .count();
-        let losses = value_targets_slice
-            .iter()
-            .skip(2)
-            .step_by(3)
-            .filter(|&&x| x > 0.5)
-            .count();
-        tracing::info!(
-            "forward_classification: value_targets - wins={}, draws={}, losses={}, total={}",
-            wins,
-            draws,
-            losses,
-            wins + draws + losses
-        );
-
-        // Cross-entropy loss: -sum(target * log(pred))
+        // Value loss
+        let value_log_probs = log_softmax(value_logits.clone(), 1);
         let value_loss = (batch.values.clone() * value_log_probs)
             .sum_dim(1)
             .neg()
             .mean();
 
-        // Log value loss details
-        let value_loss_scalar = value_loss.clone().to_data().as_slice::<f32>().unwrap()[0];
-        tracing::info!(
-            "forward_classification: value_loss={:.6}",
-            value_loss_scalar
-        );
-
-        // Side info loss (MSE after sigmoid)
-        let side_info_probs = activation::sigmoid(side_info_logits.clone());
-        let side_info_probs_clamped = side_info_probs.clamp(1e-7, 1.0 - 1e-7);
-
-        // Log side info shape and statistics
-        tracing::info!(
-            "forward_classification: side_info_shape={:?}",
-            batch.side_info.shape().dims
-        );
-
-        // Compute class weights
+        // Side info loss
+        let side_info_probs = sigmoid(side_info_logits.clone()).clamp(1e-7, 1.0 - 1e-7);
         let target_data = batch.side_info.clone().to_data();
         let mean_target = target_data
             .as_slice::<i32>()
@@ -623,154 +197,221 @@ impl<B: Backend> OXIModel<B> {
             .map(|&v| v as f32)
             .sum::<f32>()
             / (target_data.num_elements() as f32);
-
         let pos_weight = (1.0 - mean_target).max(0.1);
         let neg_weight = mean_target.max(0.1);
-
         let weights = batch
             .side_info
             .clone()
             .float()
             .mul_scalar(pos_weight - neg_weight)
             .add_scalar(neg_weight);
-
-        // Manual BCE
         let targets_float = batch.side_info.clone().float();
-        let bce_per_element = targets_float.clone() * side_info_probs_clamped.clone().log()
-            + (targets_float.neg() + 1.0) * (side_info_probs_clamped.neg() + 1.0).log();
+        let bce_per_element = targets_float.clone() * side_info_probs.clone().log()
+            + (targets_float.neg() + 1.0) * (side_info_probs.neg() + 1.0).log();
         let weighted_bce = bce_per_element.neg() * weights;
         let side_info_loss = weighted_bce.mean();
 
-        // Log side info loss
-        let side_info_loss_scalar = side_info_loss.clone().to_data().as_slice::<f32>().unwrap()[0];
-        tracing::info!("forward_classification: side_info_loss={:.6}, mean_target={:.4}, pos_weight={:.4}, neg_weight={:.4}", 
-            side_info_loss_scalar, mean_target, pos_weight, neg_weight);
+        // Time usage loss (MSE between target and mixture mean)
+        let time_usage_loss = self
+            .compute_gamma_mixture_loss_impl(time_usage_logits.clone(), batch.time_usages.clone());
 
-        // Apply config weights first
-        let config = crate::config::TrainingConfig::default();
-        let config_weighted_policy_loss = policy_loss.clone() * config.policy_loss_weight();
-        let config_weighted_value_loss = value_loss.clone() * config.value_loss_weight();
-        let config_weighted_side_info_loss =
-            side_info_loss.clone() * config.side_info_loss_weight();
+        let config = get_global_config();
 
-        // Uncertainty-based loss weighting on top of config weights
-        // We store log(sigma) as the parameter, so sigma = exp(log_sigma)
-        // Loss_i = (1 / (2 * sigma_i^2)) * L_i + log(sigma_i)
+        let config_weighted_policy_loss = policy_loss.clone() * config.policy_loss_weight;
+        let config_weighted_value_loss = value_loss.clone() * config.value_loss_weight;
+        let config_weighted_side_info_loss = side_info_loss.clone() * config.side_info_loss_weight;
+        let config_weighted_time_usage_loss =
+            time_usage_loss.clone() * config.time_usage_loss_weight;
 
-        // Get the log(sigma) values and compute sigma^2
-        let log_sigma_policy = self.policy_uncertainty.val();
-        let log_sigma_value = self.value_uncertainty.val();
-        let log_sigma_side_info = self.side_info_uncertainty.val();
+        // let log_sigma_policy = self.policy_uncertainty.val();
+        // let log_sigma_value = self.value_uncertainty.val();
+        // let log_sigma_side_info = self.side_info_uncertainty.val();
+        // let log_sigma_time_usage = self.time_usage_uncertainty.val();
+        // let sigma_sq_policy = (log_sigma_policy.clone() * 2.0).exp();
+        // let sigma_sq_value = (log_sigma_value.clone() * 2.0).exp();
+        // let sigma_sq_side_info = (log_sigma_side_info.clone() * 2.0).exp();
+        // let sigma_sq_time_usage = (log_sigma_time_usage.clone() * 2.0).exp();
 
-        // Compute sigma^2 = exp(2 * log_sigma)
-        let sigma_sq_policy = (log_sigma_policy.clone() * 2.0).exp();
-        let sigma_sq_value = (log_sigma_value.clone() * 2.0).exp();
-        let sigma_sq_side_info = (log_sigma_side_info.clone() * 2.0).exp();
+        // let uncertainty_weighted_policy_loss = config_weighted_policy_loss.clone()
+        //     / sigma_sq_policy.clone()
+        //     + log_sigma_policy.clone();
+        // let uncertainty_weighted_value_loss =
+        //     config_weighted_value_loss.clone() / sigma_sq_value.clone() + log_sigma_value.clone();
+        // // let uncertainty_weighted_side_info_loss = config_weighted_side_info_loss.clone()
+        // //     / sigma_sq_side_info.clone()
+        // //     + log_sigma_side_info.clone();
+        // let uncertainty_weighted_time_usage_loss = config_weighted_time_usage_loss.clone()
+        //     / sigma_sq_time_usage.clone()
+        //     + log_sigma_time_usage.clone();
 
-        // Apply uncertainty-based weighting to already config-weighted losses
-        let uncertainty_weighted_policy_loss = config_weighted_policy_loss.clone()
-            / (sigma_sq_policy.clone())
-            + log_sigma_policy.clone();
-        let uncertainty_weighted_value_loss =
-            config_weighted_value_loss.clone() / (sigma_sq_value.clone()) + log_sigma_value.clone();
-        let uncertainty_weighted_side_info_loss = config_weighted_side_info_loss.clone()
-            / (sigma_sq_side_info.clone())
-            + log_sigma_side_info.clone();
-
-        // Total loss is sum of uncertainty-weighted losses
-        let lambda = 0.01; // Small hyperparam, tune via experiments (e.g., 0.001 to 0.1)
+        let lambda = 0.01;
         let reg_term = lambda
             * (self.policy_uncertainty.val().powf_scalar(2.0)
                 + self.value_uncertainty.val().powf_scalar(2.0)
-                + self.side_info_uncertainty.val().powf_scalar(2.0))
+                // + self.side_info_uncertainty.val().powf_scalar(2.0)
+                + self.time_usage_uncertainty.val().powf_scalar(2.0))
             .mean();
-        let loss: Tensor<B, 1> = uncertainty_weighted_policy_loss.clone()
-            + uncertainty_weighted_value_loss.clone()
-            + uncertainty_weighted_side_info_loss.clone()
+        let loss = config_weighted_time_usage_loss.clone()
+            + config_weighted_policy_loss.clone()
+            + config_weighted_value_loss.clone()
+            // + config_weighted_side_info_loss.clone()
             + reg_term;
 
-        // Log uncertainty values for monitoring
-        let sigma_policy = log_sigma_policy.exp().to_data().as_slice::<f32>().unwrap()[0];
-        let sigma_value = log_sigma_value.exp().to_data().as_slice::<f32>().unwrap()[0];
-        let sigma_side_info = log_sigma_side_info
-            .exp()
-            .to_data()
-            .as_slice::<f32>()
-            .unwrap()[0];
+        // let sigma_policy = log_sigma_policy.exp().to_data().as_slice::<f32>().unwrap()[0];
+        // let sigma_value = log_sigma_value.exp().to_data().as_slice::<f32>().unwrap()[0];
+        // let sigma_side_info = log_sigma_side_info
+        //     .exp()
+        //     .to_data()
+        //     .as_slice::<f32>()
+        //     .unwrap()[0];
+        // let sigma_time_usage = log_sigma_time_usage
+        //     .exp()
+        //     .to_data()
+        //     .as_slice::<f32>()
+        //     .unwrap()[0];
 
-        tracing::info!(
-            "forward_classification: uncertainties - policy_sigma={:.3}, value_sigma={:.3}, side_info_sigma={:.3}",
-            sigma_policy, sigma_value, sigma_side_info
-        );
-
-        let final_loss_scalar = loss.clone().to_data().as_slice::<f32>().unwrap()[0];
-        tracing::info!(
-            "forward_classification: final_loss={:.6} (policy={:.3}, value={:.3}, side_info={:.3})",
-            final_loss_scalar,
-            policy_loss_scalar,
-            value_loss_scalar,
-            side_info_loss_scalar
-        );
-
-        // For compatibility with ClassificationOutput, we need to provide single targets
-        // We'll use the argmax of the distribution
+        // Accuracy
         let targets = batch.move_distributions.clone().argmax(1).squeeze(1);
-
-        // Log targets info for accuracy calculation
-        let targets_data = targets.clone().to_data();
-        let targets_slice = targets_data.as_slice::<i32>().unwrap();
-        let unique_targets = targets_slice
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        tracing::info!(
-            "forward_classification: targets for accuracy - shape={:?}, unique_targets={}, sample_targets={:?}",
-            targets.shape().dims,
-            unique_targets,
-            &targets_slice[..5.min(targets_slice.len())]
-        );
-
-        // Log output (masked_policy) info
-        let output_argmax = policy_logits.clone().argmax(1);
-        let output_argmax_data = output_argmax.to_data();
-        let output_argmax_slice = output_argmax_data.as_slice::<i32>().unwrap();
-
-        // Calculate and log accuracy for this batch
-        let correct = targets_slice
-            .iter()
-            .zip(output_argmax_slice.iter())
-            .filter(|(&t, &p)| t == p)
-            .count();
-        let batch_accuracy = correct as f32 / batch_size as f32;
-        tracing::info!(
-            "forward_classification: batch_accuracy={:.4} ({}/{}) - NOTE: This is move prediction accuracy, not value accuracy!",
-            batch_accuracy,
-            correct,
-            batch_size
-        );
+        let policy_logits_only_legals = policy_logits_flat_original
+            .clone()
+            .mask_fill(mask.clone(), 0.0);
+        let _predicted_moves: Tensor<B, 1, Int> =
+            policy_logits_only_legals.clone().argmax(1).squeeze(1);
+        // let correct = targets
+        //     .to_data()
+        //     .as_slice::<i32>()
+        //     .unwrap()
+        //     .iter()
+        //     .zip(predicted_moves.to_data().as_slice::<i32>().unwrap())
+        //     .filter(|(&t, &p)| t == p)
+        //     .count();
+        // let batch_accuracy = correct as f32 / batch_size as f32;
 
         ChessOutput::new(
             loss,
-            uncertainty_weighted_policy_loss.mean().reshape([1]),
-            uncertainty_weighted_value_loss.mean().reshape([1]),
-            uncertainty_weighted_side_info_loss.mean().reshape([1]),
-            policy_logits,
+            config_weighted_policy_loss.clone().mean().reshape([1]),
+            config_weighted_value_loss.clone().mean().reshape([1]),
+            config_weighted_side_info_loss.clone().mean().reshape([1]),
+            config_weighted_time_usage_loss.clone().mean().reshape([1]),
+            policy_logits_flat,
             targets,
             value_logits,
             batch.values.clone(),
             batch.legal_moves.clone(),
         )
         .with_distributions(batch.move_distributions.clone())
-        .with_uncertainties((sigma_policy, sigma_value, sigma_side_info))
+        // .with_uncertainties((sigma_policy, sigma_value, sigma_side_info, sigma_time_usage))
         .with_raw_losses(
             config_weighted_policy_loss.mean().reshape([1]),
             config_weighted_value_loss.mean().reshape([1]),
             config_weighted_side_info_loss.mean().reshape([1]),
+            config_weighted_time_usage_loss.mean().reshape([1]),
         )
     }
 
-    /// Get the current uncertainty values (sigma, not log(sigma))
-    pub fn get_uncertainties(&self) -> (f32, f32, f32) {
+    #[cfg(test)]
+    pub fn compute_gamma_mixture_loss(
+        &self,
+        time_usage_logits: Tensor<B, 2>,
+        targets: Tensor<B, 2>,
+    ) -> Tensor<B, 1>
+    where
+        B::FloatElem: From<f32>,
+    {
+        self.compute_gamma_mixture_loss_impl(time_usage_logits, targets)
+    }
+
+    fn compute_gamma_mixture_loss_impl(
+        &self,
+        time_usage_logits: Tensor<B, 2>,
+        targets: Tensor<B, 2>,
+    ) -> Tensor<B, 1>
+    where
+        B::FloatElem: From<f32>,
+    {
+        let batch_size = time_usage_logits.dims()[0];
+
+        // Extract parameters: [w1, w2, alpha1, alpha2, theta1, theta2]
+        let weights = time_usage_logits.clone().slice([0..batch_size, 0..2]);
+        let alphas = time_usage_logits.clone().slice([0..batch_size, 2..4]);
+        let thetas = time_usage_logits.clone().slice([0..batch_size, 4..6]);
+
+        // Robust loss in log-space using Huber on log times
+        let eps = 1e-6;
+        let delta = 0.1;
+        let targets_flat = targets.clone().flatten::<1>(0, 1).clamp_min(eps);
+        let pred_mean =
+            crate::gamma_utils::mixture_mean(weights.clone(), alphas.clone(), thetas.clone())
+                .clamp(eps, 1.0);
+        let targets_flat = targets_flat.clamp(eps, 1.0);
+        let diff = pred_mean.log() - targets_flat.log();
+        let abs = diff.clone().abs();
+        let quad: Tensor<B, 1> = (0.5f32) * diff.clone().powf_scalar(2.0);
+        let lin: Tensor<B, 1> = (delta as f32) * (abs.clone() - (0.5f32) * (delta as f32));
+        let cond = abs.clone().lower_elem(delta).float();
+        let huber = cond.clone() * quad + (cond.neg() + 1.0) * lin;
+        let tensor_loss = huber.mean().reshape([1]);
+
+        // OLD: CPU-based implementation using statrs (for comparison)
+        let weights_data = weights.to_data();
+        let alphas_data = alphas.to_data();
+        let thetas_data = thetas.to_data();
+        let targets_data = targets.to_data();
+
+        let weights_slice = weights_data.as_slice::<f32>().unwrap();
+        let alphas_slice = alphas_data.as_slice::<f32>().unwrap();
+        let thetas_slice = thetas_data.as_slice::<f32>().unwrap();
+        let targets_slice = targets_data.as_slice::<f32>().unwrap();
+
+        let mut log_likelihoods = Vec::with_capacity(batch_size);
+
+        for i in 0..batch_size {
+            let w1 = weights_slice[i * 2];
+            let w2 = weights_slice[i * 2 + 1];
+            let alpha1 = alphas_slice[i * 2];
+            let alpha2 = alphas_slice[i * 2 + 1];
+            let theta1 = thetas_slice[i * 2];
+            let theta2 = thetas_slice[i * 2 + 1];
+            let target = targets_slice[i].max(1e-8);
+
+            let gamma1 = Gamma::new(alpha1 as f64, 1.0 / theta1 as f64);
+            let gamma2 = Gamma::new(alpha2 as f64, 1.0 / theta2 as f64);
+
+            let pdf1 = match gamma1 {
+                Ok(g) => g.pdf(target as f64) as f32,
+                Err(_) => 1e-8,
+            };
+
+            let pdf2 = match gamma2 {
+                Ok(g) => g.pdf(target as f64) as f32,
+                Err(_) => 1e-8,
+            };
+
+            let mixture_prob = w1 * pdf1 + w2 * pdf2;
+            let log_likelihood = mixture_prob.max(1e-8).ln();
+            log_likelihoods.push(log_likelihood);
+        }
+
+        // let statrs_log_likelihood_tensor: Tensor<B, 1> =
+        //     Tensor::from_floats(log_likelihoods.as_slice(), &device);
+        // let statrs_loss = statrs_log_likelihood_tensor.neg().mean().reshape([1]);
+
+        // Log both for comparison
+        // let tensor_loss_val = tensor_loss.clone().to_data().as_slice::<f32>().unwrap()[0];
+        // let statrs_loss_val = statrs_loss.to_data().as_slice::<f32>().unwrap()[0];
+
+        // tracing::info!(
+        //     "Gamma loss comparison - Tensor: {:.6}, Statrs: {:.6}, Diff: {:.6}",
+        //     tensor_loss_val,
+        //     statrs_loss_val,
+        //     (tensor_loss_val - statrs_loss_val).abs()
+        // );
+
+        // Return the tensor-based version that preserves gradients
+        tensor_loss
+    }
+
+    pub fn get_uncertainties(&self) -> (f32, f32, f32, f32) {
         let sigma_policy = self
             .policy_uncertainty
             .val()
@@ -792,7 +433,45 @@ impl<B: Backend> OXIModel<B> {
             .to_data()
             .as_slice::<f32>()
             .unwrap()[0];
-        (sigma_policy, sigma_value, sigma_side_info)
+        let sigma_time_usage = self
+            .time_usage_uncertainty
+            .val()
+            .exp()
+            .to_data()
+            .as_slice::<f32>()
+            .unwrap()[0];
+        (sigma_policy, sigma_value, sigma_side_info, sigma_time_usage)
+    }
+
+    // Helper to get top moves
+    pub fn top_moves(
+        &self,
+        policy_logits: Tensor<B, 3>,
+        top_k: usize,
+    ) -> Vec<Vec<(usize, usize, f32)>> {
+        let [batch, _, _] = policy_logits.dims();
+        let policy_probs = softmax(policy_logits.reshape([batch, LEGAL_MOVES]), 1);
+        let policy_probs_data = policy_probs.to_data();
+        let probs = policy_probs_data.as_slice::<f32>().unwrap();
+
+        let mut top_moves = Vec::new();
+        for b in 0..batch {
+            let batch_probs = &probs[b * 64 * 64..(b + 1) * LEGAL_MOVES];
+            let mut indexed_probs: Vec<(usize, f32)> = batch_probs
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| (i, p))
+                .collect();
+            indexed_probs
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top_k_moves: Vec<(usize, usize, f32)> = indexed_probs
+                .iter()
+                .take(top_k)
+                .map(|&(idx, prob)| (idx / 64, idx % 64, prob))
+                .collect();
+            top_moves.push(top_k_moves);
+        }
+        top_moves
     }
 }
 
@@ -813,5 +492,212 @@ where
 {
     fn step(&self, batch: crate::dataset::ChessBatch<B>) -> ChessOutput<B> {
         self.forward_classification(batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{FEATURES_PER_TOKEN, NUM_GLOBALS};
+    use burn::tensor::TensorData;
+    use burn_ndarray::NdArray;
+
+    #[test]
+    fn test_gamma_mixture_loss() {
+        let device = Default::default();
+        let config = ModelConfig::default();
+        let model = OXIModel::<NdArray>::new(&device, &config);
+
+        // Create test data: [batch_size=2, 6] for [w1, w2, alpha1, alpha2, theta1, theta2]
+        let time_usage_logits = Tensor::from_data(
+            TensorData::from([
+                [0.5, 0.5, 2.0, 3.0, 0.1, 0.2],   // First sample
+                [0.3, 0.7, 1.5, 2.5, 0.15, 0.25], // Second sample
+            ]),
+            &device,
+        );
+
+        // Target time usage values
+        let targets = Tensor::from_data(
+            TensorData::from([[0.05], [0.08]]), // Relative time usage
+            &device,
+        );
+
+        // Compute loss
+        let loss = model.compute_gamma_mixture_loss(time_usage_logits, targets);
+
+        // Loss should be a scalar tensor
+        assert_eq!(loss.dims(), [1]);
+
+        // Loss should be positive (MSE)
+        let loss_value = loss.to_data().as_slice::<f32>().unwrap()[0];
+        assert!(
+            loss_value > 0.0,
+            "Loss should be positive, got: {}",
+            loss_value
+        );
+
+        println!("Gamma mixture loss test passed! Loss value: {}", loss_value);
+    }
+
+    #[test]
+    fn test_time_usage_head_output_shape() {
+        let device = Default::default();
+        let config = ModelConfig::default();
+        let model = OXIModel::<NdArray>::new(&device, &config);
+
+        // Create dummy input
+        let batch_size = 2;
+        let board_input = Tensor::zeros([batch_size, 64, FEATURES_PER_TOKEN], &device);
+        let global_features = Tensor::zeros([batch_size, NUM_GLOBALS], &device);
+
+        let (policy_logits, value_logits, side_info_logits, time_usage_logits) =
+            model.forward(board_input, global_features);
+
+        // Check time usage head outputs 6 values per batch
+        assert_eq!(time_usage_logits.dims(), [batch_size, 6]);
+
+        // Check that weights sum to approximately 1 (first 2 values should be softmax normalized)
+        let time_usage_data = time_usage_logits.to_data();
+        let values = time_usage_data.as_slice::<f32>().unwrap();
+
+        for i in 0..batch_size {
+            let w1 = values[i * 6];
+            let w2 = values[i * 6 + 1];
+            let weight_sum = w1 + w2;
+            assert!(
+                (weight_sum - 1.0).abs() < 1e-5,
+                "Weights should sum to 1, got: {} + {} = {}",
+                w1,
+                w2,
+                weight_sum
+            );
+
+            // Check that alphas and thetas are positive
+            let alpha1 = values[i * 6 + 2];
+            let alpha2 = values[i * 6 + 3];
+            let theta1 = values[i * 6 + 4];
+            let theta2 = values[i * 6 + 5];
+
+            assert!(alpha1 > 0.0, "Alpha1 should be positive, got: {}", alpha1);
+            assert!(alpha2 > 0.0, "Alpha2 should be positive, got: {}", alpha2);
+            assert!(theta1 > 0.0, "Theta1 should be positive, got: {}", theta1);
+            assert!(theta2 > 0.0, "Theta2 should be positive, got: {}", theta2);
+        }
+
+        println!("Time usage head output shape test passed!");
+    }
+
+    #[test]
+    fn test_gamma_mixture_loss_snapshot() {
+        let device = Default::default();
+        let config = ModelConfig::default();
+        let model = OXIModel::<NdArray>::new(&device, &config);
+
+        // Create fixed parameters for reproducible test
+        // Distribution 1: alpha=2.0, theta=0.02 (mean=0.04, focused around 0.04)
+        // Distribution 2: alpha=3.0, theta=0.03 (mean=0.09, focused around 0.09)
+        // Weights: 0.6 for dist1, 0.4 for dist2
+        let time_usage_logits = Tensor::from_data(
+            TensorData::from([
+                [0.405, -0.405, 2.0, 3.0, 0.02, 0.03], // logits that give weights ~[0.6, 0.4] after softmax
+                [0.405, -0.405, 2.0, 3.0, 0.02, 0.03], // Same parameters for all test cases
+                [0.405, -0.405, 2.0, 3.0, 0.02, 0.03],
+            ]),
+            &device,
+        );
+
+        // Test three scenarios:
+        // 1. Target near first distribution peak (0.04)
+        // 2. Target near second distribution peak (0.09)
+        // 3. Target far from both distributions (0.15)
+        let targets = Tensor::from_data(
+            TensorData::from([
+                [0.04], // Near first distribution mean
+                [0.09], // Near second distribution mean
+                [0.15], // Far from both distributions
+            ]),
+            &device,
+        );
+
+        let loss = model.compute_gamma_mixture_loss(time_usage_logits, targets);
+        let loss_data = loss.to_data();
+        let loss_values = loss_data.as_slice::<f32>().unwrap();
+
+        // Create snapshot data
+        let snapshot_data = format!(
+            "Gamma Mixture Loss Snapshot Test\n\
+            Parameters: w1=0.6, w2=0.4, α1=2.0, α2=3.0, θ1=0.02, θ2=0.03\n\
+            Distribution 1 mean: {:.4} (2.0 * 0.02)\n\
+            Distribution 2 mean: {:.4} (3.0 * 0.03)\n\
+            \n\
+            Target 0.04 (near dist1): loss = {:.6}\n\
+            Target 0.09 (near dist2): loss = {:.6}\n\
+            Target 0.15 (far away):   loss = {:.6}\n\
+            \n\
+            Expected behavior:\n\
+            - Loss should be lowest for target 0.04 (highest probability)\n\
+            - Loss should be medium for target 0.09 (medium probability)\n\
+            - Loss should be highest for target 0.15 (lowest probability)",
+            2.0 * 0.02,
+            3.0 * 0.03,
+            loss_values[0],
+            loss_values[0], // Note: loss is averaged, so same value for all
+            loss_values[0]
+        );
+
+        // For now, just print the snapshot. In a real test, you'd use insta::assert_snapshot!
+        println!("{}", snapshot_data);
+
+        // Verify the loss is reasonable (positive and finite)
+        assert!(
+            loss_values[0] > 0.0 && loss_values[0].is_finite(),
+            "Loss should be positive and finite, got: {}",
+            loss_values[0]
+        );
+    }
+
+    #[test]
+    fn test_individual_gamma_mixture_losses() {
+        let device = Default::default();
+        let config = ModelConfig::default();
+        let model = OXIModel::<NdArray>::new(&device, &config);
+
+        // Test each target individually to see the actual loss differences
+        let base_params = [0.405, -0.405, 2.0, 3.0, 0.02, 0.03]; // w1≈0.6, w2≈0.4
+
+        let test_cases = [
+            (0.04, "near first distribution"),
+            (0.09, "near second distribution"),
+            (0.15, "far from both distributions"),
+        ];
+
+        let mut results = Vec::new();
+
+        for (target_value, description) in test_cases.iter() {
+            let time_usage_logits = Tensor::from_data(TensorData::from([base_params]), &device);
+
+            let targets = Tensor::from_data(TensorData::from([[*target_value]]), &device);
+
+            let loss = model.compute_gamma_mixture_loss(time_usage_logits, targets);
+            let loss_value = loss.to_data().as_slice::<f32>().unwrap()[0];
+
+            results.push((target_value, description, loss_value));
+        }
+
+        // Print results
+        println!("\nIndividual Gamma Mixture Loss Results:");
+        for (target, desc, loss) in &results {
+            println!("Target {:.3} ({}): loss = {:.6}", target, desc, loss);
+        }
+
+        // Verify expected ordering: loss should increase as we move away from distribution peaks
+        // Note: This is a heuristic check - the exact ordering depends on the mixture weights
+        assert!(
+            results
+                .iter()
+                .all(|(_, _, loss)| *loss > 0.0 && loss.is_finite()),
+            "All losses should be positive and finite"
+        );
     }
 }

@@ -43,13 +43,13 @@ impl<B: Backend> Metric for UncertaintyMetric<B> {
         self.policy_sigma = input.policy_sigma;
         self.value_sigma = input.value_sigma;
         self.side_info_sigma = input.side_info_sigma;
-        
+
         // Format the display to show all three uncertainties
         let formatted = format!(
             "Policy: {:.3}, Value: {:.3}, SideInfo: {:.3}",
             self.policy_sigma, self.value_sigma, self.side_info_sigma
         );
-        
+
         MetricEntry::new(
             "Uncertainties (σ)".to_string(),
             formatted.clone(),

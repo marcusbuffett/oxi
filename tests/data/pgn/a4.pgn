@@ -6,114 +6,86 @@
 [Black "TestPlayer"]
 [Result "1-0"]
 [WhiteElo "1500"]
+[TimeControl "180+2"]
 [BlackElo "1500"]
 
-1. a4 1-0
+1. a4 { [%clk 0:10:00] }
 
-[Event "Test Game 2"]
+[Event "Test Game 1"]
 [Site "Test"]
 [Date "2024.01.01"]
-[Round "2"]
+[Round "1"]
+[White "TestPlayer"]
+[Black "TestPlayer"]
+[Result "1-0"]
+[WhiteElo "1500"]
+[TimeControl "180+2"]
+[BlackElo "1500"]
+
+1. a4 { [%clk 0:10:00] }
+
+[Event "Test Game 1"]
+[Site "Test"]
+[Date "2024.01.01"]
+[Round "1"]
 [White "TestPlayer"]
 [Black "TestPlayer"]
 [Result "1-0"]
 [WhiteElo "1500"]
 [BlackElo "1500"]
+[TimeControl "180+2"]
 
-1. a4 1-0
+1. a4 { [%clk 0:10:00] }
 
-[Event "Test Game 3"]
+[Event "Test Game 1"]
 [Site "Test"]
 [Date "2024.01.01"]
-[Round "3"]
+[Round "1"]
 [White "TestPlayer"]
 [Black "TestPlayer"]
 [Result "1-0"]
 [WhiteElo "1500"]
 [BlackElo "1500"]
+[TimeControl "180+2"]
 
-1. a4 1-0
+1. a4 { [%clk 0:10:00] }
 
-[Event "Test Game 4"]
+[Event "Test Game 1"]
 [Site "Test"]
 [Date "2024.01.01"]
-[Round "4"]
+[Round "1"]
 [White "TestPlayer"]
 [Black "TestPlayer"]
 [Result "1-0"]
 [WhiteElo "1500"]
 [BlackElo "1500"]
+[TimeControl "180+2"]
 
-1. a4 1-0
+1. a4 { [%clk 0:10:00] }
 
-[Event "Test Game 5"]
+[Event "Test Game 1"]
 [Site "Test"]
 [Date "2024.01.01"]
-[Round "5"]
+[Round "1"]
 [White "TestPlayer"]
 [Black "TestPlayer"]
 [Result "1-0"]
 [WhiteElo "1500"]
 [BlackElo "1500"]
+[TimeControl "180+2"]
 
-1. a4 1-0
+1. a4 { [%clk 0:10:00] }
 
-[Event "Test Game 6"]
+[Event "Test Game 1"]
 [Site "Test"]
 [Date "2024.01.01"]
-[Round "6"]
+[Round "1"]
 [White "TestPlayer"]
 [Black "TestPlayer"]
 [Result "1-0"]
 [WhiteElo "1500"]
 [BlackElo "1500"]
+[TimeControl "180+2"]
 
-1. a4 1-0
+1. a4 { [%clk 0:10:00] }
 
-[Event "Test Game 7"]
-[Site "Test"]
-[Date "2024.01.01"]
-[Round "7"]
-[White "TestPlayer"]
-[Black "TestPlayer"]
-[Result "1-0"]
-[WhiteElo "1500"]
-[BlackElo "1500"]
-
-1. a4 1-0
-
-[Event "Test Game 8"]
-[Site "Test"]
-[Date "2024.01.01"]
-[Round "8"]
-[White "TestPlayer"]
-[Black "TestPlayer"]
-[Result "1-0"]
-[WhiteElo "1500"]
-[BlackElo "1500"]
-
-1. a4 1-0
-
-[Event "Test Game 9"]
-[Site "Test"]
-[Date "2024.01.01"]
-[Round "9"]
-[White "TestPlayer"]
-[Black "TestPlayer"]
-[Result "1-0"]
-[WhiteElo "1500"]
-[BlackElo "1500"]
-
-1. a4 1-0
-
-[Event "Test Game 10"]
-[Site "Test"]
-[Date "2024.01.01"]
-[Round "10"]
-[White "TestPlayer"]
-[Black "TestPlayer"]
-[Result "1-0"]
-[WhiteElo "1500"]
-[BlackElo "1500"]
-
-1. a4 1-0

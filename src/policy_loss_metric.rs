@@ -54,9 +54,9 @@ impl<B: Backend> Metric for PolicyLossMetric<B> {
         self.current_raw_value = raw_value;
 
         let formatted = if let Some(raw) = raw_value {
-            format!("Raw: {:.6}, Weighted: {:.6}", raw, loss_value)
+            format!("Raw: {raw:.6}, Weighted: {loss_value:.6}")
         } else {
-            format!("{:.6}", loss_value)
+            format!("{loss_value:.6}")
         };
 
         MetricEntry::new("Policy Loss".to_string(), formatted.clone(), formatted)
@@ -75,6 +75,6 @@ impl<B: Backend> Metric for PolicyLossMetric<B> {
 impl<B: Backend> Numeric for PolicyLossMetric<B> {
     fn value(&self) -> f64 {
         // Return raw loss if available, otherwise return weighted loss
-        self.current_raw_value.unwrap_or(self.current_value).min(4.0)
+        self.current_raw_value.unwrap_or(self.current_value)
     }
 }
