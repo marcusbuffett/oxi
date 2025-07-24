@@ -1,0 +1,8 @@
+---
+source: src/encoding.rs
+expression: formatted_output
+---
+d7 weak for White: false
+d7 weak for Black: false
+d2 weak for White: false
+d2 weak for Black: false

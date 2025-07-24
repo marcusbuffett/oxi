@@ -1,0 +1,10 @@
+---
+source: src/pgn_processor.rs
+expression: snapshot_data
+---
+[
+    "Move: e2e4 | Player: White | Time remaining: 300s | Opponent time: 300s | Time used: 5s | Move #: 1 | Time control: 300+5",
+    "Move: e2e4 | Player: Black | Time remaining: 300s | Opponent time: 295s | Time used: 10s | Move #: 2 | Time control: 300+5",
+    "Move: g1f3 | Player: White | Time remaining: 295s | Opponent time: 290s | Time used: 7s | Move #: 3 | Time control: 300+5",
+    "Move: b1c3 | Player: Black | Time remaining: 290s | Opponent time: 288s | Time used: 7s | Move #: 4 | Time control: 300+5",
+]

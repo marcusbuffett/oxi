@@ -1,43 +1,34 @@
 use anyhow::Result;
 use burn_autodiff::Autodiff;
-use burn_ndarray::NdArray;
+use burn_ndarray::{NdArray, NdArrayDevice};
+use oxi::config::set_global_config;
 use oxi::config::{ModelConfig, TrainingConfig};
-use oxi::training::train;
+use oxi::custom_training;
 use std::path::PathBuf;
 
 #[test]
 fn smoke_test_training_single_epoch() -> Result<()> {
     println!("Starting smoke test with a4.pgn...");
 
+    tracing_subscriber::fmt().init();
     // Configuration - smaller model for testing
     let model_config = ModelConfig {
-        num_blocks: 2, // Reduced from 15
-        channels: 64,  // Reduced from 256
+        data_path: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/pgn")),
+        max_samples: Some(1),
+        num_layers: 2,
+        physical_batch_size: 1,
+        disable_tui: true,
         ..Default::default()
     };
 
-    let training_config = TrainingConfig {
-        batch_size: 2,
-        learning_rate: 0.001,
-        num_epochs: 1, // Just one epoch
-        ..Default::default()
-    };
+    // Ensure global config is set for components that access it
+    let _ = set_global_config(model_config.clone());
 
-    // Use a4.pgn as test data
-    let a4_pgn_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/pgn/a4.pgn");
-
-    println!("Training with data from: {:?}", a4_pgn_path);
+    let devices = vec![NdArrayDevice::default()];
 
     // Call the existing train function
-    train::<Autodiff<NdArray>>(
-        model_config,
-        training_config,
-        &a4_pgn_path,
-        0.8,  // 80% train, 20% validation split
-        None, // No sample limit
-    )?;
+    custom_training::train_custom::<Autodiff<NdArray<f32, i32, i8>>>(model_config, devices)?;
 
     println!("\nSmoke test passed - training completed without errors!");
     Ok(())
 }
-

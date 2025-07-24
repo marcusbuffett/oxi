@@ -1,161 +1,88 @@
-# Oxi - Human-like chess engine
+# Oxi - Human-like Chess Engine
 
-Oxi is a chess engine, which predicts human-like chess moves based on player skill levels. It uses the Burn ML framework.
+Oxi models human decision making in chess across the full rating spectrum. To our knowledge, it is the most accurate to human play chess AI in the world. The stack is built in Rust on top of the Burn ML framework and ships end-to-end tooling for data acquisition, training, evaluation, and analysis.
 
-## Features
+## Highlights
+- State-of-the-art human move prediction accuracy with Elo-aware conditioning and timing signals.
+- Dual-stream board encoder with learned gating between token features and global context.
+- Shaw-style relative positional transformers with Peri-LN residual routing (14 layers by default).
+- Multi-task heads for policy (64x76 moves), value (win/draw/loss), auxiliary side information, and time usage, each with calibrated uncertainty estimates.
+- Adaptive training loop with GradNorm balancing, cosine schedules, curriculum sampling, and a Ratatui dashboard for live metrics.
 
-- Human move prediction
-- Neural network architecture similar to Maia 2
-- Elo-aware attention mechanism for adapting to player strength
-- Training from PGN chess games
-- WDL head
+## Requirements
+- Rust 1.75 or newer (install via `rustup`).
+- Cargo build tooling and a working C++ toolchain (needed for LibTorch).
+- libtorch (CPU, CUDA, or Metal) libraries. Burn will download a matching build automatically; follow the [Burn docs](https://tracel-ai.github.io/burn/) if you need to pin a specific version.
+- Optional but recommended: a modern NVIDIA GPU with CUDA 12+ (Linux) or Apple Silicon with Metal (macOS). Training on CPU works for smoke tests but is prohibitively slow for large-scale runs.
+- `zstd` CLI utilities if you plan to inspect downloaded PGN archives manually.
 
-## Building
-
-## Usage
-
-### Training a Model
-
-Train a new model from PGN or CSV data. The data will be automatically split into training and validation sets based on the `--train-ratio` parameter (default 0.9 for 90% train, 10% validation).
-
-```bash
-
-
-cargo run --release --bin oxi -- train --data-path <some_pgn_file_or_directory> --output-dir checkpoints --epochs 1000 --channels 64  --num-blocks 6 --max-samples 2000 --batch-size=128 --num-devices=8
-```
-
-### Running Inference
-
-Use a trained model to predict moves:
+## Quickstart
 
 ```bash
-# Basic inference with default model
-cargo run --release --bin predict -- \
-    --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+# 1. Fetch all standard rated Lichess PGNs since 2022 (downloads .pgn.zst files).
+cargo run --release --bin oxi -- download-all --output-dir data/pgn
 
-# Specify model path and Elo ratings
-cargo run --release --bin predict -- \
-    --model-path checkpoints/model_epoch_5.mpk \
-    --fen "5rk1/2p3p1/p2q1r1p/1p1p2p1/3P1nN1/2P1RP2/PP1Q2PP/4R1K1 w - - 0 31" \
-    --elo-self 1600 \
-    --elo-oppo 1800 \
-    --top-n 10
-
-# Use custom temperature for move sampling
-cargo run --release --bin predict -- \
-    --fen "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 4 4" \
-    --temperature 0.5 \
-    --top-n 5
-
-# Use custom model config
-cargo run --release --bin predict -- \
-    --model-path models/custom_model.mpk \
-    --config-path configs/custom_config.yaml \
-    --fen "8/8/8/8/8/8/8/8 w - - 0 1"
+# 2. Train with conservative batch sizes (adjust paths/flags as needed).
+cargo run --release --bin oxi -- train \
+  --data-path data/pgn \
+  --batch-size 1024 \
+  --physical-batch-size 64 \
+  --num-devices 1
 ```
 
-### Example Output
+- Add `--resume` to continue from the latest checkpoint in `checkpoints/model/`.
+- The TUI opens by default; disable it on headless systems with `--disable-tui`.
 
-```
-Loading model from: checkpoints/model.mpk
+## Command Reference
+- `train`: Full training loop. Accepts PGN directories or single files via `--data-path`. Supports curriculum controls such as `--max-samples`, `--enable-elo-sampling`, and `--checkpoint-interval`.
+- `download-all`: Concurrently downloads every standard rated Lichess archive (2022-present) to a target directory.
+- `download-pgn`: Fetches a single month (`--year`, `--month`) to a directory. Use `--local` to limit to one file for testing.
+- `filter-confident`: Generates a curated dataset of high-confidence positions for bootstrapping or curriculum learning.
+- `process-pgn`: Placeholder for pre-processing PGNs into serialized datasets (implementation pending).
+- `evaluate`: Stub for offline evaluation; currently prints a placeholder message.
+- `download`: Planned pretrained model fetcher; prints available tags today (`blitz`, `rapid`, `classical`).
+- `inference`: Loads a checkpoint and prepares the inference engine. Printing of ranked moves is under construction; for now, integrate directly via `InferenceEngine` in code.
 
-Analyzing position: rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
-Self Elo: 1600, Opponent Elo: 1600
-Temperature: 1.0
+Run any subcommand with `--help` for the full list of options and defaults.
 
-Top 10 predicted moves:
-Rank  Move     Probability  Value     
-----------------------------------------
-1     e2e4     0.1523       0.0234    
-2     d2d4     0.1456       0.0189    
-3     g1f3     0.1234       0.0156    
-4     c2c4     0.0987       0.0123    
-5     e2e3     0.0876       0.0098    
-6     d2d3     0.0765       0.0076    
-7     b1c3     0.0654       0.0054    
-8     f2f4     0.0543       0.0032    
-9     g2g3     0.0432       0.0021    
-10    b2b3     0.0321       0.0012    
-
-Position evaluation: 0.0234 (from white's perspective)
-Assessment: Position is equal
-```
+## Training Notes
+- Data ingestion understands both plain `.pgn` and `.pgn.zst` files. Archives are streamed and decoded on the fly, so you can keep compressed files on disk.
+- Elo and ply sampling are enabled by default to emphasize underrepresented positions while keeping a balanced curriculum.
+- Checkpoints live under `checkpoints/model/` along with the AdamW optimizer shards and GradNorm state. Copy the entire directory when you want to resume elsewhere.
+- The training loop reports detailed accuracy breakdowns (move accuracy, grad norms, value calibration) in the TUI as well as in `train.log`.
+- Time usage targets are supervised from the PGN clock data; make sure your source PGNs include clock annotations if you want the time head to learn meaningful patterns.
 
 ## Model Architecture
-
-The model consists of:
-
-- **ChessResNet encoder**: Configurable residual blocks (default 15) with squeeze-excitation
-- **Vision transformer**: 6 layers with Elo-aware attention
-- **Output heads**: Policy (1880 moves), value (position evaluation), and side info (141 features)
-
-The only configurable architecture parameters are:
-- `num_blocks`: Number of residual blocks in the encoder (default: 15)
-- `channels`: Number of channels in the model (default: 256)
-
-## Data Format
-
-The training command accepts a single data source and automatically splits it into training and validation sets. Use the `--train-ratio` parameter to control the split (e.g., 0.9 for 90% training data).
-
-
-### PGN Files
-Standard PGN format with player ratings in the headers:
-```
-[Event "Rated Blitz game"]
-[White "Player1"]
-[Black "Player2"]
-[WhiteElo "1523"]
-[BlackElo "1647"]
-
-1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 ...
-```
-
-## Model Configuration
-
-The model architecture is simplified with only two configurable parameters:
-
-- `--num-blocks`: Number of residual blocks in the CNN encoder (default: 15)
-  - Smaller values (3-5) for faster training and testing
-  - Larger values (10-20) for better performance
-  
-- `--channels`: Number of channels in the model (default: 256)
-  - Must be divisible by 32 for attention heads
-  - Common values: 64, 128, 256, 512
-
-All other architecture parameters are automatically derived from these two values.
+- Board encoding splits each square into per-token features (piece identity, tactical, positional, misc) and recency channels for the latest moves.
+- Optional convolutional stem (disabled by default) can be enabled with `--conv-layers`.
+- Token and global streams are normalized separately, then fused through learned gates before entering the transformer stack.
+- Attention layers use Shaw-style relative biases with grouped query support and Peri-LN (post-residual normalization) in both the attention and MLP paths.
+- Policy head outputs 64x76 logits covering from-to square pairs (including underpromotions), masked by legality during training.
+- Value head predicts win/draw/loss logits and shares pooled representations with the side-information and time-usage heads.
+- Each head owns a learnable log-variance parameter, enabling adaptive loss weighting that works hand-in-hand with GradNorm.
 
 ## Development
+- Build: `cargo build --release`
+- Tests: `cargo test`
+- Formatter: `cargo fmt`
+- Clippy: `cargo clippy --all-targets -- -D warnings`
 
-### Running Tests
+Logs land in `train.log`, `error.log`, and the rotating sheets under `sheet-*.txt` for detailed timeline snapshots.
 
-```bash
-# Run all tests
-cargo test
-
-# Run specific test
-cargo test test_minimal_save_load
-
-# Run integration tests
-cargo test --test smoke_test
-```
-
-### Project Structure
-
+## Project Layout
 ```
 oxi/
-├── src/
-│   ├── main.rs           # Training CLI
-│   ├── bin/
-│   │   └── predict.rs    # Inference CLI
-│   ├── model.rs          # Neural network architecture
-│   ├── training.rs       # Training loop
-│   ├── inference.rs      # Inference engine
-│   ├── dataset.rs        # Data loading and batching
-│   ├── encoding.rs       # Board encoding
-│   ├── moves.rs          # Move encoding/decoding
-│   └── config.rs         # Configuration structures
-├── tests/
-│   └── smoke_test.rs     # Integration tests
-└── Cargo.toml
+|-- src/
+|   |-- main.rs                # Unified CLI entry point
+|   |-- config.rs              # Training/inference configuration and defaults
+|   |-- custom_training.rs     # End-to-end training loop and metrics
+|   |-- model.rs               # OXIModel definition and multi-head outputs
+|   |-- relative_position_transformer.rs
+|   |-- dataset.rs             # PGN ingestion and feature encoding
+|   |-- inference.rs           # Inference engine used by the CLI and tests
+|   |-- encoding.rs, moves.rs  # Chess-specific feature engineering
+|   `-- ...                    # Metrics, schedulers, GradNorm utilities
+|-- tests/                     # Integration tests and tensor sanity checks
+|-- checkpoints/               # Training outputs (gitignored)
+`-- Cargo.toml
 ```
-

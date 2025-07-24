@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use burn::prelude::*;
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric};
+use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
 
 /// Input type for policy loss metric
 pub struct PolicyLossInput<B: Backend> {
@@ -9,6 +9,10 @@ pub struct PolicyLossInput<B: Backend> {
     pub loss: Tensor<B, 1>,
     /// Raw policy loss (before uncertainty weighting)
     pub raw_loss: Option<Tensor<B, 1>>,
+    /// Current GradNorm weight applied to this loss
+    pub grad_weight: Option<f32>,
+    /// Last measured gradient norm for this head
+    pub grad_norm: Option<f32>,
 }
 
 impl<B: Backend> PolicyLossInput<B> {
@@ -16,6 +20,8 @@ impl<B: Backend> PolicyLossInput<B> {
         Self {
             loss,
             raw_loss: None,
+            grad_weight: None,
+            grad_norm: None,
         }
     }
 
@@ -23,13 +29,21 @@ impl<B: Backend> PolicyLossInput<B> {
         self.raw_loss = Some(raw_loss);
         self
     }
+
+    pub fn with_grad_info(mut self, weight: f32, grad_norm: Option<f32>) -> Self {
+        self.grad_weight = Some(weight);
+        self.grad_norm = grad_norm;
+        self
+    }
 }
 
 /// Metric for tracking policy loss
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PolicyLossMetric<B: Backend> {
     current_value: f64,
     current_raw_value: Option<f64>,
+    current_weight: Option<f64>,
+    current_grad_norm: Option<f64>,
     _backend: PhantomData<B>,
 }
 
@@ -53,28 +67,51 @@ impl<B: Backend> Metric for PolicyLossMetric<B> {
             .map(|raw| raw.clone().into_scalar().elem::<f32>() as f64);
         self.current_raw_value = raw_value;
 
-        let formatted = if let Some(raw) = raw_value {
-            format!("Raw: {:.6}, Weighted: {:.6}", raw, loss_value)
-        } else {
-            format!("{:.6}", loss_value)
-        };
+        self.current_weight = input.grad_weight.map(|w| w as f64);
+        self.current_grad_norm = input.grad_norm.map(|g| g as f64);
 
-        MetricEntry::new("Policy Loss".to_string(), formatted.clone(), formatted)
+        let base_value = raw_value.unwrap_or(loss_value);
+        let weight_display = self
+            .current_weight
+            .map(|w| format!("{w:.4}"))
+            .unwrap_or_else(|| "N/A".to_string());
+        let grad_display = self
+            .current_grad_norm
+            .map(|g| format!("{g:.4}"))
+            .unwrap_or_else(|| "N/A".to_string());
+
+        let formatted = format!(
+            "Loss: {base:.6}, Weight: {weight}, Weighted: {weighted:.6}, Grad: {grad}",
+            base = base_value,
+            weight = weight_display,
+            weighted = loss_value,
+            grad = grad_display
+        );
+
+        MetricEntry::new(
+            "Policy Loss".to_string().into(),
+            formatted.clone(),
+            formatted,
+        )
     }
 
     fn clear(&mut self) {
         self.current_value = 0.0;
         self.current_raw_value = None;
+        self.current_weight = None;
+        self.current_grad_norm = None;
     }
 
-    fn name(&self) -> String {
-        "Policy Loss".to_string()
+    fn name(&self) -> std::sync::Arc<String> {
+        "Policy Loss".to_string().into()
     }
 }
 
 impl<B: Backend> Numeric for PolicyLossMetric<B> {
-    fn value(&self) -> f64 {
+    fn value(&self) -> NumericEntry {
         // Return raw loss if available, otherwise return weighted loss
-        self.current_raw_value.unwrap_or(self.current_value).min(4.0)
+        // Cap at 10 for display purposes
+        let value = self.current_raw_value.unwrap_or(self.current_value);
+        NumericEntry::Value(value.min(10.0))
     }
 }

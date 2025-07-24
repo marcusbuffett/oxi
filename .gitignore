@@ -2,3 +2,8 @@ checkpoints
 references
 target
 .DS_Store
+test_scripts
+.crush
+reference
+model.mpk
+model

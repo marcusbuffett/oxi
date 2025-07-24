@@ -1,12 +1,9 @@
 use anyhow::Result;
-#[cfg(target_os = "linux")]
-use burn::backend::cuda::CudaDevice;
-#[cfg(target_os = "linux")]
-use burn::backend::Cuda;
+use burn::backend::LibTorch;
 #[cfg(target_os = "macos")]
 use burn::backend::Metal;
-#[cfg(target_os = "macos")]
-use burn_candle::MetalDevice;
+
+use burn_tch::LibTorchDevice;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -17,9 +14,10 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, task};
 
-use oxi::config::{ModelConfig, TrainingConfig};
+use oxi::config::{set_global_config, Config};
+use oxi::custom_training::train_custom;
+use oxi::data_creation::filter_confident_positions;
 use oxi::inference::InferenceEngine;
-use oxi::training::train;
 
 #[derive(Parser, Debug)]
 #[command(name = "oxi")]
@@ -32,7 +30,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Train a new Oxi model
-    Train(TrainConfig),
+    Train(Config),
 
     /// Run inference on chess positions
     Inference(InferenceConfig),
@@ -74,48 +72,9 @@ enum Commands {
 
     /// Evaluate model performance
     Evaluate(EvaluateConfig),
-}
 
-#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
-struct TrainConfig {
-    /// Path to data (PGN directory, PGN file, or CSV file)
-    #[arg(long)]
-    data_path: PathBuf,
-
-    /// Train/validation split ratio (e.g., 0.9 for 90% train, 10% validation)
-    #[arg(long, default_value = "0.9")]
-    train_ratio: f32,
-
-    /// Output directory for checkpoints
-    #[arg(long, default_value = "./checkpoints")]
-    output_dir: PathBuf,
-
-    /// Number of residual blocks in the model
-    #[arg(long, default_value = "15")]
-    num_blocks: usize,
-
-    /// Number of channels in the model
-    #[arg(long, default_value = "256")]
-    channels: usize,
-
-    /// Batch size for training
-    #[arg(long, default_value = "32")]
-    batch_size: usize,
-
-    /// Learning rate
-    #[arg(long, default_value = "0.001")]
-    learning_rate: f64,
-
-    /// Number of epochs
-    #[arg(long, default_value = "10")]
-    epochs: usize,
-
-    /// Maximum number of samples to use for training (for debugging/testing)
-    #[arg(long)]
-    max_samples: Option<usize>,
-
-    #[arg(long, default_value = "1")]
-    num_devices: usize,
+    /// Filter positions where model predicts with high confidence
+    FilterConfident(FilterConfidentConfig),
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
@@ -195,46 +154,70 @@ struct EvaluateConfig {
     device: String,
 }
 
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
+struct FilterConfidentConfig {
+    /// Path to model checkpoint
+    #[arg(long)]
+    model_path: PathBuf,
+
+    /// Path to PGN data directory
+    #[arg(long)]
+    data_path: PathBuf,
+
+    /// Physical batch size for inference
+    #[arg(long, default_value = "256")]
+    physical_batch_size: usize,
+
+    /// Confidence threshold (0.0-1.0)
+    #[arg(long, default_value = "0.9")]
+    confidence_threshold: f32,
+
+    /// Maximum number of examples to collect
+    #[arg(long, default_value = "10000000")]
+    max_examples: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing with environment variable support
-    // tracing_subscriber::fmt().init();
 
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Train(config) => {
             tracing::info!("Starting training with config: {:?}", config);
+            set_global_config(config.clone()).unwrap();
+            if config.disable_tui {
+                tracing_subscriber::fmt().init();
+            }
 
-            // Create config from CLI args
-            let model_config = ModelConfig::new(config.num_blocks, config.channels);
-            let mut training_config = TrainingConfig::default();
-            training_config.batch_size = config.batch_size;
-            training_config.learning_rate = config.learning_rate;
-            training_config.num_epochs = config.epochs;
+            // Validate that data_path is provided
+            let _data_path = config
+                .data_path
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--data-path is required for training"))?;
+
+            // #[cfg(target_os = "linux")]
+            // type Backend = Autodiff<Cuda>;
+            // let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+            //     (0..config.num_devices).map(CudaDevice::new).collect();
 
             #[cfg(target_os = "linux")]
-            type Backend = Autodiff<Cuda>;
+            type Backend = Autodiff<LibTorch<f32>>;
             #[cfg(target_os = "linux")]
             let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-                (0..config.num_devices).map(CudaDevice::new).collect();
-
+                (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
             #[cfg(target_os = "macos")]
-            type Backend = Autodiff<Metal>;
+            type Backend = Autodiff<burn_ndarray::NdArray<f32, i32>>;
             #[cfg(target_os = "macos")]
-            let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-                vec![<Backend as burn::tensor::backend::Backend>::Device::default()];
+            let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
+                .num_devices)
+                .map(|_| <Backend as burn::tensor::backend::Backend>::Device::default())
+                .collect();
 
-            // Run training
+            // Run training with unified config
             use burn::backend::Autodiff;
-            train::<Backend>(
-                model_config,
-                training_config,
-                &config.data_path,
-                config.train_ratio,
-                config.max_samples,
-                devices,
-            )?;
+            train_custom::<Backend>(config.clone(), devices)?;
             Ok(())
         }
 
@@ -262,42 +245,42 @@ async fn main() -> Result<()> {
             // Load model and create engine
             // TODO: We need to store model config with checkpoint to know num_blocks/channels
             // For now, use defaults
-            let model_config = ModelConfig::default();
-            let engine = InferenceEngine::<burn_ndarray::NdArray>::from_checkpoint(
+            let model_config = Config::default();
+            let _engine = InferenceEngine::<burn_ndarray::NdArray>::from_checkpoint(
                 &config.model_path,
                 model_config,
                 device,
             )?;
 
             // Run inference on positions
-            for position in &positions {
-                // Determine player colors from FEN
-                let parts: Vec<&str> = position.split(' ').collect();
-                let (elo_self, elo_oppo) = if parts.len() > 1 && parts[1] == "w" {
-                    (config.white_elo, config.black_elo)
-                } else {
-                    (config.black_elo, config.white_elo)
-                };
-
-                let predictions = engine.predict(
-                    position,
-                    elo_self,
-                    elo_oppo,
-                    config.temperature,
-                    config.top_k,
-                )?;
-
-                println!("\nPosition: {}", position);
-                println!("Top {} moves:", config.top_k);
-                for (i, pred) in predictions.iter().enumerate() {
-                    println!(
-                        "{}. {} ({:.2}%)",
-                        i + 1,
-                        pred.uci_move,
-                        pred.probability * 100.0,
-                    );
-                }
-            }
+            // for position in &positions {
+            //     // Determine player colors from FEN
+            //     let parts: Vec<&str> = position.split(' ').collect();
+            //     let (elo_self, elo_oppo) = if parts.len() > 1 && parts[1] == "w" {
+            //         (config.white_elo, config.black_elo)
+            //     } else {
+            //         (config.black_elo, config.white_elo)
+            //     };
+            //
+            //     let predictions = engine.predict(
+            //         position,
+            //         elo_self,
+            //         elo_oppo,
+            //         config.temperature,
+            //         config.top_k,
+            //     )?;
+            //
+            //     println!("\nPosition: {}", position);
+            //     println!("Top {} moves:", config.top_k);
+            //     for (i, pred) in predictions.iter().enumerate() {
+            //         println!(
+            //             "{}. {} ({:.2}%)",
+            //             i + 1,
+            //             pred.uci_move,
+            //             pred.probability * 100.0,
+            //         );
+            //     }
+            // }
             Ok(())
         }
 
@@ -311,6 +294,13 @@ async fn main() -> Result<()> {
 
         Commands::ProcessPgn(config) => {
             tracing::info!("Processing PGN files with config: {:?}", config);
+
+            // Set global config for PGN processing
+            let global_config = Config {
+                ..Config::default()
+            };
+            let _ = set_global_config(global_config);
+
             // TODO: Implement PGN processing with proper Visitor trait
             println!("PGN processing not yet implemented - see PATCHES_AND_TODOS.md");
             println!("This requires implementing the pgn_reader::Visitor trait");
@@ -337,17 +327,17 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(&output_dir)?;
 
             // Format the URL according to Lichess database naming
-            let filename = format!("lichess_db_standard_rated_{}-{:02}.pgn.zst", year, month);
-            let url = format!("https://database.lichess.org/standard/{}", filename);
+            let filename = format!("lichess_db_standard_rated_{year}-{month:02}.pgn.zst");
+            let url = format!("https://database.lichess.org/standard/{filename}");
             let output_path = output_dir.join(&filename);
 
             // Check if file already exists
             if output_path.exists() {
-                println!("File {} already exists, skipping download", filename);
+                println!("File {filename} already exists, skipping download");
                 return Ok(());
             }
 
-            println!("Downloading {} from {}", filename, url);
+            println!("Downloading {filename} from {url}");
 
             // Use reqwest to download the file
             let client = reqwest::Client::new();
@@ -400,6 +390,31 @@ async fn main() -> Result<()> {
             download_all_lichess_files(&output_dir).await?;
             Ok(())
         }
+
+        Commands::FilterConfident(config) => {
+            tracing::info!("Filtering confident predictions with config: {:?}", config);
+
+            #[cfg(target_os = "linux")]
+            type Backend = burn::backend::LibTorch<f32>;
+            #[cfg(target_os = "linux")]
+            let device = burn_tch::LibTorchDevice::Cuda(0);
+
+            #[cfg(target_os = "macos")]
+            type Backend = burn_ndarray::NdArray<f32, i32>;
+            #[cfg(target_os = "macos")]
+            let device = <Backend as burn::tensor::backend::Backend>::Device::default();
+
+            let filter_config = oxi::data_creation::FilterConfidentConfig {
+                model_path: config.model_path,
+                data_path: config.data_path,
+                physical_batch_size: config.physical_batch_size,
+                confidence_threshold: config.confidence_threshold,
+                max_examples: config.max_examples,
+            };
+
+            filter_confident_positions::<Backend>(filter_config, device)?;
+            Ok(())
+        }
     }
 }
 
@@ -431,15 +446,15 @@ async fn download_all_lichess_files(output_dir: &PathBuf) -> Result<()> {
         let semaphore = Arc::clone(&semaphore);
         task::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap(); // Acquire permit
-            let file_name = url.split('/').last().unwrap(); // Extract the file name from the URL
+            let file_name = url.split('/').next_back().unwrap(); // Extract the file name from the URL
             let path = output_dir.join(file_name);
 
             if path.exists() {
-                println!("Already downloaded {}", file_name);
+                println!("Already downloaded {file_name}");
                 return Ok::<(), anyhow::Error>(());
             }
 
-            println!("Downloading {}", file_name);
+            println!("Downloading {file_name}");
             let client = reqwest::Client::new();
             let response = client.get(&url).send().await?;
 
@@ -460,7 +475,7 @@ async fn download_all_lichess_files(output_dir: &PathBuf) -> Result<()> {
             }
 
             file.flush().await?;
-            println!("Downloaded {}", file_name);
+            println!("Downloaded {file_name}");
             Ok(())
         })
     });
@@ -471,9 +486,9 @@ async fn download_all_lichess_files(output_dir: &PathBuf) -> Result<()> {
 
     for result in results {
         if let Err(e) = result {
-            eprintln!("Task error: {:?}", e);
+            eprintln!("Task error: {e:?}");
         } else if let Err(e) = result.unwrap() {
-            eprintln!("Download error: {:?}", e);
+            eprintln!("Download error: {e:?}");
         }
     }
 

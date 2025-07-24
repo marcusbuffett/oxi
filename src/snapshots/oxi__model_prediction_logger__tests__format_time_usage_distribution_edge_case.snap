@@ -1,0 +1,12 @@
+---
+source: src/model_prediction_logger.rs
+assertion_line: 664
+expression: formatted
+---
+Actual  time usage: 0.000s (ratio 0.000)
+Predicted Beta params: α=0.90000, β=0.10000 | mean ratio 0.90000 (~54.000s)
+0-2s   :                                          (0.005)
+2-6s   :                                          (0.009)
+6-10s  :                                          (0.009)
+10-20s : ▎                                        (0.025)
+20+s   : ██████████                               (0.952)

@@ -7,36 +7,53 @@ edition = "2021"
 name = "oxi"
 path = "src/main.rs"
 
-
 [target.'cfg(target_os = "macos")'.dependencies]
-burn = { version = "0.18", features = ["default", "train", "metal"]}
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "wgpu", "metal", "autodiff", "ndarray", "fusion", "tch", "candle" ] }
+burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", features = ["metal"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
-burn = { version = "0.18", features = ["default", "train", "cuda"]}
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "tch", "autodiff", "ndarray", "fusion", "candle", "cuda"] }
+burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", features = ["cuda"] }
 
 [dependencies]
-burn-train = "0.18"
-burn-ndarray = "0.18"
-burn-cuda = { version = "0.18", optional = true }
-burn-candle = "0.18"
+burn-train = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["tui"] }
+burn-tch = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false }
+burn-ndarray = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+burn-cuda = { git = "https://github.com/tracel-ai/burn", branch = "main", optional = true }
 clap = { version = "*", features = ["derive"] }
 serde = { version = "*", features = ["derive"] }
 serde_yaml = "*"
 shakmaty = "*"
-pgn-reader = {git = "https://github.com/marcusbuffett/rust-pgn-reader", branch = "master"}
+pgn-reader = { git = "https://github.com/marcusbuffett/rust-pgn-reader", branch = "master" }
 tokio = { version = "*", features = ["full"] }
 indicatif = "*"
 anyhow = "*"
 tracing = "*"
 tracing-subscriber = "*"
+tracing-appender = "*"
 reqwest = { version = "*", features = ["json", "stream"] }
 flate2 = "*"
 zstd = "*"
 once_cell = "*"
 futures-util = "*"
+num_cpus = "*"
+rand = "*"
+statrs = "*"
+itertools = "*"
+bincode = "*"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+
+# [patch."https://github.com/tracel-ai/cubecl"]
+# cubecl = { path = "./patches/cubecl/crates/cubecl" }
+# cubecl-runtime = { path = "./patches/cubecl/crates/cubecl-runtime" }
+# cubecl-ir = { path = "./patches/cubecl/crates/cubecl-ir" }
+# cubecl-common = { path = "./patches/cubecl/crates/cubecl-common" }
+# cubecl-core = { path = "./patches/cubecl/crates/cubecl-core" }
 
 [dev-dependencies]
 tempfile = "*"
-burn-autodiff = "0.18"
+burn-autodiff = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 insta = "*"
 
 [features]

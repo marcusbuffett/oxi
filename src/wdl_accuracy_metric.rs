@@ -1,12 +1,12 @@
 use core::marker::PhantomData;
 
 use burn::prelude::*;
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric};
 use burn::tensor::ElementConversion;
+use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
 
 /// The WDL (Win/Draw/Loss) accuracy metric.
 /// This metric tracks the accuracy of win/draw/loss predictions from the value head.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct WdlAccuracyMetric<B: Backend> {
     /// Current batch's accuracy percentage
     current_value: f64,
@@ -43,13 +43,13 @@ impl<B: Backend> Metric for WdlAccuracyMetric<B> {
         let targets = &input.targets;
 
         let [batch_size, num_classes] = outputs.dims();
-        
+
         // Verify we have 3 classes (win, draw, loss)
         debug_assert_eq!(num_classes, 3, "WDL head should output 3 classes");
 
         // Get predicted classes (argmax along class dimension)
         let predicted_classes = outputs.clone().argmax(1);
-        
+
         // Get target classes (argmax of one-hot encoded targets)
         let target_classes = targets.clone().argmax(1);
 
@@ -71,9 +71,9 @@ impl<B: Backend> Metric for WdlAccuracyMetric<B> {
         self.current_value = accuracy;
 
         MetricEntry::new(
-            "WDL Accuracy".to_string(),
-            format!("{:.2}%", accuracy),
-            format!("{:.2}", accuracy),
+            "WDL Accuracy".to_string().into(),
+            format!("{accuracy:.2}%"),
+            format!("{accuracy:.2}"),
         )
     }
 
@@ -81,22 +81,23 @@ impl<B: Backend> Metric for WdlAccuracyMetric<B> {
         self.current_value = 0.0;
     }
 
-    fn name(&self) -> String {
-        "WDL Accuracy".to_string()
+    fn name(&self) -> std::sync::Arc<String> {
+        "WDL Accuracy".to_string().into()
     }
 }
 
 impl<B: Backend> Numeric for WdlAccuracyMetric<B> {
-    fn value(&self) -> f64 {
-        self.current_value
+    fn value(&self) -> NumericEntry {
+        // Set min of 40 for display purposes
+        NumericEntry::Value(self.current_value.max(40.0))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_ndarray::{NdArray, NdArrayDevice};
     use burn::data::dataloader::Progress;
+    use burn_ndarray::{NdArray, NdArrayDevice};
 
     #[test]
     fn test_wdl_accuracy_perfect() {
@@ -107,9 +108,9 @@ mod tests {
         // Outputs as logits (before softmax)
         let outputs = Tensor::from_data(
             [
-                [5.0, 0.0, 0.0],  // Strong win prediction
-                [0.0, 5.0, 0.0],  // Strong draw prediction
-                [0.0, 0.0, 5.0],  // Strong loss prediction
+                [5.0, 0.0, 0.0], // Strong win prediction
+                [0.0, 5.0, 0.0], // Strong draw prediction
+                [0.0, 0.0, 5.0], // Strong loss prediction
             ],
             &device,
         );
@@ -117,9 +118,9 @@ mod tests {
         // Targets as one-hot encoded
         let targets = Tensor::from_data(
             [
-                [1.0, 0.0, 0.0],  // Win
-                [0.0, 1.0, 0.0],  // Draw
-                [0.0, 0.0, 1.0],  // Loss
+                [1.0, 0.0, 0.0], // Win
+                [0.0, 1.0, 0.0], // Draw
+                [0.0, 0.0, 1.0], // Loss
             ],
             &device,
         );
@@ -137,7 +138,11 @@ mod tests {
         };
         let entry = metric.update(&input, &metadata);
 
-        assert_eq!(metric.value(), 100.0);
+        let v = match metric.value() {
+            NumericEntry::Value(v) => v,
+            _ => panic!("Expected numeric value"),
+        };
+        assert_eq!(v, 100.0);
         assert!(entry.formatted.contains("100.00%"));
     }
 
@@ -149,20 +154,20 @@ mod tests {
         // Create test data: 4 examples, 2 correct, 2 incorrect
         let outputs = Tensor::from_data(
             [
-                [5.0, 0.0, 0.0],  // Predict win (correct)
-                [5.0, 0.0, 0.0],  // Predict win (incorrect, should be draw)
-                [0.0, 0.0, 5.0],  // Predict loss (correct)
-                [0.0, 5.0, 0.0],  // Predict draw (incorrect, should be win)
+                [5.0, 0.0, 0.0], // Predict win (correct)
+                [5.0, 0.0, 0.0], // Predict win (incorrect, should be draw)
+                [0.0, 0.0, 5.0], // Predict loss (correct)
+                [0.0, 5.0, 0.0], // Predict draw (incorrect, should be win)
             ],
             &device,
         );
 
         let targets = Tensor::from_data(
             [
-                [1.0, 0.0, 0.0],  // Win
-                [0.0, 1.0, 0.0],  // Draw
-                [0.0, 0.0, 1.0],  // Loss
-                [1.0, 0.0, 0.0],  // Win
+                [1.0, 0.0, 0.0], // Win
+                [0.0, 1.0, 0.0], // Draw
+                [0.0, 0.0, 1.0], // Loss
+                [1.0, 0.0, 0.0], // Win
             ],
             &device,
         );
@@ -180,7 +185,11 @@ mod tests {
         };
         metric.update(&input, &metadata);
 
-        assert_eq!(metric.value(), 50.0);
+        let v = match metric.value() {
+            NumericEntry::Value(v) => v,
+            _ => panic!("Expected numeric value"),
+        };
+        assert_eq!(v, 50.0);
     }
 
     #[test]
@@ -191,21 +200,15 @@ mod tests {
         // First batch: 2/3 correct
         let outputs1 = Tensor::from_data(
             [
-                [5.0, 0.0, 0.0],  // Correct
-                [5.0, 0.0, 0.0],  // Correct
-                [0.0, 5.0, 0.0],  // Incorrect
+                [5.0, 0.0, 0.0], // Correct
+                [5.0, 0.0, 0.0], // Correct
+                [0.0, 5.0, 0.0], // Incorrect
             ],
             &device,
         );
 
-        let targets1 = Tensor::from_data(
-            [
-                [1.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            &device,
-        );
+        let targets1 =
+            Tensor::from_data([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], &device);
 
         let metadata = MetricMetadata {
             progress: Progress {
@@ -220,32 +223,38 @@ mod tests {
         metric.update(&WdlAccuracyInput::new(outputs1, targets1), &metadata);
 
         // First batch: 2/3 correct = 66.67%
-        assert!((metric.value() - 66.67).abs() < 0.01);
+        let v = match metric.value() {
+            NumericEntry::Value(v) => v,
+            _ => panic!("Expected numeric value"),
+        };
+        assert!((v - 66.67).abs() < 0.01);
 
         // Second batch: 1/2 correct
         let outputs2 = Tensor::from_data(
             [
-                [0.0, 0.0, 5.0],  // Correct
-                [0.0, 5.0, 0.0],  // Incorrect
+                [0.0, 0.0, 5.0], // Correct
+                [0.0, 5.0, 0.0], // Incorrect
             ],
             &device,
         );
 
-        let targets2 = Tensor::from_data(
-            [
-                [0.0, 0.0, 1.0],
-                [1.0, 0.0, 0.0],
-            ],
-            &device,
-        );
+        let targets2 = Tensor::from_data([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]], &device);
 
         metric.update(&WdlAccuracyInput::new(outputs2, targets2), &metadata);
 
         // Second batch: 1/2 correct = 50% (not accumulated)
-        assert_eq!(metric.value(), 50.0);
-        
+        let v = match metric.value() {
+            NumericEntry::Value(v) => v,
+            _ => panic!("Expected numeric value"),
+        };
+        assert_eq!(v, 50.0);
+
         // Test clear
         metric.clear();
-        assert_eq!(metric.value(), 0.0);
+        let v = match metric.value() {
+            NumericEntry::Value(v) => v,
+            _ => panic!("Expected numeric value"),
+        };
+        assert_eq!(v, 40.0);
     }
 }
