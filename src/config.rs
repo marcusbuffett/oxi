@@ -98,7 +98,7 @@ pub struct Config {
     pub time_usage_loss_weight: f32,
 
     /// Weight decay for optimizer
-    #[arg(long, default_value = "0.01")]
+    #[arg(long, default_value = "0.1")]
     pub weight_decay: f64,
 
     /// Gradient clipping norm (0 to disable)

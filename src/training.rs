@@ -8,6 +8,7 @@ use burn::lr_scheduler::noam::NoamLrSchedulerConfig;
 use burn::module::AutodiffModule;
 use burn::module::Module;
 use burn::optim::AdamConfig;
+use burn::optim::AdamWConfig;
 use burn::prelude::*;
 use burn::record::FullPrecisionSettings;
 use burn::record::NamedMpkFileRecorder;
@@ -170,11 +171,8 @@ where
         // .summary()
         .build(
             model,
-            AdamConfig::new()
-                // .with_momentum(Some(MomentumConfig::new().with_momentum(0.9)))
-                .with_weight_decay(Some(burn::optim::decay::WeightDecayConfig::new(
-                    config.weight_decay as f32,
-                )))
+            AdamWConfig::new()
+                .with_weight_decay(config.weight_decay as f32)
                 .with_grad_clipping(if config.gradient_clip > 0.0 {
                     Some(GradientClippingConfig::Norm(config.gradient_clip as f32))
                 } else {
