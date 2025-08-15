@@ -178,23 +178,18 @@ async fn main() -> Result<()> {
             let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
                 (0..config.num_devices).map(CudaDevice::new).collect();
 
-            // #[cfg(target_os = "macos")]
-            // type Backend = Autodiff<Metal>;
-            // #[cfg(target_os = "macos")]
-            // let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-            //     vec![<Backend as burn::tensor::backend::Backend>::Device::default()];
-            // #[cfg(target_os = "macos")]
-            // type Backend = Autodiff<Metal<f32, i32>>;
-            // #[cfg(target_os = "macos")]
-            // let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-            //     vec![<Backend as burn::tensor::backend::Backend>::Device::default()];
             #[cfg(target_os = "macos")]
-            type Backend = Autodiff<burn_ndarray::NdArray<f32, i32>>;
+            type Backend = Autodiff<Metal<f32, i32>>;
             #[cfg(target_os = "macos")]
-            let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = vec![
-                <Backend as burn::tensor::backend::Backend>::Device::default(),
-                <Backend as burn::tensor::backend::Backend>::Device::default(),
-            ];
+            let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                vec![<Backend as burn::tensor::backend::Backend>::Device::default()];
+            // #[cfg(target_os = "macos")]
+            // type Backend = Autodiff<burn_ndarray::NdArray<f32, i32>>;
+            // #[cfg(target_os = "macos")]
+            // let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
+            //     .num_devices)
+            //     .map(|_| <Backend as burn::tensor::backend::Backend>::Device::default())
+            //     .collect();
 
             // Run training with unified config
             use burn::backend::Autodiff;

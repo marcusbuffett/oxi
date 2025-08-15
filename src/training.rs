@@ -75,7 +75,7 @@ where
     let path = config.data_path.clone().expect("Model path not set");
     let data_path = Path::new(&path);
     // Load dataset with max_samples limit
-    let dataset: OXIDataset = if data_path.is_dir() {
+    let mut dataset: OXIDataset = if data_path.is_dir() {
         tracing::info!("Loading data from PGN directory: {:?}", data_path);
         OXIDataset::from_pgn_dir_with_limit(data_path, config.clone(), config.max_samples)?
     } else {
@@ -83,6 +83,13 @@ where
         tracing::info!("Loading data from PGN file: {:?}", data_path);
         OXIDataset::from_pgn_with_limit(data_path, config.clone(), config.max_samples)?
     };
+    if config.max_samples.is_some() {
+        dataset.examples = dataset
+            .examples
+            .into_iter()
+            .take(config.max_samples.unwrap())
+            .collect();
+    }
     tracing::info!("Training with {} samples", dataset.examples.len());
 
     // Split into train and validation
@@ -187,7 +194,13 @@ where
         );
 
     // Train the model
+    let start_time = std::time::Instant::now();
     let trained_model = learner.fit(dataloader_train, dataloader_valid);
+    let training_duration = start_time.elapsed();
+    println!(
+        "Training completed in {:.2} seconds",
+        training_duration.as_secs_f64()
+    );
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
     trained_model
         .save_file("model", &recorder)

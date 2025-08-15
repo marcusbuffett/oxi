@@ -46,3 +46,6 @@ insta = "*"
 default = []
 metal = []
 cuda = []
+
+[profile.release]
+debug = true

@@ -723,9 +723,24 @@ pub fn process_pgn_directory_parallel(
     // Collect results from workers
     let mut all_examples = Vec::new();
     let mut batches_received = 0;
+    let mut remaining_skip = get_global_config().skip.unwrap_or(0);
 
     while let Ok(batch) = rx.recv() {
         batches_received += 1;
+
+        // Handle skipping of initial samples by dropping full batches or trimming head
+        let mut batch = batch;
+        if remaining_skip > 0 {
+            if remaining_skip >= batch.len() {
+                remaining_skip -= batch.len();
+                // Drop entire batch
+                continue;
+            } else {
+                // Trim the head of the batch by remaining_skip
+                batch.drain(0..remaining_skip);
+                remaining_skip = 0;
+            }
+        }
 
         // Check if we need to abort due to reaching max samples
         if let Some(max) = max_samples {

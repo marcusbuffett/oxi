@@ -33,6 +33,10 @@ pub struct Config {
     #[arg(long)]
     pub max_samples: Option<usize>,
 
+    /// Number of initial samples to skip during PGN processing
+    #[arg(long)]
+    pub skip: Option<usize>,
+
     #[arg(long)]
     pub timeout: Option<u64>,
 
@@ -49,7 +53,7 @@ pub struct Config {
     pub batch_size: Option<usize>,
 
     /// Physical batch size (for gradient accumulation)
-    #[arg(long, default_value = "256")]
+    #[arg(long, default_value = "1024")]
     pub physical_batch_size: usize,
 
     /// Random seed for reproducibility
@@ -61,14 +65,14 @@ pub struct Config {
     pub num_workers: usize,
 
     /// Number of training epochs
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "1")]
     pub num_epochs: usize,
 
     /// Using NoamLrScheduler
     #[arg(long, default_value = "1.0")]
     pub learning_rate: f64,
 
-    #[arg(long, default_value = "4000")]
+    #[arg(long, default_value = "30000")]
     pub warmup: usize,
 
     #[arg(long)]
@@ -98,7 +102,7 @@ pub struct Config {
     pub time_usage_loss_weight: f32,
 
     /// Weight decay for optimizer
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value = "0.01")]
     pub weight_decay: f64,
 
     /// Gradient clipping norm (0 to disable)
@@ -113,13 +117,8 @@ pub struct Config {
     #[arg(long, default_value = "8")]
     pub num_heads: usize,
 
-    /// Number of K/V head groups for grouped-query attention (GQA). Must divide num_heads.
-    /// Set equal to num_heads to disable grouping; set to 1 for multi-query attention (MQA).
-    #[arg(long)]
-    pub kv_groups: Option<usize>,
-
     /// Number of transformer layers
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "16")]
     pub num_layers: usize,
 
     /// ELO bins for player skill levels
@@ -129,10 +128,6 @@ pub struct Config {
         default_value = "800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800"
     )]
     pub elo_bins: Vec<i32>,
-
-    /// Embedding dimension for ELO
-    #[arg(long, default_value = "256")]
-    pub elo_embed_dim: usize,
 
     /// MLP hidden dimension ratio
     #[arg(long, default_value = "4.0")]
@@ -191,9 +186,6 @@ impl Config {
     pub fn num_heads(&self) -> usize {
         self.num_heads
     }
-    pub fn kv_groups(&self) -> usize {
-        self.kv_groups.unwrap_or(self.num_heads)
-    }
     pub fn num_layers(&self) -> usize {
         self.num_layers
     }
@@ -206,9 +198,6 @@ impl Config {
 
     pub fn elo_bins(&self) -> &[i32] {
         &self.elo_bins
-    }
-    pub fn elo_embed_dim(&self) -> usize {
-        self.elo_embed_dim
     }
     pub fn mlp_ratio(&self) -> f32 {
         self.mlp_ratio
@@ -256,12 +245,11 @@ impl Default for Config {
             side_info_loss_weight: 0.5,
             embed_dim: 256,
             num_heads: 4,
-            kv_groups: None,
             num_layers: 6,
             elo_bins: (800i32..=2800i32).step_by(200).collect(),
-            elo_embed_dim: 128,
             mlp_ratio: 4.0,
             max_samples: None,
+            skip: None,
             timeout: None,
             checkpoint: None,
             single_legal_move_only: false,

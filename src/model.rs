@@ -9,6 +9,8 @@ use burn::prelude::*;
 use burn::tensor::activation::{log_softmax, sigmoid, softmax, softplus};
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::{TrainOutput, TrainStep, ValidStep};
+use rand::rng;
+use rand::Rng as _;
 use statrs::distribution::{Continuous, Gamma};
 
 #[derive(Module, Debug)]
@@ -16,6 +18,11 @@ pub struct OXIModel<B: Backend> {
     board_embed: Linear<B>,
     pos_embed: Embedding<B>,
     global_embed: Linear<B>,
+    // Per-stream normalization and gating to balance token/global/pos embeddings
+    token_norm: LayerNorm<B>,
+    global_norm: LayerNorm<B>,
+    pos_norm: LayerNorm<B>,
+    gate_logits: Param<Tensor<B, 1>>, // [3] -> softmax to get gates for [token, global, pos]
     blocks: Vec<TransformerBlock<B>>,
     norm: LayerNorm<B>,
     policy_head: Linear<B>,
@@ -37,13 +44,24 @@ impl<B: Backend> OXIModel<B> {
 
         let mut blocks = Vec::new();
         for _ in 0..config.num_layers() {
-            blocks.push(TransformerBlock::new(device));
+            blocks.push(TransformerBlock::new(device, true));
         }
 
         // Learned absolute positional embeddings for 64 squares
         let pos_embed = EmbeddingConfig::new(64, config.embed_dim())
-            .with_initializer(nn::Initializer::Uniform { min: 0.0, max: 0.01 })
+            .with_initializer(nn::Initializer::Uniform {
+                min: 0.0,
+                max: 1.0, // Match 0-1 range of token/global features for better initial magnitude balance
+            })
             .init(device);
+
+        // Per-stream layer norms
+        let token_norm = LayerNormConfig::new(config.embed_dim()).init(device);
+        let global_norm = LayerNormConfig::new(config.embed_dim()).init(device);
+        let pos_norm = LayerNormConfig::new(config.embed_dim()).init(device);
+
+        // Gating logits initialized to zeros -> equal softmax weights
+        let gate_logits = Param::from_tensor(Tensor::zeros([3], device));
 
         let norm = LayerNormConfig::new(config.embed_dim()).init(device);
 
@@ -63,6 +81,10 @@ impl<B: Backend> OXIModel<B> {
             board_embed,
             pos_embed,
             global_embed,
+            token_norm,
+            global_norm,
+            pos_norm,
+            gate_logits,
             blocks,
             norm,
             policy_head,
@@ -99,7 +121,29 @@ impl<B: Backend> OXIModel<B> {
             .repeat_dim(0, batch_size);
         let embedding_positions = self.pos_embed.forward(index_positions);
 
-        let mut x = token_embeds + global_embeds + embedding_positions;
+        // Normalize each stream
+        let token_normed = self.token_norm.forward(token_embeds);
+        let global_normed = self.global_norm.forward(global_embeds);
+        let pos_normed = self.pos_norm.forward(embedding_positions);
+
+        // Softmax gates over the three streams
+        let gates = softmax(self.gate_logits.val(), 0); // [3]
+        let gate_token = gates.clone().slice([0..1]).reshape([1, 1, 1]);
+        let gate_global = gates.clone().slice([1..2]).reshape([1, 1, 1]);
+        let gate_pos = gates.clone().slice([2..3]).reshape([1, 1, 1]);
+
+        // Log gate values every forward pass
+        let gate_vals = gates.to_data();
+        let g = gate_vals.as_slice::<f32>().unwrap();
+        tracing::info!(
+            "Embedding gates (softmax): token={:.6} global={:.6} pos={:.6}",
+            g[0],
+            g[1],
+            g[2]
+        );
+
+        // Combine streams with learned gates
+        let mut x = token_normed * gate_token + global_normed * gate_global + pos_normed * gate_pos;
 
         for block in self.blocks.iter() {
             x = block.forward(x);
@@ -482,6 +526,7 @@ where
     fn step(&self, batch: crate::dataset::ChessBatch<B>) -> TrainOutput<ChessOutput<B>> {
         let item = self.forward_classification(batch);
         let grads = item.loss.backward();
+
         TrainOutput::new(self, grads, item)
     }
 }
