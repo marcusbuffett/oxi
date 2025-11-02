@@ -3,6 +3,7 @@ use burn::backend::LibTorch;
 #[cfg(target_os = "macos")]
 use burn::backend::Metal;
 
+#[cfg(not(target_os = "macos"))]
 use burn_tch::LibTorchDevice;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
@@ -202,18 +203,19 @@ async fn main() -> Result<()> {
             // let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
             //     (0..config.num_devices).map(CudaDevice::new).collect();
 
-            #[cfg(target_os = "linux")]
-            type Backend = Autodiff<LibTorch<f32>>;
-            #[cfg(target_os = "linux")]
-            let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-                (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
             #[cfg(target_os = "macos")]
-            type Backend = Autodiff<burn_ndarray::NdArray<f32, i32>>;
+            type Backend = Autodiff<Metal>;
             #[cfg(target_os = "macos")]
             let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
                 .num_devices)
                 .map(|_| <Backend as burn::tensor::backend::Backend>::Device::default())
                 .collect();
+
+            #[cfg(not(target_os = "macos"))]
+            type Backend = Autodiff<LibTorch<f32>>;
+            #[cfg(not(target_os = "macos"))]
+            let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
 
             // Run training with unified config
             use burn::backend::Autodiff;
@@ -240,13 +242,23 @@ async fn main() -> Result<()> {
                 anyhow::bail!("No positions provided. Use --fen or --fen-file");
             }
 
-            let device = burn_ndarray::NdArrayDevice::default();
+            #[cfg(target_os = "macos")]
+            let device = <Metal as burn::tensor::backend::Backend>::Device::default();
+            #[cfg(not(target_os = "macos"))]
+            let device = burn_tch::LibTorchDevice::Cuda(0);
 
             // Load model and create engine
             // TODO: We need to store model config with checkpoint to know num_blocks/channels
             // For now, use defaults
             let model_config = Config::default();
-            let _engine = InferenceEngine::<burn_ndarray::NdArray>::from_checkpoint(
+            #[cfg(target_os = "macos")]
+            let _engine = InferenceEngine::<Metal>::from_checkpoint(
+                &config.model_path,
+                model_config,
+                device,
+            )?;
+            #[cfg(not(target_os = "macos"))]
+            let _engine = InferenceEngine::<LibTorch<f32>>::from_checkpoint(
                 &config.model_path,
                 model_config,
                 device,
@@ -394,15 +406,15 @@ async fn main() -> Result<()> {
         Commands::FilterConfident(config) => {
             tracing::info!("Filtering confident predictions with config: {:?}", config);
 
-            #[cfg(target_os = "linux")]
-            type Backend = burn::backend::LibTorch<f32>;
-            #[cfg(target_os = "linux")]
-            let device = burn_tch::LibTorchDevice::Cuda(0);
+            #[cfg(target_os = "macos")]
+            type Backend = Metal;
+            #[cfg(target_os = "macos")]
+            let device = <Metal as burn::tensor::backend::Backend>::Device::default();
 
-            #[cfg(target_os = "macos")]
-            type Backend = burn_ndarray::NdArray<f32, i32>;
-            #[cfg(target_os = "macos")]
-            let device = <Backend as burn::tensor::backend::Backend>::Device::default();
+            #[cfg(not(target_os = "macos"))]
+            type Backend = burn::backend::LibTorch<f32>;
+            #[cfg(not(target_os = "macos"))]
+            let device = burn_tch::LibTorchDevice::Cuda(0);
 
             let filter_config = oxi::data_creation::FilterConfidentConfig {
                 model_path: config.model_path,

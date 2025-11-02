@@ -9,7 +9,6 @@ use crate::wdl_accuracy_metric::WdlAccuracyInput;
 use burn::prelude::*;
 use burn::tensor::Transaction;
 use burn::train::metric::{Adaptor, LossInput};
-use burn_ndarray::NdArray;
 use burn_train::metric::ItemLazy;
 
 /// Custom classification output for chess that includes separate policy and value outputs
@@ -134,6 +133,22 @@ impl<B: Backend> ChessOutput<B> {
         self
     }
 
+    /// Get the total loss used for metrics display (sum of raw losses if available)
+    /// This is the same calculation used by LossMetric
+    pub fn total_loss(&self) -> Tensor<B, 1> {
+        if let (Some(raw_policy), Some(raw_value), Some(raw_time)) = (
+            &self.raw_policy_loss,
+            &self.raw_value_loss,
+            &self.raw_time_usage_loss,
+        ) {
+            // Use raw losses if available (same as LossMetric)
+            raw_policy.clone() + raw_value.clone() + raw_time.clone()
+        } else {
+            // Fallback to combined loss
+            self.loss.clone()
+        }
+    }
+
     /// Detach all tensors from the autodiff graph to allow early memory reclamation.
     pub fn detach(self) -> Self {
         Self {
@@ -236,25 +251,7 @@ impl<B: Backend> Adaptor<TimeUsageLossInput<B>> for ChessOutput<B> {
 // Implement Adaptor for LossMetric
 impl<B: Backend> Adaptor<LossInput<B>> for ChessOutput<B> {
     fn adapt(&self) -> LossInput<B> {
-        let mut raw_total: Option<Tensor<B, 1>> = None;
-
-        for raw_loss in [
-            self.raw_policy_loss.clone(),
-            self.raw_value_loss.clone(),
-            self.raw_time_usage_loss.clone(),
-        ] {
-            if let Some(raw_loss) = raw_loss {
-                raw_total = Some(match raw_total.take() {
-                    Some(current) => current + raw_loss,
-                    None => raw_loss,
-                });
-            }
-        }
-
-        match raw_total {
-            Some(total_raw) => LossInput::new(total_raw),
-            None => LossInput::new(self.loss.clone()),
-        }
+        LossInput::new(self.total_loss())
     }
 }
 
@@ -285,7 +282,7 @@ impl<B: Backend> Adaptor<UncertaintyInput> for ChessOutput<B> {
 }
 
 impl<B: Backend> ItemLazy for ChessOutput<B> {
-    type ItemSync = ChessOutput<NdArray>;
+    type ItemSync = ChessOutput<crate::inference::InferenceBackend>;
 
     fn sync(self) -> Self::ItemSync {
         let target_distributions = self.target_distributions;

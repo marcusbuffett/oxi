@@ -110,8 +110,8 @@ impl<B: Backend> Metric for TimeUsageLossMetric<B> {
 impl<B: Backend> Numeric for TimeUsageLossMetric<B> {
     fn value(&self) -> NumericEntry {
         // Return raw loss if available, otherwise return weighted loss
-        // Cap at 2 for display purposes
+        // Cap at 10 for display purposes
         let value = self.current_raw_value.unwrap_or(self.current_value);
-        NumericEntry::Value(value.min(2.0))
+        NumericEntry::Value(value.min(10.0))
     }
 }

@@ -634,14 +634,18 @@ mod tests {
     use super::*;
     use crate::config::{FEATURES_PER_TOKEN, NUM_GLOBALS};
     use burn::tensor::TensorData;
-    use burn_ndarray::NdArray;
+
+    #[cfg(target_os = "macos")]
+    type TestBackend = burn::backend::Metal;
+    #[cfg(not(target_os = "macos"))]
+    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_beta_loss_matches_manual_nll() {
-        let device = Default::default();
+        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
         let config = ModelConfig::default();
         let _ = crate::config::set_global_config(config.clone());
-        let model = OXIModel::<NdArray>::new(&device, &config);
+        let model = OXIModel::<TestBackend>::new(&device, &config);
 
         let time_usage_params =
             Tensor::from_data(TensorData::from([[2.0, 3.0], [5.0, 2.5]]), &device);
@@ -677,9 +681,7 @@ mod tests {
 
     #[test]
     fn test_uncertainty_weighted_loss_non_negative_for_small_losses() {
-        use burn_ndarray::NdArray;
-        type TestBackend = NdArray;
-        let device = Default::default();
+        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
 
         // Very small raw losses (simulate < 0.02 edge case)
         let small_losses = [0.02f32, 0.005f32, 1e-6f32];
@@ -704,10 +706,10 @@ mod tests {
 
     #[test]
     fn test_time_usage_head_output_shape() {
-        let device = Default::default();
+        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
         let config = ModelConfig::default();
         let _ = crate::config::set_global_config(config.clone());
-        let model = OXIModel::<NdArray>::new(&device, &config);
+        let model = OXIModel::<TestBackend>::new(&device, &config);
 
         // Create dummy input
         let batch_size = 2;
@@ -737,10 +739,10 @@ mod tests {
 
     #[test]
     fn test_beta_loss_handles_extreme_targets() {
-        let device = Default::default();
+        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
         let config = ModelConfig::default();
         let _ = crate::config::set_global_config(config.clone());
-        let model = OXIModel::<NdArray>::new(&device, &config);
+        let model = OXIModel::<TestBackend>::new(&device, &config);
 
         let time_usage_params =
             Tensor::from_data(TensorData::from([[2.0, 5.0], [8.0, 1.5]]), &device);

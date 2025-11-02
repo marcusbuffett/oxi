@@ -3693,7 +3693,6 @@ dependencies = [
  "burn-autodiff",
  "burn-candle",
  "burn-cuda",
- "burn-ndarray",
  "burn-tch",
  "burn-train",
  "clap",

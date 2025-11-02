@@ -92,7 +92,11 @@ impl<B: Backend> MLP<B> {
 mod tests {
     use super::*;
     use crate::config::{set_global_config, Config};
-    use burn_ndarray::NdArray;
+
+    #[cfg(target_os = "macos")]
+    type TestBackend = burn::backend::Metal;
+    #[cfg(not(target_os = "macos"))]
+    type TestBackend = burn::backend::LibTorch<f32>;
 
     fn ensure_config() {
         // Try setting a small config; ignore error if already set
@@ -102,9 +106,12 @@ mod tests {
     #[test]
     fn transformer_block_smoke_shapes() {
         ensure_config();
-        let device = Default::default();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
         let config = get_global_config();
-        let block = TransformerBlock::<NdArray>::new(&device);
+        let block = TransformerBlock::<TestBackend>::new(&device);
         let batch_size = 2usize;
         let seq_len = 64usize; // 8x8 board
         let embed_dim = config.embed_dim();
@@ -117,9 +124,12 @@ mod tests {
     #[should_panic]
     fn transformer_block_panics_on_wrong_seq_len() {
         ensure_config();
-        let device = Default::default();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
         let config = get_global_config();
-        let block = TransformerBlock::<NdArray>::new(&device);
+        let block = TransformerBlock::<TestBackend>::new(&device);
         let batch_size = 1usize;
         let seq_len = 32usize; // wrong: not 8x8
         let embed_dim = config.embed_dim();
@@ -131,9 +141,12 @@ mod tests {
     #[ignore]
     fn transformer_block_large_batch_shapes() {
         ensure_config();
-        let device = Default::default();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
         let config = get_global_config();
-        let block = TransformerBlock::<NdArray>::new(&device);
+        let block = TransformerBlock::<TestBackend>::new(&device);
         let batch_size = 1024usize;
         let seq_len = 64usize; // 8x8 board
         let embed_dim = config.embed_dim();

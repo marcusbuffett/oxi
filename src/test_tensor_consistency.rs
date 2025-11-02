@@ -3,7 +3,6 @@ mod tests {
     use burn::data::dataloader::batcher::Batcher;
     use burn::data::dataloader::Dataset;
     use burn::prelude::*;
-    use burn_ndarray::NdArrayDevice;
     use shakmaty::Chess;
     use std::fs;
     use tempfile::NamedTempFile;
@@ -13,7 +12,10 @@ mod tests {
     use crate::inference::{GlobalFeatures, InferenceEngine};
     use crate::model::OXIModel;
 
-    type TestBackend = burn_ndarray::NdArray<f32>;
+    #[cfg(target_os = "macos")]
+    type TestBackend = burn::backend::Metal;
+    #[cfg(not(target_os = "macos"))]
+    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_tensor_consistency_between_inference_and_dataset() {
@@ -44,7 +46,10 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         fs::write(temp_file.path(), pgn_content).expect("Failed to write PGN content");
 
-        let device = NdArrayDevice::default();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
 
         // Load dataset from PGN
         let dataset =
@@ -183,7 +188,10 @@ mod tests {
         );
 
         // Test that reshaping works as expected
-        let device = NdArrayDevice::default();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
         let board_tensor = Tensor::<TestBackend, 1>::from_floats(encoded_board.as_slice(), &device)
             .reshape([1, 64, FEATURES_PER_TOKEN]);
 

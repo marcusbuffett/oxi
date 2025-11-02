@@ -290,7 +290,7 @@ impl<B: Backend> Metric for GradientNormMetric<B> {
 
 impl<B: Backend> Numeric for GradientNormMetric<B> {
     fn value(&self) -> NumericEntry {
-        // Cap at 50 for display purposes
-        NumericEntry::Value(self.current_value.min(50.0))
+        // Cap at 10 for display purposes
+        NumericEntry::Value(self.current_value.min(10.0))
     }
 }

@@ -75,12 +75,19 @@ impl<B: Backend> Numeric for LegalMoveProbabilityMetric<B> {
 mod tests {
     use super::*;
     use burn::data::dataloader::Progress;
-    use burn_ndarray::{NdArray, NdArrayDevice};
+
+    #[cfg(target_os = "macos")]
+    type TestBackend = burn::backend::Metal;
+    #[cfg(not(target_os = "macos"))]
+    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_legal_move_probability_perfect() {
-        let device = NdArrayDevice::default();
-        let mut metric = LegalMoveProbabilityMetric::<NdArray>::new();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
+        let mut metric = LegalMoveProbabilityMetric::<TestBackend>::new();
 
         // Create test data: 2 positions with different numbers of legal moves
         // Position 1: 3 legal moves (indices 0, 1, 2)
@@ -136,8 +143,11 @@ mod tests {
 
     #[test]
     fn test_legal_move_probability_batch() {
-        let device = NdArrayDevice::default();
-        let mut metric = LegalMoveProbabilityMetric::<NdArray>::new();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
+        let mut metric = LegalMoveProbabilityMetric::<TestBackend>::new();
 
         // Test batch with mixed legal move counts
         let policy_logits = Tensor::from_data(

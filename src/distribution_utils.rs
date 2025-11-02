@@ -68,13 +68,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_ndarray::NdArray;
 
-    type TestBackend = NdArray;
+    #[cfg(target_os = "macos")]
+    type TestBackend = burn::backend::Metal;
+    #[cfg(not(target_os = "macos"))]
+    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_log_gamma_approx() {
-        let device = Default::default();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
         let x = Tensor::<TestBackend, 1>::from_floats([1.0, 2.0, 3.0, 4.0], &device);
         let result = log_gamma_approx(x);
 

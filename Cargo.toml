@@ -8,17 +8,16 @@ name = "oxi"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "wgpu", "metal", "autodiff", "ndarray", "fusion", "tch", "candle" ] }
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "wgpu", "metal", "autodiff", "fusion", "tch", "candle" ] }
 burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", features = ["metal"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "tch", "autodiff", "ndarray", "fusion", "candle", "cuda"] }
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "tch", "autodiff", "fusion", "candle", "cuda"] }
 burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", features = ["cuda"] }
 
 [dependencies]
 burn-train = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["tui"] }
 burn-tch = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false }
-burn-ndarray = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 burn-cuda = { git = "https://github.com/tracel-ai/burn", branch = "main", optional = true }
 clap = { version = "*", features = ["derive"] }
 serde = { version = "*", features = ["derive"] }

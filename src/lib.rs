@@ -1,8 +1,8 @@
 pub mod chess_output;
 pub mod config;
 pub mod constants;
-pub mod cosine_scheduler;
 pub mod custom_training;
+pub mod reduce_on_plateau_scheduler;
 pub mod data_creation;
 pub mod dataset;
 pub mod debug_prediction_monitor;
@@ -14,6 +14,7 @@ pub mod gradnorm;
 pub mod gradnorm_status_metric;
 pub mod inference;
 pub mod legal_move_probability_metric;
+pub mod lr_plateau_metric;
 pub mod metrics_renderer;
 pub mod model;
 pub mod model_prediction_logger;

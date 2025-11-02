@@ -8,8 +8,8 @@ use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::train::metric::LossMetric;
+use burn_train::metric::IterationSpeedMetric;
 use burn_train::metric::{Adaptor, Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
-use burn_train::metric::{IterationSpeedMetric, LearningRateMetric};
 use burn_train::Interrupter;
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::thread_rng;
@@ -27,13 +27,13 @@ use tracing_subscriber::fmt as tracing_fmt;
 use crate::chess_output::ChessOutput;
 use crate::config::Config;
 use crate::constants::EASY_POSITIONS_PATH;
-use crate::cosine_scheduler::CosineAnnealingWithWarmup;
 use crate::dataset::{ChessBatch, ChessBatcher, ChessExample, ChessItem, OXIDataset};
 use crate::debug_prediction_monitor::DebugPredictionMonitor;
 use crate::gradient_norm_metric::{
     compute_gradient_norm, GradientNormBreakdown, GradientNormInput, GradientNormMetric,
 };
 use crate::gradnorm::{GradNormProbeResult, GradNormState, GradNormTask};
+use crate::lr_plateau_metric::{LrPlateauInput, LrPlateauMetric};
 use crate::metrics_renderer::{
     EvaluationName, EvaluationProgress, MetricState, MetricsRenderer, MetricsRendererEvaluation,
     MetricsRendererTraining, TrainingProgress,
@@ -41,6 +41,7 @@ use crate::metrics_renderer::{
 use crate::model::OXIModel;
 use crate::move_accuracy_metric::MoveTopKAccuracyMetric;
 use crate::policy_loss_metric::{PolicyLossInput, PolicyLossMetric};
+use crate::reduce_on_plateau_scheduler::ReduceOnPlateauScheduler;
 use crate::time_usage_loss_metric::{TimeUsageLossInput, TimeUsageLossMetric};
 use crate::training_stage_metric::{TrainingStage, TrainingStageInput, TrainingStageMetric};
 use crate::tui::OxiTuiRenderer;
@@ -882,7 +883,6 @@ fn format_metric_line(name: &str, history: &RollingMetric, as_percentage: bool) 
 #[allow(clippy::too_many_arguments)]
 fn write_scoresheet(
     config: &Config,
-    warmup_steps: usize,
     resume_status: &str,
     iteration: usize,
     items_processed: usize,
@@ -976,9 +976,11 @@ Model & Data Configuration\n\
 - Time usage loss weight: {time_usage_loss_weight}\n\
 - Weight decay: {weight_decay}\n\
 - Gradient clip: {gradient_clip}\n\
-- Warmup steps: {warmup}\n\
 - LR max: {lr_max}\n\
 - LR min: {lr_min}\n\
+- Measurement batch size: {measurement_batch_size}\n\
+- LR patience: {lr_patience}\n\
+- LR reduction factor: {lr_reduction_factor}\n\
 \n\
 Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         duration = training_duration.as_secs_f64(),
@@ -1002,9 +1004,11 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         time_usage_loss_weight = config.time_usage_loss_weight,
         weight_decay = config.weight_decay,
         gradient_clip = config.gradient_clip,
-        warmup = warmup_steps,
         lr_max = config.lr_max,
         lr_min = config.lr_min,
+        measurement_batch_size = config.measurement_batch_size,
+        lr_patience = config.lr_patience,
+        lr_reduction_factor = config.lr_reduction_factor,
         window = SCORE_WINDOW,
     );
 
@@ -1012,12 +1016,7 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
     Ok(filename)
 }
 
-struct TrainLogGuard {
-    _default_guard: DefaultGuard,
-    _worker_guard: WorkerGuard,
-}
-
-fn init_train_logging() -> TrainLogGuard {
+fn init_train_logging() {
     let file_appender = tracing_appender::rolling::never(".", "train.log");
     let (non_blocking, worker_guard) = tracing_appender::non_blocking(file_appender);
     let subscriber = tracing_fmt()
@@ -1027,12 +1026,7 @@ fn init_train_logging() -> TrainLogGuard {
         .without_time()
         .with_writer(non_blocking)
         .finish();
-    let default_guard = tracing::subscriber::set_default(subscriber);
-
-    TrainLogGuard {
-        _default_guard: default_guard,
-        _worker_guard: worker_guard,
-    }
+    let default_guard = tracing::subscriber::set_global_default(subscriber).unwrap();
 }
 
 /// Custom training loop with checkpointing every N iterations
@@ -1073,7 +1067,7 @@ where
     B::FloatElem: From<f32>,
     B::IntElem: From<i32>,
 {
-    let _train_log_guard = init_train_logging();
+    init_train_logging();
 
     println!("Using custom training loop");
     tracing::info!("Using custom training loop");
@@ -1386,6 +1380,15 @@ where
         1
     };
 
+    // Calculate effective batch size and initial learning rate
+    // LR scales with sqrt of batch size: batch_size=16000 -> lr=3e-2
+    let effective_batch_size = grad_accumulation_steps * config.physical_batch_size;
+    let initial_lr = 0.03 * (effective_batch_size as f64 / 16000.0).sqrt();
+    println!(
+        "Effective batch size: {}, Initial LR: {:.6}",
+        effective_batch_size, initial_lr
+    );
+
     // Create optimizers (4 groups: decay+normal_lr, decay+high_lr, no_decay+normal_lr, no_decay+high_lr)
     let grad_clipping = if config.gradient_clip > 0.0 {
         Some(GradientClippingConfig::Norm(config.gradient_clip as f32))
@@ -1561,26 +1564,32 @@ where
     let total_optimizer_steps =
         (total_batches + grad_accumulation_steps - 1) / grad_accumulation_steps;
 
-    // Compute warmup steps: use config value if provided, otherwise default to 10% of total batches
-    let warmup_steps = config
-        .warmup_steps
-        .unwrap_or((total_batches as f64 * 0.1) as usize);
-
     println!(
         "Total batches: {}, Total optimizer steps: {}",
         total_batches, total_optimizer_steps
     );
+    println!("Initial LR: {:.6}, Min LR: {}", initial_lr, config.lr_min);
     println!(
-        "Warmup steps: {} ({}% of total)",
-        warmup_steps,
-        (warmup_steps as f64 / total_batches as f64 * 100.0)
+        "Measurement batch size: {}, LR patience: {}, LR reduction factor: {}",
+        config.measurement_batch_size, config.lr_patience, config.lr_reduction_factor
     );
-    println!("Max LR: {}, Min LR: {}", config.lr_max, config.lr_min);
 
-    // Create cosine annealing learning rate scheduler with warmup
-    // Note: scheduler steps on every batch, so we scale total_steps by grad_accumulation
-    let mut lr_scheduler =
-        CosineAnnealingWithWarmup::new(warmup_steps, total_batches, config.lr_max, config.lr_min);
+    // Create ReduceOnPlateau learning rate scheduler
+    let mut lr_scheduler = ReduceOnPlateauScheduler::new(
+        initial_lr,
+        config.lr_min,
+        config.lr_reduction_factor,
+        config.lr_patience,
+        config.measurement_batch_size,
+    );
+
+    // Adjust measurement batch size to be a multiple of physical batch size
+    lr_scheduler.adjust_measurement_batch_size(config.physical_batch_size);
+    println!(
+        "Adjusted measurement batch size to: {} (multiple of physical batch size {})",
+        lr_scheduler.measurement_batch_size(),
+        config.physical_batch_size
+    );
 
     // Initialize metrics
     let mut loss_metric = LossMetric::new();
@@ -1599,7 +1608,7 @@ where
     let mut wdl_history = RollingMetric::new(SCORE_WINDOW);
     let mut gradient_norm_history = RollingMetric::new(SCORE_WINDOW);
     let mut iteration_speed_metric = IterationSpeedMetric::new();
-    let mut lr_metric = LearningRateMetric::new();
+    let mut lr_metric = LrPlateauMetric::new();
     let mut stage_metric = TrainingStageMetric::new();
 
     println!(
@@ -1647,6 +1656,19 @@ where
         if interruptor.should_stop() {
             println!("Training interrupted by user");
             tracing::info!("Training interrupted by user");
+            break;
+        }
+
+        // Check if scheduler indicates training should stop (at min LR with no improvement)
+        if lr_scheduler.should_stop() {
+            println!(
+                "Training stopped: reached min LR with no improvement for {} measurement batches",
+                config.lr_patience
+            );
+            tracing::info!(
+                "Training stopped: reached min LR with no improvement for {} measurement batches",
+                config.lr_patience
+            );
             break;
         }
 
@@ -1709,9 +1731,6 @@ where
         }
         accumulation_count += 1;
 
-        // Step the learning rate scheduler on every batch
-        current_lr = lr_scheduler.step();
-
         // Combine outputs back on the main device for logging/metrics
         let output = combine_outputs(&device_outputs, &devices[0]);
         drop(device_outputs);
@@ -1719,6 +1738,14 @@ where
         B::sync(&devices[0]);
         B::memory_cleanup(&devices[0]);
         gradnorm_state.record_batch_losses(iteration, &output);
+
+        // Record batch in ReduceOnPlateau scheduler
+        // Uses the same loss calculation as LossMetric (sum of raw losses if available)
+        let batch_loss = output.total_loss().into_scalar().elem::<f32>() as f64;
+        let _measurement_recorded = lr_scheduler.record_batch(current_batch_size, batch_loss);
+
+        // Get current learning rate from scheduler
+        current_lr = lr_scheduler.get_lr();
 
         // Update metrics metadata
         let metadata = MetricMetadata {
@@ -1984,7 +2011,13 @@ where
         let iteration_speed_entry = iteration_speed_metric.update(&output.adapt(), &metadata);
         renderer.update_train(MetricState::Generic(iteration_speed_entry));
 
-        let lr_entry = lr_metric.update(&output.adapt(), &metadata);
+        let lr_plateau_input = LrPlateauInput::new(
+            current_lr,
+            lr_scheduler.best_loss(),
+            lr_scheduler.batches_without_improvement(),
+            config.lr_patience,
+        );
+        let lr_entry = lr_metric.update(&lr_plateau_input, &metadata);
         let lr_value = Numeric::value(&lr_metric);
         renderer.update_train(MetricState::Numeric(lr_entry, lr_value));
 
@@ -2064,7 +2097,6 @@ where
 
     let scoresheet_path = write_scoresheet(
         &config,
-        warmup_steps,
         &resume_status,
         iteration,
         items_processed,

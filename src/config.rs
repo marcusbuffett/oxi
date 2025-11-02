@@ -92,20 +92,28 @@ pub struct Config {
     pub num_workers: usize,
 
     /// Maximum learning rate (after warmup)
-    #[arg(long, default_value = "0.0005")]
+    #[arg(long, default_value = "0.003")]
     pub lr_max: f64,
 
     /// Minimum learning rate (end of training)
-    #[arg(long, default_value = "0.000001")]
+    #[arg(long, default_value = "1e-6")]
     pub lr_min: f64,
 
     /// Learning rate scalar multiplier for scale parameters (scale_qk, scale_v)
     #[arg(long, default_value = "100.0")]
     pub lr_scalar: f64,
 
-    /// Number of warmup steps (batches, not optimizer steps). If not specified, defaults to 10% of total batches
-    #[arg(long)]
-    pub warmup_steps: Option<usize>,
+    /// Number of samples to accumulate before recording a loss measurement for ReduceOnPlateau
+    #[arg(long, default_value = "4000")]
+    pub measurement_batch_size: usize,
+
+    /// Number of measurement batches without improvement before reducing learning rate
+    #[arg(long, default_value = "25")]
+    pub lr_patience: usize,
+
+    /// Factor to reduce learning rate by when plateau is detected (e.g., 0.5 means halve the LR)
+    #[arg(long, default_value = "0.1")]
+    pub lr_reduction_factor: f64,
 
     /// Number of validation samples
     #[arg(long)]
@@ -444,10 +452,12 @@ impl Default for Config {
             gradnorm_value_priority: 1.0,
             gradnorm_time_priority: 1.0,
             gradnorm_probe_size: 256,
-            lr_max: 0.0005,
+            lr_max: 0.05,
             lr_min: 0.000001,
             lr_scalar: 100.0,
-            warmup_steps: Some(1000),
+            measurement_batch_size: 4000,
+            lr_patience: 25,
+            lr_reduction_factor: 0.1,
             validation_samples: None,
             policy_loss_weight: 0.15,
             policy_label_smoothing: 0.03,

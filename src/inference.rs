@@ -11,8 +11,12 @@ use crate::moves::{mirror_fen, mirror_move};
 use shakmaty::EnPassantMode;
 use shakmaty::{fen::Fen, san::SanPlus, Chess, Color, Position, Square};
 
-/// Simple NdArray backend without autodiff for inference
-pub type InferenceBackend = burn_ndarray::NdArray<f32>;
+/// Inference backend: Metal on macOS, LibTorch otherwise
+#[cfg(target_os = "macos")]
+pub type InferenceBackend = burn::backend::Metal;
+
+#[cfg(not(target_os = "macos"))]
+pub type InferenceBackend = burn::backend::LibTorch<f32>;
 
 /// Compute signed material imbalance (white - black) using standard piece values
 pub fn compute_material_imbalance(pos: &Chess) -> i32 {
@@ -355,12 +359,12 @@ where
         }
     }
 
-    /// Create a simple inference engine with NdArray backend
+    /// Create a simple inference engine with default device
     pub fn create_simple(
         model: OXIModel<InferenceBackend>,
         config: Config,
     ) -> InferenceEngine<InferenceBackend> {
-        let device = burn_ndarray::NdArrayDevice::default();
+        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
         InferenceEngine::new(model, config, device)
     }
 
@@ -920,11 +924,10 @@ pub struct PositionAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_ndarray::NdArrayDevice;
 
     #[test]
     fn test_inference_engine_creation() {
-        let device = NdArrayDevice::default();
+        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
         let config = Config::default();
         crate::config::set_global_config(config.clone()).unwrap();
         let model = OXIModel::<InferenceBackend>::new(&device, &config);
@@ -953,7 +956,7 @@ mod tests {
 
     #[test]
     fn test_analyze_position() {
-        let device = NdArrayDevice::default();
+        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
         let config = Config::default();
         crate::config::set_global_config(config.clone()).unwrap();
         let model = OXIModel::<InferenceBackend>::new(&device, &config);
@@ -978,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_momentum_features_snapshot() {
-        let device = NdArrayDevice::default();
+        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
         let config = Config::default();
         crate::config::set_global_config(config.clone()).unwrap();
 

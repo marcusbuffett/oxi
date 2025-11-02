@@ -97,12 +97,19 @@ impl<B: Backend> Numeric for WdlAccuracyMetric<B> {
 mod tests {
     use super::*;
     use burn::data::dataloader::Progress;
-    use burn_ndarray::{NdArray, NdArrayDevice};
+
+    #[cfg(target_os = "macos")]
+    type TestBackend = burn::backend::Metal;
+    #[cfg(not(target_os = "macos"))]
+    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_wdl_accuracy_perfect() {
-        let device = NdArrayDevice::default();
-        let mut metric = WdlAccuracyMetric::<NdArray>::new();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
+        let mut metric = WdlAccuracyMetric::<TestBackend>::new();
 
         // Create test data: 3 examples with perfect predictions
         // Outputs as logits (before softmax)
@@ -148,8 +155,11 @@ mod tests {
 
     #[test]
     fn test_wdl_accuracy_partial() {
-        let device = NdArrayDevice::default();
-        let mut metric = WdlAccuracyMetric::<NdArray>::new();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
+        let mut metric = WdlAccuracyMetric::<TestBackend>::new();
 
         // Create test data: 4 examples, 2 correct, 2 incorrect
         let outputs = Tensor::from_data(
@@ -194,8 +204,11 @@ mod tests {
 
     #[test]
     fn test_wdl_accuracy_batch_update() {
-        let device = NdArrayDevice::default();
-        let mut metric = WdlAccuracyMetric::<NdArray>::new();
+        #[cfg(target_os = "macos")]
+        let device = burn::backend::metal::MetalDevice::default();
+        #[cfg(not(target_os = "macos"))]
+        let device = burn_tch::LibTorchDevice::Cpu;
+        let mut metric = WdlAccuracyMetric::<TestBackend>::new();
 
         // First batch: 2/3 correct
         let outputs1 = Tensor::from_data(
