@@ -1,9 +1,5 @@
 use anyhow::Result;
 use burn::backend::LibTorch;
-#[cfg(target_os = "macos")]
-use burn::backend::Metal;
-
-#[cfg(not(target_os = "macos"))]
 use burn_tch::LibTorchDevice;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
@@ -180,7 +176,8 @@ struct FilterConfidentConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing with environment variable support
+    // Initialize logging to train.log
+    let _guard = oxi::custom_training::init_train_logging();
 
     let cli = Cli::parse();
 
@@ -188,9 +185,6 @@ async fn main() -> Result<()> {
         Commands::Train(config) => {
             tracing::info!("Starting training with config: {:?}", config);
             set_global_config(config.clone()).unwrap();
-            if config.disable_tui {
-                tracing_subscriber::fmt().init();
-            }
 
             // Validate that data_path is provided
             let _data_path = config
@@ -198,21 +192,15 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("--data-path is required for training"))?;
 
-            // #[cfg(target_os = "linux")]
-            // type Backend = Autodiff<Cuda>;
-            // let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-            //     (0..config.num_devices).map(CudaDevice::new).collect();
+            // Use LibTorch backend on all platforms (MPS on macOS, CUDA elsewhere)
+            type Backend = Autodiff<LibTorch<f32>>;
 
-            #[cfg(target_os = "macos")]
-            type Backend = Autodiff<Metal>;
             #[cfg(target_os = "macos")]
             let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
                 .num_devices)
-                .map(|_| <Backend as burn::tensor::backend::Backend>::Device::default())
+                .map(|_| LibTorchDevice::Mps)
                 .collect();
 
-            #[cfg(not(target_os = "macos"))]
-            type Backend = Autodiff<LibTorch<f32>>;
             #[cfg(not(target_os = "macos"))]
             let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
                 (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
@@ -243,7 +231,7 @@ async fn main() -> Result<()> {
             }
 
             #[cfg(target_os = "macos")]
-            let device = <Metal as burn::tensor::backend::Backend>::Device::default();
+            let device = burn_tch::LibTorchDevice::Mps;
             #[cfg(not(target_os = "macos"))]
             let device = burn_tch::LibTorchDevice::Cuda(0);
 
@@ -252,7 +240,7 @@ async fn main() -> Result<()> {
             // For now, use defaults
             let model_config = Config::default();
             #[cfg(target_os = "macos")]
-            let _engine = InferenceEngine::<Metal>::from_checkpoint(
+            let _engine = InferenceEngine::<LibTorch<f32>>::from_checkpoint(
                 &config.model_path,
                 model_config,
                 device,
@@ -406,13 +394,12 @@ async fn main() -> Result<()> {
         Commands::FilterConfident(config) => {
             tracing::info!("Filtering confident predictions with config: {:?}", config);
 
-            #[cfg(target_os = "macos")]
-            type Backend = Metal;
-            #[cfg(target_os = "macos")]
-            let device = <Metal as burn::tensor::backend::Backend>::Device::default();
-
-            #[cfg(not(target_os = "macos"))]
+            // Use LibTorch backend on all platforms (MPS on macOS, CUDA elsewhere)
             type Backend = burn::backend::LibTorch<f32>;
+
+            #[cfg(target_os = "macos")]
+            let device = burn_tch::LibTorchDevice::Mps;
+
             #[cfg(not(target_os = "macos"))]
             let device = burn_tch::LibTorchDevice::Cuda(0);
 

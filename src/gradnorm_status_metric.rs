@@ -77,15 +77,33 @@ fn format_status(status: &GradNormTaskStatus) -> String {
 
     let loss_display = status
         .last_loss
-        .map(|loss| format!("{loss:.6}"))
+        .map(|loss| {
+            if loss < 0.01 {
+                format!("{loss:.2e}")
+            } else {
+                format!("{loss:.6}")
+            }
+        })
         .unwrap_or_else(|| "N/A".to_string());
     let weighted_display = status
         .last_weighted_loss
-        .map(|loss| format!("{loss:.6}"))
+        .map(|loss| {
+            if loss < 0.01 {
+                format!("{loss:.2e}")
+            } else {
+                format!("{loss:.6}")
+            }
+        })
         .unwrap_or_else(|| "N/A".to_string());
     let grad_display = status
         .last_grad_norm
-        .map(|grad| format!("{grad:.4}"))
+        .map(|grad| {
+            if grad < 0.01 {
+                format!("{grad:.2e}")
+            } else {
+                format!("{grad:.4}")
+            }
+        })
         .unwrap_or_else(|| "N/A".to_string());
 
     format!(

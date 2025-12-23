@@ -697,9 +697,9 @@ fn ray_piece_index(color: Color, role: Role) -> usize {
     color_offset + ray_piece_group(role)
 }
 
-fn compute_ray_features(board: &shakmaty::Board, origin: Square) -> ([[f32; 8]; 2], f32) {
+fn compute_ray_features(board: &shakmaty::Board, origin: Square) -> ([[f32; 8]; 8], f32) {
     let mut directional_weights = [[0.0f32; 8]; 8];
-    let mut directional_pin_flags = [0.0f32; 8];
+    let mut any_pin = 0.0f32;
     let origin_piece = board.piece_at(origin);
     let origin_color = origin_piece.map(|piece| piece.color);
     let origin_role = origin_piece.map(|piece| piece.role);
@@ -731,7 +731,7 @@ fn compute_ray_features(board: &shakmaty::Board, origin: Square) -> ([[f32; 8]; 
                                 if behind_value > candidate_value
                                     && !role_moves_in_direction(c_role, (dx, dy))
                                 {
-                                    directional_pin_flags[dir_idx] = 1.0;
+                                    any_pin = 1.0;
                                 }
                                 can_pin = false;
                             } else {
@@ -750,26 +750,13 @@ fn compute_ray_features(board: &shakmaty::Board, origin: Square) -> ([[f32; 8]; 
         }
     }
 
-    let mut aggregated_weights = [[0.0f32; 8]; 2]; // [0]=diagonals, [1]=cardinals
-    let mut any_pin = 0.0f32;
-
-    for dir_idx in 0..8 {
-        let target = if dir_idx >= 4 { 0 } else { 1 };
-        for group_idx in 0..8 {
-            aggregated_weights[target][group_idx] += directional_weights[dir_idx][group_idx];
-        }
-        if directional_pin_flags[dir_idx] > 0.5 {
-            any_pin = 1.0;
-        }
-    }
-
-    for weights in aggregated_weights.iter_mut() {
+    for weights in directional_weights.iter_mut() {
         for weight in weights.iter_mut() {
-            *weight = weight.clamp(0.0, 1.0);
+            *weight = (*weight / 2.0).clamp(0.0, 1.0);
         }
     }
 
-    (aggregated_weights, any_pin)
+    (directional_weights, any_pin)
 }
 
 fn normalize_vec(vector: (f32, f32)) -> (f32, f32) {

@@ -270,7 +270,11 @@ impl<B: Backend> Metric for GradientNormMetric<B> {
     fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
         self.current_value = input.norm;
 
-        let formatted = format!("{:.6}", input.norm);
+        let formatted = if input.norm < 0.01 {
+            format!("{:.2e}", input.norm)
+        } else {
+            format!("{:.6}", input.norm)
+        };
 
         MetricEntry::new(
             "Gradient Norm".to_string().into(),

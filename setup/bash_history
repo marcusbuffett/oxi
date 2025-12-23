@@ -1,0 +1,99 @@
+cd oxi
+cargo run --release -- --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+cargo run --release -- train --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+sudo apt install -y libssl-dev build-essential curl wget
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+# 5. Create project venv + PyTorch (cu128 for B200) **~30s**
+uv init --python 3.12 myproject  # Or 3.10 to match Stack
+uv venv
+source .venv/bin/activate
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+echo "✅ PyTorch 2.7.0 (cu128) installed!"
+LIBTORCH=$(uv run python -c "import torch; print(torch.utils.cmake_prefix_path)")
+echo "export LIBTORCH='$LIBTORCH'" >> ~/.bashrc
+echo "✅ libtorch ready! In CMakeLists.txt: list(APPEND CMAKE_PREFIX_PATH \$ENV{LIBTORCH})"
+cargo run --release -- train --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+exit
+v ~/.bashrc 
+vim ~/.bashrc
+nvidia-smi
+nvidia-smi  # Shows 8x B200 GPUs, driver ~56xxx
+nvcc --version  # CUDA 12.8
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"  # 2.7.0 True 8
+sudo apt-get install -y rsync
+cd oxi
+cargo run --release -- --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo run --release -- --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+. "$HOME/.cargo/env"
+cargo run --release -- --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+apt install openssl
+sudo apt install openssl
+apt install openssl
+cargo run --release -- --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+sudo apt install libssl-dev
+sudo apt update
+sudo apt install libssl-dev
+cargo run --release -- --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+cargo run --release -- download-all --output-dir /lambda/nfs/chessbook/
+cd oxi
+cargo run --release -- train --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+echo $LIBTORCH 
+echo $LIBTORCH_USE_PYTORCH
+export LIBTORCH=/home/ubuntu/oxi/.venv/lib/python3.12/site-packages/torch
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+cargo run --release -- train --data-path /lambda/nfs/chessbook/lichess --max-samples 24000000 --physical-batch-size=512 --batch-size=8192 --num-layers=14 --num-heads=8 --embed-dim=768 --num-pretrain-steps=1000000 --log-gradient-breakdown --gradient-breakdown-interval 2 --gradient-layer-limit 128 --gradient-head-limit 128 --time-usage-loss-weight=0 --max-easy-positions=0 --gradnorm-interval=1 --gradnorm-policy-priority=20.0 --gradient-clip=3.0 --lr-max=0.0003 --warmup-steps=1000 --value-loss-weight=0.0001 --conv-layers=0
+vim run.sh
+./run.sh
+chmod +x run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+vim run.sh
+./run.sh
+sudo apt install tmux
+TERM=xterm tmux
+htop
+TERM=xterm htop
+nvidia-smi
+TERM=xterm htop
+nvidia-smi
+nvidia-smi --help
+nvidia-smi -l

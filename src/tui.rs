@@ -1313,7 +1313,13 @@ fn average_previous(samples: &[MetricSample], count: usize) -> Option<f64> {
 
 fn format_value(value: Option<f64>) -> String {
     match value {
-        Some(v) if v.is_finite() => format!("{:.4}", v),
+        Some(v) if v.is_finite() => {
+            if v < 0.01 && v != 0.0 {
+                format!("{:.2e}", v)
+            } else {
+                format!("{:.4}", v)
+            }
+        }
         _ => "--".to_string(),
     }
 }
@@ -1332,15 +1338,21 @@ fn format_delta(delta: f64, previous: Option<f64>) -> (String, Color) {
         Color::Gray
     };
 
+    let delta_str = if delta.abs() < 0.01 && delta.abs() > f64::EPSILON {
+        format!("{:.2e}", delta.abs())
+    } else {
+        format!("{:.4}", delta.abs())
+    };
+
     let text = if let Some(prev) = previous {
         if prev.abs() > f64::EPSILON {
             let percent = (delta / prev.abs()) * 100.0;
-            format!("{}{:.4} ({}{:.1}%)", sign, delta, sign, percent)
+            format!("{}{} ({}{:.1}%)", sign, delta_str, sign, percent)
         } else {
-            format!("{}{:.4}", sign, delta)
+            format!("{}{}", sign, delta_str)
         }
     } else {
-        format!("{}{:.4}", sign, delta)
+        format!("{}{}", sign, delta_str)
     };
 
     (text, color)

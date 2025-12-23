@@ -55,7 +55,13 @@ impl Metric for LrPlateauMetric {
 
         let best_loss_display = self
             .best_loss
-            .map(|loss| format!("{loss:.6}"))
+            .map(|loss| {
+                if loss < 0.01 {
+                    format!("{loss:.2e}")
+                } else {
+                    format!("{loss:.6}")
+                }
+            })
             .unwrap_or_else(|| "N/A".to_string());
 
         let progress_pct = if self.patience > 0 {
@@ -64,9 +70,15 @@ impl Metric for LrPlateauMetric {
             0.0
         };
 
+        let lr_display = if self.current_lr < 0.01 {
+            format!("{:.2e}", self.current_lr)
+        } else {
+            format!("{:.6}", self.current_lr)
+        };
+
         let formatted = format!(
-            "LR: {lr:.6}, Best Loss: {best}, Plateau: {batches}/{patience} ({progress:.0}%)",
-            lr = self.current_lr,
+            "LR: {lr}, Best Loss: {best}, Plateau: {batches}/{patience} ({progress:.0}%)",
+            lr = lr_display,
             best = best_loss_display,
             batches = self.batches_without_improvement,
             patience = self.patience,

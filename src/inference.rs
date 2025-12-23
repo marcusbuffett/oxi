@@ -11,11 +11,7 @@ use crate::moves::{mirror_fen, mirror_move};
 use shakmaty::EnPassantMode;
 use shakmaty::{fen::Fen, san::SanPlus, Chess, Color, Position, Square};
 
-/// Inference backend: Metal on macOS, LibTorch otherwise
-#[cfg(target_os = "macos")]
-pub type InferenceBackend = burn::backend::Metal;
-
-#[cfg(not(target_os = "macos"))]
+/// Inference backend: LibTorch on all platforms (MPS on macOS, CUDA elsewhere)
 pub type InferenceBackend = burn::backend::LibTorch<f32>;
 
 /// Compute signed material imbalance (white - black) using standard piece values

@@ -164,15 +164,11 @@ impl<B: Backend> ChessOutput<B> {
             value_output: self.value_output.detach(),
             value_targets: self.value_targets.detach(),
             legal_moves_mask: self.legal_moves_mask.detach(),
-            target_distributions: self
-                .target_distributions
-                .map(|tensor| tensor.detach()),
+            target_distributions: self.target_distributions.map(|tensor| tensor.detach()),
             uncertainties: self.uncertainties,
             raw_policy_loss: self.raw_policy_loss.map(|tensor| tensor.detach()),
             raw_value_loss: self.raw_value_loss.map(|tensor| tensor.detach()),
-            raw_time_usage_loss: self
-                .raw_time_usage_loss
-                .map(|tensor| tensor.detach()),
+            raw_time_usage_loss: self.raw_time_usage_loss.map(|tensor| tensor.detach()),
         }
     }
 }

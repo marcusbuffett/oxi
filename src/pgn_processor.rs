@@ -354,13 +354,15 @@ impl Visitor for PgnVisitor {
         // Compute material imbalance for momentum tracking
         let material_imbalance = crate::inference::compute_material_imbalance(&self.position);
 
-        let should_include = if config.single_legal_move_only && config.checkmate_only {
+        let should_include = if config.single_legal_move_only.unwrap_or(false)
+            && config.checkmate_only.unwrap_or(false)
+        {
             // Both flags: only include positions with single legal move AND that deliver checkmate
             has_single_legal_move && is_checkmate
-        } else if config.single_legal_move_only {
+        } else if config.single_legal_move_only.unwrap_or(false) {
             // Only single legal move positions
             has_single_legal_move
-        } else if config.checkmate_only {
+        } else if config.checkmate_only.unwrap_or(false) {
             // Only checkmate positions
             is_checkmate
         } else {
@@ -1165,10 +1167,10 @@ mod tests {
     /// Create a test configuration that doesn't filter based on ply/elo
     fn create_test_config() -> Config {
         let mut config = Config::default();
-        config.enable_ply_sampling = false;
-        config.enable_elo_sampling = false;
-        config.single_legal_move_only = false;
-        config.checkmate_only = false;
+        config.enable_ply_sampling = Some(false);
+        config.enable_elo_sampling = Some(false);
+        config.single_legal_move_only = Some(false);
+        config.checkmate_only = Some(false);
         set_global_config(config.clone()).unwrap();
         config
     }

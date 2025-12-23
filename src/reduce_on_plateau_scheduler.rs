@@ -57,7 +57,8 @@ impl ReduceOnPlateauScheduler {
     /// Adjust measurement batch size to be a multiple of physical batch size
     pub fn adjust_measurement_batch_size(&mut self, physical_batch_size: usize) {
         // Round up to nearest multiple of physical_batch_size
-        let multiple = (self.measurement_batch_size + physical_batch_size - 1) / physical_batch_size;
+        let multiple =
+            (self.measurement_batch_size + physical_batch_size - 1) / physical_batch_size;
         self.measurement_batch_size = multiple * physical_batch_size;
     }
 
@@ -142,7 +143,17 @@ impl ReduceOnPlateauScheduler {
 }
 
 impl LrScheduler for ReduceOnPlateauScheduler {
-    type Record<B: Backend> = (f64, f64, f64, usize, usize, usize, Option<f64>, usize, usize);
+    type Record<B: Backend> = (
+        f64,
+        f64,
+        f64,
+        usize,
+        usize,
+        usize,
+        Option<f64>,
+        usize,
+        usize,
+    );
 
     fn step(&mut self) -> f64 {
         // Unlike the cosine scheduler, we don't step automatically

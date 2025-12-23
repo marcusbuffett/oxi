@@ -286,7 +286,7 @@ fn format_square_encoding(square_idx: usize, encoded_board: &[f32]) -> String {
     let hanging_feature = tactical_features[t_idx];
     t_idx += 1;
 
-    const DIRECTION_LABELS: [&str; 2] = ["Diagonals", "Cardinals"];
+    const DIRECTION_LABELS: [&str; 8] = ["N", "S", "E", "W", "NE", "NW", "SE", "SW"];
     const GROUP_LABELS: [&str; 4] = ["minors", "majors", "pawns", "kings"];
     let format_group_counts = |counts: &[f32]| -> String {
         GROUP_LABELS
@@ -297,7 +297,7 @@ fn format_square_encoding(square_idx: usize, encoded_board: &[f32]) -> String {
             .join(" ")
     };
 
-    output.push_str("\t\tRay piece weights (white | black):\n");
+    output.push_str("\t\tRay piece weights by direction (white | black):\n");
     for dir_name in DIRECTION_LABELS.iter() {
         let counts = &tactical_features[t_idx..t_idx + 8];
         let white_counts = &counts[..4];

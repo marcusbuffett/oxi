@@ -1,0 +1,92 @@
+ubuntu@209-20-156-238:~/inference/bot$ cargo tree | grep -E 'burn|tch|torch'
+│   ├── matchit v0.7.3
+├── burn v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   ├── burn-autodiff v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-candle v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-core v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── burn-dataset v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-derive v0.20.0 (proc-macro) (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-cuda v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-cubecl v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   ├── burn-cubecl-fusion v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   │   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   │   ├── burn-fusion v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   │   │   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   │   │   ├── burn-ir v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   │   │   │   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   │   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   │   ├── burn-ir v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   ├── burn-fusion v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   ├── burn-ir v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── burn-fusion v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-ir v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-ndarray v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-autodiff v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── burn-ir v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-nn v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-core v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-optim v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-core v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-tch v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│   │   ├── burn-common v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── burn-tensor v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   │   ├── tch v0.22.0
+│   │   │   ├── torch-sys v0.22.0
+│   │   └── torch-sys v0.22.0 (*)
+│   └── burn-train v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e)
+│       ├── burn-core v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│       ├── burn-ndarray v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│       ├── burn-optim v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+├── burn-ndarray v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+├── burn-tch v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-candle v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-ndarray v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-tch v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+│   ├── burn-train v0.20.0 (https://github.com/tracel-ai/burn?branch=main#17f8024e) (*)
+ubuntu@209-20-156-238:~/inference/bot$ echo $LIBTORCH
+/home/ubuntu/oxi/.venv/lib/python3.12/site-packages/torch
+ubuntu@209-20-156-238:~/inference/bot$ ldd target/debug/bot | grep -E 'torch|c10'
+        libtorch_cuda.so => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so (0x000074a2cdc00000)
+        libtorch_cpu.so => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so (0x000074a2b8a00000)
+        libc10.so => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/libc10.so (0x000074a3045f6000)
+        libc10_cuda.so => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/libc10_cuda.so (0x000074a2cdb49000)
+        libcudart.so.12 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/cuda_runtime/lib/libcudart.so.12 (0x000074a2b7c00000)
+        libcusparse.so.12 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/cusparse/lib/libcusparse.so.12 (0x000074a2a6c00000)
+        libcufft.so.11 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/cufft/lib/libcufft.so.11 (0x000074a295000000)
+        libcusparseLt.so.0 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../cusparselt/lib/libcusparseLt.so.0 (0x000074a288000000)
+        libcurand.so.10 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/curand/lib/libcurand.so.10 (0x000074a281a00000)
+        libcublas.so.12 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/cublas/lib/libcublas.so.12 (0x000074a27ae00000)
+        libcublasLt.so.12 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/cublas/lib/libcublasLt.so.12 (0x000074a25ce00000)
+        libcudnn.so.9 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/cudnn/lib/libcudnn.so.9 (0x000074a25ca00000)
+        libnccl.so.2 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/nccl/lib/libnccl.so.2 (0x000074a24e200000)
+        libgomp-a34b3233.so.1 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/libgomp-a34b3233.so.1 (0x000074a24de00000)
+        libcupti.so.12 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/cuda_cupti/lib/libcupti.so.12 (0x000074a24d400000)
+        libnvJitLink.so.12 => /home/ubuntu/inference/bot/.venv/lib/python3.12/site-packages/torch/lib/../../nvidia/cusparse/lib/../../nvjitlink/lib/libnvJitLink.so.12 (0x000074a249e00000)
+ubuntu@209-20-156-238:~/inference/bot$ python -c "import torch; print(torch.__version__)"
+2.9.0+cu128
+ubuntu@209-20-156-238:~/inference/bot$ uv pip install --upgrade "torch>=2.5.0" "torchvision" "torchaudio" --index-url https://download.pytorch.org/whl/cu128
+Using Python 3.12.11 environment at: /home/ubuntu/oxi/.venv
+Resolved 30 packages in 864ms
+Audited 30 packages in 0.07ms
+ubuntu@209-20-156-238:~/inference/bot$ python -c "import torch; print(torch.__version__)"
+2.9.0+cu128
+ubuntu@209-20-156-238:~/inference/bot$ echo $LIBTORCH
+/home/ubuntu/oxi/.venv/lib/python3.12/site-packages/torch
+
+ubuntu@209-20-156-238:~/inference/bot$ LIBTORCH_BYPASS_VERSION_CHECK=1 INFERENCE_WORKERS=1 cargo run
+target/debug/bot: symbol lookup error: target/debug/bot: undefined symbol: _ZN3c106detail23torchInternalAssertFailEPKcS2_jS2_RKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE
+

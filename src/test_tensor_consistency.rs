@@ -23,8 +23,8 @@ mod tests {
         let model_config = ModelConfig::default();
         let mut config = Config::default();
         // Disable sampling so all moves are included
-        config.enable_ply_sampling = false;
-        config.enable_elo_sampling = false;
+        config.enable_ply_sampling = Some(false);
+        config.enable_elo_sampling = Some(false);
         let _ = set_global_config(config);
 
         // Create a mock PGN file with the required format

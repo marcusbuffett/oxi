@@ -179,10 +179,8 @@ const MODEL_DIR_NAME: &str = "model";
 const MODEL_FILE_NAME: &str = "model.mpk";
 const OPT_DECAY_NORMAL_FILE_NAME: &str = "optimizer_decay_normal.mpk";
 const OPT_DECAY_HIGH_FILE_NAME: &str = "optimizer_decay_high.mpk";
-const OPT_DECAY_SCALE_FILE_NAME: &str = "optimizer_decay_scale.mpk";
 const OPT_NO_DECAY_NORMAL_FILE_NAME: &str = "optimizer_no_decay_normal.mpk";
 const OPT_NO_DECAY_HIGH_FILE_NAME: &str = "optimizer_no_decay_high.mpk";
-const OPT_NO_DECAY_SCALE_FILE_NAME: &str = "optimizer_no_decay_scale.mpk";
 const GRADNORM_STATE_FILE_NAME: &str = "gradnorm_state.bin";
 
 fn save_optimizer_state<B: AutodiffBackend, O>(
@@ -214,15 +212,13 @@ where
     Ok(optimizer.load_record(record))
 }
 
-fn save_training_state<B, O1, O2, O3, O4, O5, O6>(
+fn save_training_state<B, O1, O2, O3, O4>(
     model: &OXIModel<B>,
     gradnorm_state: &GradNormState,
     optim_decay_normal: &O1,
     optim_decay_high: &O2,
-    optim_decay_scale: &O3,
-    optim_no_decay_normal: &O4,
-    optim_no_decay_high: &O5,
-    optim_no_decay_scale: &O6,
+    optim_no_decay_normal: &O3,
+    optim_no_decay_high: &O4,
     directory: &Path,
 ) -> anyhow::Result<()>
 where
@@ -231,8 +227,6 @@ where
     O2: Optimizer<OXIModel<B>, B>,
     O3: Optimizer<OXIModel<B>, B>,
     O4: Optimizer<OXIModel<B>, B>,
-    O5: Optimizer<OXIModel<B>, B>,
-    O6: Optimizer<OXIModel<B>, B>,
 {
     std::fs::create_dir_all(directory)?;
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
@@ -254,24 +248,14 @@ where
         directory.join(OPT_DECAY_HIGH_FILE_NAME),
     )?;
     save_optimizer_state::<B, O3>(
-        optim_decay_scale,
-        &recorder,
-        directory.join(OPT_DECAY_SCALE_FILE_NAME),
-    )?;
-    save_optimizer_state::<B, O4>(
         optim_no_decay_normal,
         &recorder,
         directory.join(OPT_NO_DECAY_NORMAL_FILE_NAME),
     )?;
-    save_optimizer_state::<B, O5>(
+    save_optimizer_state::<B, O4>(
         optim_no_decay_high,
         &recorder,
         directory.join(OPT_NO_DECAY_HIGH_FILE_NAME),
-    )?;
-    save_optimizer_state::<B, O6>(
-        optim_no_decay_scale,
-        &recorder,
-        directory.join(OPT_NO_DECAY_SCALE_FILE_NAME),
     )?;
 
     let gradnorm_path = directory.join(GRADNORM_STATE_FILE_NAME);
@@ -993,7 +977,7 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         seed = config.seed,
         num_pretrain_steps = config.num_pretrain_steps,
         checkpoint_interval = config.checkpoint_interval,
-        resume_flag = config.resume,
+        resume_flag = config.resume.unwrap_or(false),
         embed_dim = config.embed_dim(),
         num_heads = config.num_heads(),
         num_layers = config.num_layers(),
@@ -1016,7 +1000,7 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
     Ok(filename)
 }
 
-fn init_train_logging() {
+pub fn init_train_logging() -> WorkerGuard {
     let file_appender = tracing_appender::rolling::never(".", "train.log");
     let (non_blocking, worker_guard) = tracing_appender::non_blocking(file_appender);
     let subscriber = tracing_fmt()
@@ -1026,7 +1010,19 @@ fn init_train_logging() {
         .without_time()
         .with_writer(non_blocking)
         .finish();
-    let default_guard = tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    // Try to set the global default, but don't panic if it's already set
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    worker_guard
+}
+
+fn sync_backend_if_supported<B: AutodiffBackend>(device: &B::Device) {
+    let backend_name = B::name(device);
+    if backend_name.contains("<metal>") {
+        return;
+    }
+    B::sync(device);
 }
 
 /// Custom training loop with checkpointing every N iterations
@@ -1067,8 +1063,6 @@ where
     B::FloatElem: From<f32>,
     B::IntElem: From<i32>,
 {
-    init_train_logging();
-
     println!("Using custom training loop");
     tracing::info!("Using custom training loop");
 
@@ -1078,7 +1072,7 @@ where
     let mut resume_status = "Not requested".to_string();
     let mut resume_optimizer_dir: Option<PathBuf> = None;
 
-    if config.resume {
+    if config.resume.unwrap_or(false) {
         let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
         let resume_dir = Path::new(MODEL_DIR_NAME);
         let model_file = resume_dir.join(MODEL_FILE_NAME);
@@ -1123,12 +1117,11 @@ where
     }
 
     let weight_decay_groups = WeightDecayGroups::new::<B, _>(&model);
-    let (decay_params, no_decay_params, normal_lr_params, high_lr_params, scale_lr_params) =
+    let (decay_params, no_decay_params, normal_lr_params, high_lr_params) =
         weight_decay_groups.counts();
 
-    // Calculate LR multipliers
-    let lr_multiplier = (config.embed_dim() as f64).sqrt(); // For embeddings
-    let scale_lr_multiplier = config.lr_scalar; // For scale parameters
+    // Calculate LR multiplier for embeddings and scale parameters
+    let lr_multiplier = (config.embed_dim() as f64).sqrt();
 
     println!("\nParameter grouping summary:");
     println!(
@@ -1136,52 +1129,39 @@ where
         decay_params, no_decay_params
     );
     println!(
-        "  Learning rate: {} normal LR, {} high LR, {} scale LR",
-        normal_lr_params, high_lr_params, scale_lr_params
+        "  Learning rate: {} normal LR, {} high LR (embeddings + scale params)",
+        normal_lr_params, high_lr_params
     );
     println!(
-        "  LR multiplier for embeddings: {:.4}x (sqrt({}) = {:.4})",
+        "  LR multiplier for high LR params: {:.4}x (sqrt({}) = {:.4})",
         lr_multiplier,
         config.embed_dim(),
         lr_multiplier
-    );
-    println!(
-        "  LR multiplier for scale params: {:.4}x",
-        scale_lr_multiplier
     );
     println!(
         "  Base LR range: {:.6} (max) -> {:.6} (min)",
         config.lr_max, config.lr_min
     );
     println!(
-        "  High LR range: {:.6} (max) -> {:.6} (min)",
+        "  High LR range: {:.6} (max) -> {:.6} (min)\n",
         config.lr_max * lr_multiplier,
         config.lr_min * lr_multiplier
     );
-    println!(
-        "  Scale LR range: {:.6} (max) -> {:.6} (min)\n",
-        config.lr_max * scale_lr_multiplier,
-        config.lr_min * scale_lr_multiplier
-    );
 
     tracing::info!(
-        "Parameter grouping: {} decay, {} no_decay; {} normal_lr, {} high_lr, {} scale_lr; embed_multiplier={:.4}, scale_multiplier={:.4}",
+        "Parameter grouping: {} decay, {} no_decay; {} normal_lr, {} high_lr; lr_multiplier={:.4}",
         decay_params,
         no_decay_params,
         normal_lr_params,
         high_lr_params,
-        scale_lr_params,
-        lr_multiplier,
-        scale_lr_multiplier
+        lr_multiplier
     );
     tracing::info!(
-        "Base LR range: {:.6} -> {:.6}; High LR range: {:.6} -> {:.6}; Scale LR range: {:.6} -> {:.6}",
+        "Base LR range: {:.6} -> {:.6}; High LR range: {:.6} -> {:.6}",
         config.lr_max,
         config.lr_min,
         config.lr_max * lr_multiplier,
-        config.lr_min * lr_multiplier,
-        config.lr_max * scale_lr_multiplier,
-        config.lr_min * scale_lr_multiplier
+        config.lr_min * lr_multiplier
     );
 
     // Load dataset
@@ -1383,7 +1363,7 @@ where
     // Calculate effective batch size and initial learning rate
     // LR scales with sqrt of batch size: batch_size=16000 -> lr=3e-2
     let effective_batch_size = grad_accumulation_steps * config.physical_batch_size;
-    let initial_lr = 0.03 * (effective_batch_size as f64 / 16000.0).sqrt();
+    let initial_lr = 0.001 * (effective_batch_size as f64 / 16000.0).sqrt();
     println!(
         "Effective batch size: {}, Initial LR: {:.6}",
         effective_batch_size, initial_lr
@@ -1406,22 +1386,12 @@ where
         .with_grad_clipping(grad_clipping.clone())
         .init();
 
-    let mut optim_decay_scale = AdamWConfig::new()
-        .with_weight_decay(config.weight_decay as f32)
-        .with_grad_clipping(grad_clipping.clone())
-        .init();
-
     let mut optim_no_decay_normal = AdamWConfig::new()
         .with_weight_decay(0.0)
         .with_grad_clipping(grad_clipping.clone())
         .init();
 
     let mut optim_no_decay_high = AdamWConfig::new()
-        .with_weight_decay(0.0)
-        .with_grad_clipping(grad_clipping.clone())
-        .init();
-
-    let mut optim_no_decay_scale = AdamWConfig::new()
         .with_weight_decay(0.0)
         .with_grad_clipping(grad_clipping)
         .init();
@@ -1454,17 +1424,6 @@ where
             );
         }
 
-        let decay_scale_path = resume_dir.join(OPT_DECAY_SCALE_FILE_NAME);
-        if decay_scale_path.exists() {
-            optim_decay_scale =
-                load_optimizer_state(optim_decay_scale, &recorder, decay_scale_path, device)?;
-        } else {
-            println!(
-                "Optimizer state {} not found; continuing with fresh state",
-                OPT_DECAY_SCALE_FILE_NAME
-            );
-        }
-
         let no_decay_normal_path = resume_dir.join(OPT_NO_DECAY_NORMAL_FILE_NAME);
         if no_decay_normal_path.exists() {
             optim_no_decay_normal = load_optimizer_state(
@@ -1488,17 +1447,6 @@ where
             println!(
                 "Optimizer state {} not found; continuing with fresh state",
                 OPT_NO_DECAY_HIGH_FILE_NAME
-            );
-        }
-
-        let no_decay_scale_path = resume_dir.join(OPT_NO_DECAY_SCALE_FILE_NAME);
-        if no_decay_scale_path.exists() {
-            optim_no_decay_scale =
-                load_optimizer_state(optim_no_decay_scale, &recorder, no_decay_scale_path, device)?;
-        } else {
-            println!(
-                "Optimizer state {} not found; continuing with fresh state",
-                OPT_NO_DECAY_SCALE_FILE_NAME
             );
         }
 
@@ -1638,7 +1586,7 @@ where
     let main_device = devices[0].clone();
     let device_workers = DeviceWorkers::<B>::new(&model, &devices, &main_device);
 
-    let mut renderer: Box<dyn MetricsRenderer> = if config.disable_tui {
+    let mut renderer: Box<dyn MetricsRenderer> = if config.disable_tui.unwrap_or(false) {
         println!("TUI disabled, using CLI renderer");
         Box::new(SimpleCliRenderer::new())
     } else {
@@ -1735,14 +1683,19 @@ where
         let output = combine_outputs(&device_outputs, &devices[0]);
         drop(device_outputs);
 
-        B::sync(&devices[0]);
+        sync_backend_if_supported::<B>(&devices[0]);
         B::memory_cleanup(&devices[0]);
         gradnorm_state.record_batch_losses(iteration, &output);
 
-        // Record batch in ReduceOnPlateau scheduler
-        // Uses the same loss calculation as LossMetric (sum of raw losses if available)
-        let batch_loss = output.total_loss().into_scalar().elem::<f32>() as f64;
-        let _measurement_recorded = lr_scheduler.record_batch(current_batch_size, batch_loss);
+        // Record batch in ReduceOnPlateau scheduler using raw policy loss so GradNorm weighting
+        // on other heads cannot prematurely trigger LR reductions.
+        let policy_loss_tensor = output
+            .raw_policy_loss
+            .clone()
+            .unwrap_or_else(|| output.base_policy_loss.clone());
+        let batch_policy_loss = policy_loss_tensor.into_scalar().elem::<f32>() as f64;
+        let _measurement_recorded =
+            lr_scheduler.record_batch(current_batch_size, batch_policy_loss);
 
         // Get current learning rate from scheduler
         current_lr = lr_scheduler.get_lr();
@@ -1789,14 +1742,8 @@ where
                 );
             }
 
-            let (
-                grads_decay_normal,
-                grads_decay_high,
-                grads_decay_scale,
-                grads_no_decay_normal,
-                grads_no_decay_high,
-                grads_no_decay_scale,
-            ) = weight_decay_groups.split_grads::<B, _>(&model, grads);
+            let (grads_decay_normal, grads_decay_high, grads_no_decay_normal, grads_no_decay_high) =
+                weight_decay_groups.split_grads::<B, _>(&model, grads);
 
             let grad_norm_input = GradientNormInput::new(gradient_norm_value);
             let grad_norm_entry = gradient_norm_metric.update(&grad_norm_input, &metadata);
@@ -1840,14 +1787,10 @@ where
                 );
             }
 
-            let scale_lr = current_lr * scale_lr_multiplier;
-
             model = optim_decay_normal.step(current_lr, model, grads_decay_normal);
             model = optim_decay_high.step(high_lr, model, grads_decay_high);
-            model = optim_decay_scale.step(scale_lr, model, grads_decay_scale);
             model = optim_no_decay_normal.step(current_lr, model, grads_no_decay_normal);
             model = optim_no_decay_high.step(high_lr, model, grads_no_decay_high);
-            model = optim_no_decay_scale.step(scale_lr, model, grads_no_decay_scale);
 
             device_workers.broadcast_model(&model);
 
@@ -2075,10 +2018,8 @@ where
                 &gradnorm_state,
                 &optim_decay_normal,
                 &optim_decay_high,
-                &optim_decay_scale,
                 &optim_no_decay_normal,
                 &optim_no_decay_high,
-                &optim_no_decay_scale,
                 Path::new(MODEL_DIR_NAME),
             )?;
         }
@@ -2121,10 +2062,8 @@ where
         &gradnorm_state,
         &optim_decay_normal,
         &optim_decay_high,
-        &optim_decay_scale,
         &optim_no_decay_normal,
         &optim_no_decay_high,
-        &optim_no_decay_scale,
         Path::new(MODEL_DIR_NAME),
     )?;
 

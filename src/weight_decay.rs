@@ -16,8 +16,7 @@ enum WeightDecayGroup {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LearningRateGroup {
     Normal,
-    HighLR,      // For embeddings that should get sqrt(embed_dim) multiplier
-    ScaleParams, // For scale_qk/scale_v that should get lr_scalar multiplier
+    HighLR, // For embeddings and scale params that should get sqrt(embed_dim) multiplier
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,11 +56,10 @@ impl WeightDecayGroups {
             assignments: classifier.assignments,
         };
 
-        let (decay_count, no_decay_count, normal_lr_count, high_lr_count, scale_lr_count) =
-            groups.counts();
+        let (decay_count, no_decay_count, normal_lr_count, high_lr_count) = groups.counts();
         info!(
-            "[WeightDecayGroups::new] Total assignments: {} decay, {} no_decay, {} normal_lr, {} high_lr, {} scale_lr",
-            decay_count, no_decay_count, normal_lr_count, high_lr_count, scale_lr_count
+            "[WeightDecayGroups::new] Total assignments: {} decay, {} no_decay, {} normal_lr, {} high_lr",
+            decay_count, no_decay_count, normal_lr_count, high_lr_count
         );
 
         // Log detailed parameter grouping
@@ -80,26 +78,6 @@ impl WeightDecayGroups {
                 high_lr_params.len()
             );
             for (path, group) in high_lr_params.iter() {
-                info!(
-                    "[WeightDecayGroups::new]   {} (decay={:?})",
-                    path, group.decay
-                );
-            }
-        }
-
-        let mut scale_lr_params: Vec<_> = classifier
-            .param_paths
-            .iter()
-            .filter(|(_, group)| group.lr == LearningRateGroup::ScaleParams)
-            .collect();
-        scale_lr_params.sort_by(|a, b| a.0.cmp(&b.0));
-
-        if !scale_lr_params.is_empty() {
-            info!(
-                "[WeightDecayGroups::new] Scale LR parameters ({} total):",
-                scale_lr_params.len()
-            );
-            for (path, group) in scale_lr_params.iter() {
                 info!(
                     "[WeightDecayGroups::new]   {} (decay={:?})",
                     path, group.decay
@@ -150,14 +128,12 @@ impl WeightDecayGroups {
         0.5 * weight_decay * total_squared_norm
     }
 
-    /// Split gradients into 6 sets: (decay+normal_lr, decay+high_lr, decay+scale_lr, no_decay+normal_lr, no_decay+high_lr, no_decay+scale_lr)
+    /// Split gradients into 4 sets: (decay+normal_lr, decay+high_lr, no_decay+normal_lr, no_decay+high_lr)
     pub fn split_grads<B, M>(
         &self,
         model: &M,
         grads: GradientsParams,
     ) -> (
-        GradientsParams,
-        GradientsParams,
         GradientsParams,
         GradientsParams,
         GradientsParams,
@@ -173,29 +149,20 @@ impl WeightDecayGroups {
         );
         let mut splitter = GradientsSplitVisitor::<B>::new(&self.assignments, grads);
         model.visit(&mut splitter);
-        let (decay_normal, decay_high, decay_scale, no_decay_normal, no_decay_high, no_decay_scale) =
-            splitter.finish();
+        let (decay_normal, decay_high, no_decay_normal, no_decay_high) = splitter.finish();
         info!(
-            "[split_grads] Result: {} decay+normal, {} decay+high, {} decay+scale, {} no_decay+normal, {} no_decay+high, {} no_decay+scale",
-            decay_normal.len(), decay_high.len(), decay_scale.len(), no_decay_normal.len(), no_decay_high.len(), no_decay_scale.len()
+            "[split_grads] Result: {} decay+normal, {} decay+high, {} no_decay+normal, {} no_decay+high",
+            decay_normal.len(), decay_high.len(), no_decay_normal.len(), no_decay_high.len()
         );
-        (
-            decay_normal,
-            decay_high,
-            decay_scale,
-            no_decay_normal,
-            no_decay_high,
-            no_decay_scale,
-        )
+        (decay_normal, decay_high, no_decay_normal, no_decay_high)
     }
 
-    /// Return (decay_count, no_decay_count, normal_lr_count, high_lr_count, scale_lr_count) for logging/debugging.
-    pub fn counts(&self) -> (usize, usize, usize, usize, usize) {
+    /// Return (decay_count, no_decay_count, normal_lr_count, high_lr_count) for logging/debugging.
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
         let mut decay = 0;
         let mut no_decay = 0;
         let mut normal_lr = 0;
         let mut high_lr = 0;
-        let mut scale_lr = 0;
 
         for group in self.assignments.values() {
             match group.decay {
@@ -205,11 +172,10 @@ impl WeightDecayGroups {
             match group.lr {
                 LearningRateGroup::Normal => normal_lr += 1,
                 LearningRateGroup::HighLR => high_lr += 1,
-                LearningRateGroup::ScaleParams => scale_lr += 1,
             }
         }
 
-        (decay, no_decay, normal_lr, high_lr, scale_lr)
+        (decay, no_decay, normal_lr, high_lr)
     }
 }
 
@@ -262,8 +228,8 @@ impl<B: AutodiffBackend> WeightDecayClassifier<B> {
 
         // Determine learning rate group
         let lr = if path_contains(path, "rel_scale_qk") || path_contains(path, "rel_scale_v") {
-            // Scale parameters get dedicated lr_scalar multiplier
-            LearningRateGroup::ScaleParams
+            // Scale parameters get sqrt(embed_dim) multiplier (same as embeddings)
+            LearningRateGroup::HighLR
         } else if (path_contains(path, "token_embed") && path_contains(path, "weight"))
             || (path_contains(path, "global_embed") && path_contains(path, "weight"))
             || (path_contains(path, "a_qk") && path_contains(path, "weight"))
@@ -312,16 +278,14 @@ impl<B: AutodiffBackend> ModuleVisitor<B> for WeightDecayClassifier<B> {
     }
 }
 
-/// Utility visitor that partitions gradients into 6 groups based on decay and LR.
+/// Utility visitor that partitions gradients into 4 groups based on decay and LR.
 struct GradientsSplitVisitor<'a, B: AutodiffBackend> {
     assignments: &'a HashMap<ParamId, ParameterGroup>,
     remaining: GradientsParams,
     grads_decay_normal: GradientsParams,
     grads_decay_high: GradientsParams,
-    grads_decay_scale: GradientsParams,
     grads_no_decay_normal: GradientsParams,
     grads_no_decay_high: GradientsParams,
-    grads_no_decay_scale: GradientsParams,
     backend: PhantomData<B>,
 }
 
@@ -332,10 +296,8 @@ impl<'a, B: AutodiffBackend> GradientsSplitVisitor<'a, B> {
             remaining: grads,
             grads_decay_normal: GradientsParams::new(),
             grads_decay_high: GradientsParams::new(),
-            grads_decay_scale: GradientsParams::new(),
             grads_no_decay_normal: GradientsParams::new(),
             grads_no_decay_high: GradientsParams::new(),
-            grads_no_decay_scale: GradientsParams::new(),
             backend: PhantomData,
         }
     }
@@ -343,8 +305,6 @@ impl<'a, B: AutodiffBackend> GradientsSplitVisitor<'a, B> {
     fn finish(
         self,
     ) -> (
-        GradientsParams,
-        GradientsParams,
         GradientsParams,
         GradientsParams,
         GradientsParams,
@@ -358,10 +318,8 @@ impl<'a, B: AutodiffBackend> GradientsSplitVisitor<'a, B> {
         (
             self.grads_decay_normal,
             self.grads_decay_high,
-            self.grads_decay_scale,
             self.grads_no_decay_normal,
             self.grads_no_decay_high,
-            self.grads_no_decay_scale,
         )
     }
 }
@@ -391,20 +349,12 @@ impl<'a, B: AutodiffBackend> ModuleVisitor<B> for GradientsSplitVisitor<'a, B> {
                 self.grads_decay_high
                     .register::<B::InnerBackend, D>(id, grad);
             }
-            (WeightDecayGroup::Decay, LearningRateGroup::ScaleParams) => {
-                self.grads_decay_scale
-                    .register::<B::InnerBackend, D>(id, grad);
-            }
             (WeightDecayGroup::NoDecay, LearningRateGroup::Normal) => {
                 self.grads_no_decay_normal
                     .register::<B::InnerBackend, D>(id, grad);
             }
             (WeightDecayGroup::NoDecay, LearningRateGroup::HighLR) => {
                 self.grads_no_decay_high
-                    .register::<B::InnerBackend, D>(id, grad);
-            }
-            (WeightDecayGroup::NoDecay, LearningRateGroup::ScaleParams) => {
-                self.grads_no_decay_scale
                     .register::<B::InnerBackend, D>(id, grad);
             }
         }

@@ -19,11 +19,11 @@ pub const LEGAL_MOVES: usize = 64 * 76;
 // - 1 number of attackers (black), normalized by 6
 // Feature grouping per square (current position only, excluding recency channels):
 // - Piece identity group (12): white/black one-hots for all roles
-// - Tactical group (38): attackers, pins, pin target, hanging flag, square control, diagonal/cardinal ray features
+// - Tactical group (86): attackers, pins, pin target, hanging flag, square control, directional ray features
 // - Positional group (25): legal moves, pawn structure, weak squares, open file, passed pawn, dark-square flag, rank/file one-hots
 // - Misc group (2): en passant target, local castling right
 pub const PIECE_IDENTITY_FEATURES: usize = 12;
-pub const TACTICAL_FEATURES: usize = 38;
+pub const TACTICAL_FEATURES: usize = 86;
 pub const POSITIONAL_FEATURES: usize = 25;
 pub const MISC_FEATURES: usize = 2;
 pub const RECENCY_FEATURES: usize = 4; // white_from, white_to, black_from, black_to
@@ -67,9 +67,9 @@ pub struct Config {
     pub timeout: Option<u64>,
 
     /// Resume training from the last saved model checkpoint
-    #[arg(long)]
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
-    pub resume: bool,
+    pub resume: Option<bool>,
 
     // We only do one pass through the data, so this is mostly unused
     #[arg(long, default_value = "1.0")]
@@ -92,16 +92,12 @@ pub struct Config {
     pub num_workers: usize,
 
     /// Maximum learning rate (after warmup)
-    #[arg(long, default_value = "0.003")]
+    #[arg(long, default_value = "0.0003")]
     pub lr_max: f64,
 
     /// Minimum learning rate (end of training)
     #[arg(long, default_value = "1e-6")]
     pub lr_min: f64,
-
-    /// Learning rate scalar multiplier for scale parameters (scale_qk, scale_v)
-    #[arg(long, default_value = "100.0")]
-    pub lr_scalar: f64,
 
     /// Number of samples to accumulate before recording a loss measurement for ReduceOnPlateau
     #[arg(long, default_value = "4000")]
@@ -147,9 +143,9 @@ pub struct Config {
     pub gradient_clip: f64,
 
     /// Enable verbose gradient norm breakdown logging
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
-    pub log_gradient_breakdown: bool,
+    pub log_gradient_breakdown: Option<bool>,
 
     /// How often (in optimizer steps) to log gradient breakdown details
     #[arg(long, default_value = "16")]
@@ -172,9 +168,9 @@ pub struct Config {
     pub l2_penalty_log_interval: usize,
 
     /// Enable adaptive GradNorm reweighting across heads
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
-    pub enable_gradnorm: bool,
+    pub enable_gradnorm: Option<bool>,
 
     /// Optimizer steps between GradNorm weight updates
     #[arg(long, default_value = "8")]
@@ -228,28 +224,28 @@ pub struct Config {
     pub conv_layers: usize,
 
     /// Only include positions with a single legal move
-    #[arg(long)]
-    pub single_legal_move_only: bool,
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub single_legal_move_only: Option<bool>,
 
-    /// Only include positions with a single legal move
-    #[arg(long, default_value = "false")]
-    pub disable_tui: bool,
+    /// Disable terminal UI
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub disable_tui: Option<bool>,
 
     /// Only include positions that are checkmate
-    #[arg(long)]
-    pub checkmate_only: bool,
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub checkmate_only: Option<bool>,
 
     /// Probability of logging individual items for debugging (0.0 to 1.0)
     #[arg(long, default_value = "1.0")]
     pub item_log_probability: f32,
 
     /// Enable detailed tensor norm logging during forward passes
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
-    pub log_tensor_norms: bool,
+    pub log_tensor_norms: Option<bool>,
 
     /// How often (in forward passes) to record tensor norm snapshots
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "8")]
     #[serde(default)]
     pub norm_log_interval: usize,
 
@@ -263,19 +259,19 @@ pub struct Config {
     pub focal_loss_gamma: f32,
 
     /// Disable Shaw-style relative positional representations in attention
-    #[arg(long, default_value = "false")]
-    pub disable_shaw_pr: bool,
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub disable_shaw_pr: Option<bool>,
 
     #[arg(long, default_value = "1")]
     pub num_devices: usize,
 
     /// Probability of dropping positions based on ply (80% at ply 0, 0% at ply 10+)
-    #[arg(long, default_value = "true")]
-    pub enable_ply_sampling: bool,
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub enable_ply_sampling: Option<bool>,
 
     /// Probability of dropping games based on Elo (75% at 1000 Elo, 0% at 2000+ Elo)
-    #[arg(long, default_value = "true")]
-    pub enable_elo_sampling: bool,
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub enable_elo_sampling: Option<bool>,
 
     /// Number of iterations between checkpoints
     #[arg(long, default_value = "100")]
@@ -351,7 +347,7 @@ impl Config {
     }
 
     pub fn log_tensor_norms(&self) -> bool {
-        self.log_tensor_norms
+        self.log_tensor_norms.unwrap_or(false)
     }
 
     pub fn norm_log_interval(&self) -> usize {
@@ -363,7 +359,7 @@ impl Config {
     }
 
     pub fn log_gradient_breakdown(&self) -> bool {
-        self.log_gradient_breakdown
+        self.log_gradient_breakdown.unwrap_or(false)
     }
 
     pub fn gradient_breakdown_interval(&self) -> usize {
@@ -383,7 +379,7 @@ impl Config {
     }
 
     pub fn gradnorm_enabled(&self) -> bool {
-        self.enable_gradnorm
+        self.enable_gradnorm.unwrap_or(true)
     }
 
     pub fn gradnorm_interval(&self) -> usize {
@@ -439,12 +435,12 @@ impl Default for Config {
             num_workers: 4,
             weight_decay: 0.00001,
             gradient_clip: 3.0,
-            log_gradient_breakdown: false,
+            log_gradient_breakdown: Some(false),
             gradient_breakdown_interval: 16,
             gradient_head_limit: 128,
             gradient_layer_limit: 128,
             l2_penalty_log_interval: 100,
-            enable_gradnorm: true,
+            enable_gradnorm: Some(true),
             gradnorm_interval: 8,
             gradnorm_alpha: 0.5,
             gradnorm_learning_rate: 0.5,
@@ -454,7 +450,6 @@ impl Default for Config {
             gradnorm_probe_size: 256,
             lr_max: 0.05,
             lr_min: 0.000001,
-            lr_scalar: 100.0,
             measurement_batch_size: 4000,
             lr_patience: 25,
             lr_reduction_factor: 0.1,
@@ -471,20 +466,20 @@ impl Default for Config {
             max_samples: Some(240000000),
             skip: None,
             timeout: None,
-            resume: false,
-            single_legal_move_only: false,
-            checkmate_only: false,
+            resume: Some(false),
+            single_legal_move_only: Some(false),
+            checkmate_only: Some(false),
             item_log_probability: 1.00,
-            log_tensor_norms: false,
+            log_tensor_norms: Some(false),
             norm_log_interval: 100,
             norm_preview_limit: 6,
             time_usage_loss_weight: 0.0,
-            disable_tui: false,
-            disable_shaw_pr: false,
+            disable_tui: Some(false),
+            disable_shaw_pr: Some(false),
             num_devices: 1,
             focal_loss_gamma: 1.0,
-            enable_ply_sampling: true,
-            enable_elo_sampling: true,
+            enable_ply_sampling: Some(true),
+            enable_elo_sampling: Some(true),
             checkpoint_interval: 100,
             num_pretrain_steps: 1000000,
             max_easy_positions: Some(0),
@@ -559,7 +554,7 @@ pub fn shd_log<F: FnOnce()>(f: F) {
 /// Check if a position should be kept based on ply and random sampling
 pub fn should_keep_position_by_ply(ply: usize, rng_value: f64) -> bool {
     let config = get_global_config();
-    if !config.enable_ply_sampling {
+    if !config.enable_ply_sampling.unwrap_or(true) {
         return true;
     }
     rng_value < ply_keep_probability(ply)
@@ -568,7 +563,7 @@ pub fn should_keep_position_by_ply(ply: usize, rng_value: f64) -> bool {
 /// Check if a game should be kept based on Elo and random sampling
 pub fn should_keep_game_by_elo(white_elo: i32, black_elo: i32, rng_value: f64) -> bool {
     let config = get_global_config();
-    if !config.enable_elo_sampling {
+    if !config.enable_elo_sampling.unwrap_or(true) {
         eprintln!("DEBUG: ELO sampling is DISABLED!");
         return true;
     }

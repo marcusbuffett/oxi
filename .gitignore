@@ -7,3 +7,5 @@ test_scripts
 reference
 model.mpk
 model
+.venv
+models
