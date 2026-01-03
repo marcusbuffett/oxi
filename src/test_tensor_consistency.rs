@@ -80,6 +80,7 @@ mod tests {
             time_remaining_self: chess_item.global_features.time_remaining_self,
             time_remaining_oppo: chess_item.global_features.time_remaining_oppo,
             base_time: chess_item.global_features.base_time,
+            increment: chess_item.global_features.increment,
             move_count: chess_item.global_features.move_count,
             elo_self: chess_item.elo_self,
         };

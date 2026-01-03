@@ -1,6 +1,5 @@
 use crate::legal_move_probability_metric::LegalMoveProbabilityInput;
 use crate::move_accuracy_metric::MoveAccuracyInput;
-use crate::move_distribution_accuracy_metric::MoveDistributionAccuracyInput;
 use crate::policy_loss_metric::PolicyLossInput;
 use crate::time_usage_loss_metric::TimeUsageLossInput;
 use crate::uncertainty_metric::UncertaintyInput;
@@ -44,8 +43,6 @@ pub struct ChessOutput<B: Backend> {
     pub value_targets: Tensor<B, 2>,
     /// The legal moves mask (1.0 for legal moves, 0.0 for illegal)
     pub legal_moves_mask: Tensor<B, 2>,
-    /// The target move distributions (for distribution accuracy metric)
-    pub target_distributions: Option<Tensor<B, 2>>,
     /// Uncertainty values (sigma) for each loss component
     pub uncertainties: Option<(f32, f32, f32)>,
 }
@@ -81,18 +78,11 @@ impl<B: Backend> ChessOutput<B> {
             value_output,
             value_targets,
             legal_moves_mask,
-            target_distributions: None,
             uncertainties: None,
             raw_policy_loss: None,
             raw_value_loss: None,
             raw_time_usage_loss: None,
         }
-    }
-
-    /// Creates a new ChessOutput with target distributions
-    pub fn with_distributions(mut self, target_distributions: Tensor<B, 2>) -> Self {
-        self.target_distributions = Some(target_distributions);
-        self
     }
 
     /// Sets the uncertainty values
@@ -164,7 +154,6 @@ impl<B: Backend> ChessOutput<B> {
             value_output: self.value_output.detach(),
             value_targets: self.value_targets.detach(),
             legal_moves_mask: self.legal_moves_mask.detach(),
-            target_distributions: self.target_distributions.map(|tensor| tensor.detach()),
             uncertainties: self.uncertainties,
             raw_policy_loss: self.raw_policy_loss.map(|tensor| tensor.detach()),
             raw_value_loss: self.raw_value_loss.map(|tensor| tensor.detach()),
@@ -177,37 +166,6 @@ impl<B: Backend> ChessOutput<B> {
 impl<B: Backend> Adaptor<MoveAccuracyInput<B>> for ChessOutput<B> {
     fn adapt(&self) -> MoveAccuracyInput<B> {
         MoveAccuracyInput::new(self.policy_output.clone(), self.policy_targets.clone())
-    }
-}
-
-// Implement Adaptor for MoveDistributionAccuracyMetric
-impl<B: Backend> Adaptor<MoveDistributionAccuracyInput<B>> for ChessOutput<B> {
-    fn adapt(&self) -> MoveDistributionAccuracyInput<B> {
-        MoveDistributionAccuracyInput::new(
-            self.policy_output.clone(),
-            self.target_distributions.clone().unwrap_or_else(|| {
-                // If no distributions provided, create one-hot from targets
-                let batch_size = self.policy_targets.shape().dims[0];
-                let num_moves = self.policy_output.shape().dims[1];
-                let device = self.policy_targets.device();
-
-                // Create one-hot encoding
-                let mut one_hot = Tensor::zeros([batch_size, num_moves], &device);
-                for i in 0..batch_size {
-                    let target_idx = self
-                        .policy_targets
-                        .clone()
-                        .slice([i..i + 1])
-                        .into_scalar()
-                        .elem::<i32>() as usize;
-                    one_hot = one_hot.slice_assign(
-                        [i..i + 1, target_idx..target_idx + 1],
-                        Tensor::ones([1, 1], &device),
-                    );
-                }
-                one_hot
-            }),
-        )
     }
 }
 
@@ -281,7 +239,6 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
     type ItemSync = ChessOutput<crate::inference::InferenceBackend>;
 
     fn sync(self) -> Self::ItemSync {
-        let target_distributions = self.target_distributions;
         let uncertainties = self.uncertainties;
         let raw_policy_loss = self.raw_policy_loss;
         let raw_value_loss = self.raw_value_loss;
@@ -303,15 +260,6 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
                 .expect("Correct amount of tensor data");
 
         let device = &Default::default();
-
-        let synced_distributions = target_distributions.map(|t| {
-            let [dist_data] = Transaction::default()
-                .register(t)
-                .execute()
-                .try_into()
-                .expect("Correct amount of tensor data");
-            Tensor::from_data(dist_data, device)
-        });
 
         let synced_raw_policy_loss = raw_policy_loss.map(|t| {
             let [raw_data] = Transaction::default()
@@ -353,7 +301,6 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             value_output: Tensor::from_data(value_output, device),
             value_targets: Tensor::from_data(value_targets, device),
             legal_moves_mask: Tensor::from_data(legal_moves_mask, device),
-            target_distributions: synced_distributions,
             uncertainties,
             raw_policy_loss: synced_raw_policy_loss,
             raw_value_loss: synced_raw_value_loss,

@@ -11,8 +11,11 @@ use crate::moves::{mirror_fen, mirror_move};
 use shakmaty::EnPassantMode;
 use shakmaty::{fen::Fen, san::SanPlus, Chess, Color, Position, Square};
 
-/// Inference backend: LibTorch on all platforms (MPS on macOS, CUDA elsewhere)
+#[cfg(target_os = "macos")]
 pub type InferenceBackend = burn::backend::LibTorch<f32>;
+
+#[cfg(target_os = "linux")]
+pub type InferenceBackend = burn_ndarray::NdArray<f32>;
 
 /// Compute signed material imbalance (white - black) using standard piece values
 pub fn compute_material_imbalance(pos: &Chess) -> i32 {
@@ -143,6 +146,8 @@ pub struct GlobalFeatures {
     pub time_remaining_oppo: u32,
     /// Time control base time (in seconds)
     pub base_time: u32,
+    /// Time control increment (in seconds)
+    pub increment: u32,
     /// Move count in the game
     pub move_count: usize,
     /// Self Elo rating
@@ -158,6 +163,8 @@ pub struct GlobalFeaturesInternal {
     pub time_remaining_oppo: u32,
     /// Time control base time (in seconds)
     pub base_time: u32,
+    /// Time control increment (in seconds)
+    pub increment: u32,
     /// Material imbalance (white - black)
     pub material_imbalance: i32,
     /// Count difference of major pieces (rooks + queens): white - black
@@ -181,6 +188,7 @@ pub struct GlobalFeaturesNormalized {
     pub time_self_ratio: f32,
     pub time_oppo_normalized: f32,
     pub time_oppo_ratio: f32,
+    pub increment_ratio: f32,
     pub move_count_normalized: f32,
     pub elo_normalized: f32,
     pub material_imbalance_normalized: f32,
@@ -199,6 +207,7 @@ impl GlobalFeatures {
             time_remaining_self: self.time_remaining_self,
             time_remaining_oppo: self.time_remaining_oppo,
             base_time: self.base_time,
+            increment: self.increment,
             material_imbalance,
             major_piece_imbalance: 0,
             minor_piece_imbalance: 0,
@@ -213,6 +222,7 @@ impl GlobalFeatures {
 impl GlobalFeaturesInternal {
     /// Compute normalized global features
     pub fn to_normalized(&self) -> GlobalFeaturesNormalized {
+        let base_time = self.base_time.max(1);
         // Normalize Elo to [0, 1] range (similar to dataset processing)
         let elo_self_normalized = if self.elo_self >= 800 && self.elo_self <= 2800 {
             (self.elo_self - 800) as f32 / (2800 - 800) as f32
@@ -231,11 +241,10 @@ impl GlobalFeaturesInternal {
 
         GlobalFeaturesNormalized {
             time_self_normalized: (self.time_remaining_self as f32 / 1500.0).clamp(0.0, 1.0),
-            time_self_ratio: (self.time_remaining_self as f32 / self.base_time as f32)
-                .clamp(0.0, 1.0),
+            time_self_ratio: (self.time_remaining_self as f32 / base_time as f32).clamp(0.0, 1.0),
             time_oppo_normalized: (self.time_remaining_oppo as f32 / 1500.0).clamp(0.0, 1.0),
-            time_oppo_ratio: (self.time_remaining_oppo as f32 / self.base_time as f32)
-                .clamp(0.0, 1.0),
+            time_oppo_ratio: (self.time_remaining_oppo as f32 / base_time as f32).clamp(0.0, 1.0),
+            increment_ratio: (self.increment as f32 / base_time as f32).clamp(0.0, 1.0),
             move_count_normalized: (self.move_count as f32 / 300.0).clamp(0.0, 1.0),
             elo_normalized: elo_self_normalized,
             material_imbalance_normalized: material_imbalance_norm,
@@ -252,6 +261,7 @@ impl GlobalFeaturesInternal {
             normalized.time_self_ratio,
             normalized.time_oppo_normalized,
             normalized.time_oppo_ratio,
+            normalized.increment_ratio,
             normalized.move_count_normalized,
             normalized.elo_normalized,
             // normalized.material_imbalance_normalized,
@@ -269,8 +279,9 @@ impl Default for GlobalFeatures {
             time_remaining_self: 1500, // 25 minutes
             time_remaining_oppo: 1500, // 25 minutes
             base_time: 1800,           // 30 minutes
-            move_count: 20,            // Mid-game
-            elo_self: 1500,            // Average rating
+            increment: 0,
+            move_count: 20, // Mid-game
+            elo_self: 1500, // Average rating
         }
     }
 }

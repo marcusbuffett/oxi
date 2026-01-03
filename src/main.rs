@@ -12,8 +12,8 @@ use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, task};
 
 use oxi::config::{set_global_config, Config};
+use oxi::constants::TCEC_DOWNLOAD_URL;
 use oxi::custom_training::train_custom;
-use oxi::data_creation::filter_confident_positions;
 use oxi::inference::InferenceEngine;
 
 #[derive(Parser, Debug)]
@@ -70,8 +70,12 @@ enum Commands {
     /// Evaluate model performance
     Evaluate(EvaluateConfig),
 
-    /// Filter positions where model predicts with high confidence
-    FilterConfident(FilterConfidentConfig),
+    /// Download TCEC (Top Chess Engine Championship) games for pretraining
+    DownloadTcec {
+        /// Output directory for downloaded files
+        #[arg(long, default_value = "./data/tcec")]
+        output_dir: PathBuf,
+    },
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
@@ -151,28 +155,7 @@ struct EvaluateConfig {
     device: String,
 }
 
-#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
-struct FilterConfidentConfig {
-    /// Path to model checkpoint
-    #[arg(long)]
-    model_path: PathBuf,
 
-    /// Path to PGN data directory
-    #[arg(long)]
-    data_path: PathBuf,
-
-    /// Physical batch size for inference
-    #[arg(long, default_value = "256")]
-    physical_batch_size: usize,
-
-    /// Confidence threshold (0.0-1.0)
-    #[arg(long, default_value = "0.9")]
-    confidence_threshold: f32,
-
-    /// Maximum number of examples to collect
-    #[arg(long, default_value = "10000000")]
-    max_examples: usize,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -391,27 +374,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::FilterConfident(config) => {
-            tracing::info!("Filtering confident predictions with config: {:?}", config);
-
-            // Use LibTorch backend on all platforms (MPS on macOS, CUDA elsewhere)
-            type Backend = burn::backend::LibTorch<f32>;
-
-            #[cfg(target_os = "macos")]
-            let device = burn_tch::LibTorchDevice::Mps;
-
-            #[cfg(not(target_os = "macos"))]
-            let device = burn_tch::LibTorchDevice::Cuda(0);
-
-            let filter_config = oxi::data_creation::FilterConfidentConfig {
-                model_path: config.model_path,
-                data_path: config.data_path,
-                physical_batch_size: config.physical_batch_size,
-                confidence_threshold: config.confidence_threshold,
-                max_examples: config.max_examples,
-            };
-
-            filter_confident_positions::<Backend>(filter_config, device)?;
+        Commands::DownloadTcec { output_dir } => {
+            tracing::info!("Downloading TCEC games to {:?}", output_dir);
+            download_tcec_games(&output_dir).await?;
             Ok(())
         }
     }
@@ -492,5 +457,100 @@ async fn download_all_lichess_files(output_dir: &PathBuf) -> Result<()> {
     }
 
     println!("All downloads completed!");
+    Ok(())
+}
+
+async fn download_tcec_games(output_dir: &PathBuf) -> Result<()> {
+    std::fs::create_dir_all(output_dir)?;
+
+    let zip_filename = "TCEC-everything-compact.zip";
+    let zip_path = output_dir.join(zip_filename);
+
+    if zip_path.exists() {
+        println!("TCEC archive already downloaded: {}", zip_path.display());
+    } else {
+        println!("Downloading TCEC games from {}", TCEC_DOWNLOAD_URL);
+
+        let client = reqwest::Client::new();
+        let response = client.get(TCEC_DOWNLOAD_URL).send().await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to download TCEC games: HTTP {}", response.status());
+        }
+
+        let total_size = response.content_length().unwrap_or(0);
+        println!("File size: {} MB", total_size / 1_048_576);
+
+        let mut file = tokio::fs::File::create(&zip_path).await?;
+        let mut downloaded = 0u64;
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+
+            if total_size > 0 && downloaded % (10 * 1_048_576) == 0 {
+                let progress = (downloaded as f64 / total_size as f64 * 100.0).min(100.0);
+                println!(
+                    "Progress: {:.1}% ({} / {} MB)",
+                    progress,
+                    downloaded / 1_048_576,
+                    total_size / 1_048_576
+                );
+            }
+        }
+
+        println!("Download complete: {}", zip_path.display());
+    }
+
+    let pgn_dir = output_dir.to_path_buf();
+    let pgn_files: Vec<_> = std::fs::read_dir(&pgn_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "pgn")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if !pgn_files.is_empty() {
+        println!(
+            "Found {} PGN files already extracted, skipping extraction",
+            pgn_files.len()
+        );
+    } else {
+        println!("Extracting PGN files from archive...");
+
+        let zip_file = std::fs::File::open(&zip_path)?;
+        let mut archive = zip::ZipArchive::new(zip_file)?;
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let outpath = match file.enclosed_name() {
+                Some(path) => output_dir.join(path),
+                None => continue,
+            };
+
+            if file.name().ends_with('/') {
+                std::fs::create_dir_all(&outpath)?;
+            } else {
+                if let Some(p) = outpath.parent() {
+                    if !p.exists() {
+                        std::fs::create_dir_all(p)?;
+                    }
+                }
+                let mut outfile = std::fs::File::create(&outpath)?;
+                std::io::copy(&mut file, &mut outfile)?;
+                println!("Extracted: {}", outpath.display());
+            }
+        }
+
+        println!("Extraction complete!");
+    }
+
+    println!("\nTCEC games ready at: {}", output_dir.display());
+    println!("Use --pretrain-samples N with train command to pretrain on these games");
     Ok(())
 }

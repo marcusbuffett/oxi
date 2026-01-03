@@ -1,3 +1,7 @@
+use crate::metrics_renderer::{
+    EvaluationName, EvaluationProgress, MetricState, MetricsRenderer, MetricsRendererEvaluation,
+    MetricsRendererTraining, TrainingProgress,
+};
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataloader::Progress;
 use burn::grad_clipping::GradientClippingConfig;
@@ -26,7 +30,7 @@ use tracing_subscriber::fmt as tracing_fmt;
 
 use crate::chess_output::ChessOutput;
 use crate::config::Config;
-use crate::constants::EASY_POSITIONS_PATH;
+
 use crate::dataset::{ChessBatch, ChessBatcher, ChessExample, ChessItem, OXIDataset};
 use crate::debug_prediction_monitor::DebugPredictionMonitor;
 use crate::gradient_norm_metric::{
@@ -34,12 +38,9 @@ use crate::gradient_norm_metric::{
 };
 use crate::gradnorm::{GradNormProbeResult, GradNormState, GradNormTask};
 use crate::lr_plateau_metric::{LrPlateauInput, LrPlateauMetric};
-use crate::metrics_renderer::{
-    EvaluationName, EvaluationProgress, MetricState, MetricsRenderer, MetricsRendererEvaluation,
-    MetricsRendererTraining, TrainingProgress,
-};
 use crate::model::OXIModel;
 use crate::move_accuracy_metric::MoveTopKAccuracyMetric;
+use crate::pgn_processor::process_tcec_directory_iter;
 use crate::policy_loss_metric::{PolicyLossInput, PolicyLossMetric};
 use crate::reduce_on_plateau_scheduler::ReduceOnPlateauScheduler;
 use crate::time_usage_loss_metric::{TimeUsageLossInput, TimeUsageLossMetric};
@@ -386,9 +387,6 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         value_output: output.value_output.to_device(device),
         value_targets: output.value_targets.to_device(device),
         legal_moves_mask: output.legal_moves_mask.to_device(device),
-        target_distributions: output
-            .target_distributions
-            .map(|tensor| tensor.to_device(device)),
         uncertainties: output.uncertainties,
         raw_policy_loss: output
             .raw_policy_loss
@@ -430,7 +428,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let all_raw_policy = outputs.iter().all(|o| o.raw_policy_loss.is_some());
     let all_raw_value = outputs.iter().all(|o| o.raw_value_loss.is_some());
     let all_raw_time = outputs.iter().all(|o| o.raw_time_usage_loss.is_some());
-    let all_target_distributions = outputs.iter().all(|o| o.target_distributions.is_some());
 
     let mut sum_raw_policy_loss = all_raw_policy.then(|| Tensor::<B, 1>::zeros([1], device));
     let mut sum_raw_value_loss = all_raw_value.then(|| Tensor::<B, 1>::zeros([1], device));
@@ -441,7 +438,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut value_outputs = Vec::with_capacity(outputs.len());
     let mut value_targets = Vec::with_capacity(outputs.len());
     let mut legal_masks = Vec::with_capacity(outputs.len());
-    let mut target_distributions = Vec::with_capacity(outputs.len());
 
     for output in outputs {
         let batch_size = output.policy_output.dims()[0];
@@ -482,10 +478,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         value_outputs.push(output.value_output.clone());
         value_targets.push(output.value_targets.clone());
         legal_masks.push(output.legal_moves_mask.clone());
-
-        if let Some(dist) = output.target_distributions.as_ref() {
-            target_distributions.push(dist.clone());
-        }
     }
 
     assert!(total_items > 0, "Combined batch must contain samples");
@@ -510,12 +502,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let value_targets = Tensor::cat(value_targets, 0);
     let legal_moves_mask = Tensor::cat(legal_masks, 0);
 
-    let target_distributions = if all_target_distributions {
-        Some(Tensor::cat(target_distributions, 0))
-    } else {
-        None
-    };
-
     let uncertainties = outputs.iter().find_map(|output| output.uncertainties);
 
     ChessOutput {
@@ -531,7 +517,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         value_output,
         value_targets,
         legal_moves_mask,
-        target_distributions,
         uncertainties,
         raw_policy_loss,
         raw_value_loss,
@@ -923,6 +908,9 @@ fn write_scoresheet(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "N/A".to_string());
 
+    let effective_batch_size = grad_accumulation_steps * config.physical_batch_size;
+    let initial_lr = 0.001 * (effective_batch_size as f64 / 16000.0).sqrt();
+
     let content = format!(
         "OXI Training Scoresheet\n\
 Timestamp (UTC): {timestamp_display}\n\
@@ -947,7 +935,7 @@ Model & Data Configuration\n\
 - Num devices: {num_devices}\n\
 - Train ratio: {train_ratio}\n\
 - Seed: {seed}\n\
-- Num pretrain steps: {num_pretrain_steps}\n\
+- Pretrain samples: {pretrain_samples}\n\
 - Checkpoint interval: {checkpoint_interval}\n\
 - Resume flag: {resume_flag}\n\
 - Embed dim: {embed_dim}\n\
@@ -960,7 +948,7 @@ Model & Data Configuration\n\
 - Time usage loss weight: {time_usage_loss_weight}\n\
 - Weight decay: {weight_decay}\n\
 - Gradient clip: {gradient_clip}\n\
-- LR max: {lr_max}\n\
+- Initial LR: {initial_lr:.6}\n\
 - LR min: {lr_min}\n\
 - Measurement batch size: {measurement_batch_size}\n\
 - LR patience: {lr_patience}\n\
@@ -975,7 +963,7 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         num_devices = config.num_devices,
         train_ratio = config.train_ratio,
         seed = config.seed,
-        num_pretrain_steps = config.num_pretrain_steps,
+        pretrain_samples = config.pretrain_samples,
         checkpoint_interval = config.checkpoint_interval,
         resume_flag = config.resume.unwrap_or(false),
         embed_dim = config.embed_dim(),
@@ -988,7 +976,7 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         time_usage_loss_weight = config.time_usage_loss_weight,
         weight_decay = config.weight_decay,
         gradient_clip = config.gradient_clip,
-        lr_max = config.lr_max,
+        initial_lr = initial_lr,
         lr_min = config.lr_min,
         measurement_batch_size = config.measurement_batch_size,
         lr_patience = config.lr_patience,
@@ -1025,33 +1013,21 @@ fn sync_backend_if_supported<B: AutodiffBackend>(device: &B::Device) {
     B::sync(device);
 }
 
-/// Custom training loop with checkpointing every N iterations
-/// Load easy positions from the serialized binary file
-fn load_easy_positions(path: &str, max_count: usize) -> anyhow::Result<Vec<ChessExample>> {
-    use bincode::decode_from_std_read;
-    use std::io::BufReader;
-
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut examples = Vec::new();
-
-    let config = bincode::config::standard();
-
-    // Deserialize examples one by one
-    while examples.len() < max_count {
-        match decode_from_std_read(&mut reader, config) {
-            Ok(example) => examples.push(example),
-            Err(e) => {
-                // Check if we hit EOF naturally
-                if examples.is_empty() {
-                    return Err(anyhow::anyhow!("Failed to read any examples: {}", e));
-                }
-                // Otherwise, we probably reached EOF after reading some examples
-                break;
-            }
-        }
+fn load_tcec_examples(data_path: &Path, max_count: usize) -> anyhow::Result<Vec<ChessExample>> {
+    let tcec_path = data_path.join("tcec");
+    if !tcec_path.exists() {
+        anyhow::bail!(
+            "TCEC games directory not found: {}. Run 'download-tcec' command first.",
+            tcec_path.display()
+        );
     }
 
+    println!("Loading TCEC examples from {}...", tcec_path.display());
+
+    let examples_iter = process_tcec_directory_iter(&tcec_path)?;
+    let examples: Vec<ChessExample> = examples_iter.take(max_count).collect();
+
+    println!("Loaded {} TCEC examples", examples.len());
     Ok(examples)
 }
 
@@ -1138,15 +1114,8 @@ where
         config.embed_dim(),
         lr_multiplier
     );
-    println!(
-        "  Base LR range: {:.6} (max) -> {:.6} (min)",
-        config.lr_max, config.lr_min
-    );
-    println!(
-        "  High LR range: {:.6} (max) -> {:.6} (min)\n",
-        config.lr_max * lr_multiplier,
-        config.lr_min * lr_multiplier
-    );
+    println!("  Min LR: {:.6}", config.lr_min);
+    println!("  High LR min: {:.6}\n", config.lr_min * lr_multiplier);
 
     tracing::info!(
         "Parameter grouping: {} decay, {} no_decay; {} normal_lr, {} high_lr; lr_multiplier={:.4}",
@@ -1157,10 +1126,8 @@ where
         lr_multiplier
     );
     tracing::info!(
-        "Base LR range: {:.6} -> {:.6}; High LR range: {:.6} -> {:.6}",
-        config.lr_max,
+        "Min LR: {:.6}; High LR min: {:.6}",
         config.lr_min,
-        config.lr_max * lr_multiplier,
         config.lr_min * lr_multiplier
     );
 
@@ -1185,39 +1152,26 @@ where
         crate::model_prediction_logger::format_ply_histogram(&dataset.examples)
     );
 
-    // Pretrain phase: load easy positions if available
+    // Pretrain phase: load TCEC (computer engine) games if configured
     let mut pretrain_examples = Vec::new();
-    if config.num_pretrain_steps > 0 {
-        println!("Loading pretrain items from {}", EASY_POSITIONS_PATH);
+    if config.pretrain_samples > 0 {
+        println!(
+            "Loading {} TCEC samples for pretraining...",
+            config.pretrain_samples
+        );
 
-        // Try to load easy positions from file
-        if Path::new(EASY_POSITIONS_PATH).exists() {
-            let max_count = config
-                .max_easy_positions
-                .unwrap_or(config.num_pretrain_steps * config.physical_batch_size);
-            match load_easy_positions(EASY_POSITIONS_PATH, max_count) {
-                Ok(examples) => {
-                    pretrain_examples = examples;
-                    println!(
-                        "Loaded {} pretrain items from {}",
-                        pretrain_examples.len(),
-                        EASY_POSITIONS_PATH
-                    );
-                }
-                Err(e) => {
-                    println!(
-                        "Warning: Failed to load easy positions from {}: {}",
-                        EASY_POSITIONS_PATH, e
-                    );
-                    println!("Continuing without pretraining phase");
-                }
+        match load_tcec_examples(data_path, config.pretrain_samples) {
+            Ok(examples) => {
+                pretrain_examples = examples;
+                println!(
+                    "Loaded {} TCEC examples for pretraining",
+                    pretrain_examples.len()
+                );
             }
-        } else {
-            println!(
-                "Warning: {} not found. Run 'filter-confident' command first to generate easy positions.",
-                EASY_POSITIONS_PATH
-            );
-            println!("Continuing without pretraining phase");
+            Err(e) => {
+                println!("Warning: Failed to load TCEC games: {}", e);
+                println!("Continuing without pretraining phase");
+            }
         }
     }
 
@@ -1240,92 +1194,81 @@ where
         train_examples.len()
     );
 
-    // Create mixed batches with gradual transition from easy to real examples
-    // Start at 100% easy, taper to 0% easy, then run out of easy examples
+    // Create mixed batches: taper from 100% TCEC to 0% TCEC, then continue with human games
     let mut batches: Vec<Vec<ChessExample>> = Vec::new();
     let num_pretrain_batches;
 
     if !pretrain_examples.is_empty() {
         println!(
-            "Creating mixed batches with {} pretrain items (100% -> 0% easy)",
+            "Creating mixed batches with {} TCEC samples (100% -> 0% TCEC)",
             pretrain_examples.len()
         );
 
-        // Calculate how many batches we need to use all pretrain examples
-        // Linear taper from 100% to 0% means average is 50% easy per batch
-        // Total easy examples = num_batches * batch_size * 0.5
-        // So: num_batches = num_pretrain / (batch_size * 0.5)
+        // Linear taper from 100% to 0% means average is 50% TCEC per batch
+        // num_batches = num_pretrain / (batch_size * 0.5)
         let physical_batch_size = config.physical_batch_size;
         let num_pretrain = pretrain_examples.len();
-        let average_easy_ratio = 0.5; // (1.0 + 0.0) / 2
+        let average_tcec_ratio = 0.5;
         num_pretrain_batches = ((num_pretrain as f64
-            / (physical_batch_size as f64 * average_easy_ratio))
+            / (physical_batch_size as f64 * average_tcec_ratio))
             .ceil() as usize)
             .max(1);
 
         println!(
-            "Will create {} batches to use all {} pretrain examples (avg {:.0}% easy per batch)",
+            "Will create {} pretrain batches using {} TCEC samples (avg {:.0}% TCEC per batch)",
             num_pretrain_batches,
             num_pretrain,
-            average_easy_ratio * 100.0
+            average_tcec_ratio * 100.0
         );
 
-        // Convert to iterators to enable efficient drain operations
         let mut pretrain_iter = pretrain_examples.into_iter();
-        let mut real_iter = train_examples.into_iter();
-        let mut pretrain_count = 0;
-        let mut real_count = 0;
+        let mut human_iter = train_examples.into_iter();
+        let mut tcec_count = 0;
+        let mut human_count = 0;
 
         for batch_num in 0..num_pretrain_batches {
-            // Calculate the easy percentage for this batch using linear interpolation
-            // Start at 1.0 (100%), end at 0.0 (0%)
             let progress = batch_num as f64 / (num_pretrain_batches - 1).max(1) as f64;
-            let easy_percentage = 1.0 - progress; // 1.0 -> 0.0
+            let tcec_percentage = 1.0 - progress;
 
-            let num_easy = (physical_batch_size as f64 * easy_percentage).round() as usize;
-            let num_real = physical_batch_size - num_easy;
+            let num_tcec = (physical_batch_size as f64 * tcec_percentage).round() as usize;
+            let num_human = physical_batch_size - num_tcec;
 
-            // Pre-allocate batch with capacity for efficiency
             let mut batch = Vec::with_capacity(physical_batch_size);
 
-            // Add easy examples, falling back to real if we run out
-            for _ in 0..num_easy {
+            for _ in 0..num_tcec {
                 if let Some(example) = pretrain_iter.next() {
                     batch.push(example);
-                    pretrain_count += 1;
-                } else if let Some(example) = real_iter.next() {
+                    tcec_count += 1;
+                } else if let Some(example) = human_iter.next() {
                     batch.push(example);
-                    real_count += 1;
+                    human_count += 1;
                 }
             }
 
-            // Add real examples using extend for efficiency
-            let real_chunk: Vec<_> = real_iter.by_ref().take(num_real).collect();
-            real_count += real_chunk.len();
-            batch.extend(real_chunk);
+            let human_chunk: Vec<_> = human_iter.by_ref().take(num_human).collect();
+            human_count += human_chunk.len();
+            batch.extend(human_chunk);
 
-            // Shuffle this batch so easy and real examples are mixed within the batch
             batch.shuffle(&mut rng);
             batches.push(batch);
         }
 
-        // Add remaining real examples as additional batches using extend
         loop {
-            let batch_chunk: Vec<_> = real_iter.by_ref().take(physical_batch_size).collect();
+            let batch_chunk: Vec<_> = human_iter.by_ref().take(physical_batch_size).collect();
             if batch_chunk.is_empty() {
                 break;
             }
-            real_count += batch_chunk.len();
+            human_count += batch_chunk.len();
             let mut batch = batch_chunk;
             batch.shuffle(&mut rng);
             batches.push(batch);
         }
 
         println!(
-            "Created {} batches using {} pretrain and {} real examples",
+            "Created {} batches using {} TCEC and {} human samples",
             batches.len(),
-            pretrain_count,
-            real_count
+            tcec_count,
+            human_count
         );
     } else {
         num_pretrain_batches = 0;
@@ -1363,10 +1306,10 @@ where
     // Calculate effective batch size and initial learning rate
     // LR scales with sqrt of batch size: batch_size=16000 -> lr=3e-2
     let effective_batch_size = grad_accumulation_steps * config.physical_batch_size;
-    let initial_lr = 0.001 * (effective_batch_size as f64 / 16000.0).sqrt();
+    let initial_lr = 0.001 * (effective_batch_size as f64 / 16000.0).sqrt() * config.lr_multiplier;
     println!(
-        "Effective batch size: {}, Initial LR: {:.6}",
-        effective_batch_size, initial_lr
+        "Effective batch size: {}, Initial LR: {:.6} (multiplier: {})",
+        effective_batch_size, initial_lr, config.lr_multiplier
     );
 
     // Create optimizers (4 groups: decay+normal_lr, decay+high_lr, no_decay+normal_lr, no_decay+high_lr)
@@ -1969,15 +1912,14 @@ where
 
         let stage_input = TrainingStageInput {
             stage: if is_in_pretrain_phase {
-                // Calculate the easy percentage for this batch
                 let progress =
                     ((iteration - 1) as f64 / (num_pretrain_batches - 1).max(1) as f64).min(1.0);
-                let easy_percentage = 1.0 - progress; // 1.0 -> 0.0
+                let tcec_percentage = 1.0 - progress;
 
                 TrainingStage::Pretrain {
                     iteration,
                     total: num_pretrain_batches,
-                    easy_percentage,
+                    tcec_percentage,
                 }
             } else {
                 TrainingStage::MainTraining

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
 
-pub const NUM_GLOBALS: usize = 6;
+pub const NUM_GLOBALS: usize = 7;
 pub const LEGAL_MOVES: usize = 64 * 76;
 // Per-square features (current position only):
 // - 12 piece one-hots (white/black 6 each)
@@ -91,10 +91,6 @@ pub struct Config {
     #[arg(long, default_value = "4")]
     pub num_workers: usize,
 
-    /// Maximum learning rate (after warmup)
-    #[arg(long, default_value = "0.0003")]
-    pub lr_max: f64,
-
     /// Minimum learning rate (end of training)
     #[arg(long, default_value = "1e-6")]
     pub lr_min: f64,
@@ -104,16 +100,16 @@ pub struct Config {
     pub measurement_batch_size: usize,
 
     /// Number of measurement batches without improvement before reducing learning rate
-    #[arg(long, default_value = "25")]
+    #[arg(long, default_value = "100")]
     pub lr_patience: usize,
 
     /// Factor to reduce learning rate by when plateau is detected (e.g., 0.5 means halve the LR)
     #[arg(long, default_value = "0.1")]
     pub lr_reduction_factor: f64,
 
-    /// Number of validation samples
-    #[arg(long)]
-    pub validation_samples: Option<usize>,
+    /// Multiplier applied to the learning rate calculated from batch size
+    #[arg(long, default_value = "1.0")]
+    pub lr_multiplier: f64,
 
     /// Weight for policy loss
     #[arg(long, default_value = "0.15")]
@@ -203,16 +199,12 @@ pub struct Config {
     pub gradnorm_probe_size: usize,
 
     /// Embedding dimension for tokens
-    #[arg(long, default_value = "768")]
+    #[arg(long, default_value = "512")]
     pub embed_dim: usize,
 
     /// Number of transformer layers
     #[arg(long, default_value = "14")]
     pub num_layers: usize,
-
-    /// Number of key/value heads used for grouped-query attention (defaults to num_heads)
-    #[arg(long)]
-    pub num_kv_heads: Option<usize>,
 
     /// MLP hidden dimension ratio
     #[arg(long, default_value = "4.0")]
@@ -277,12 +269,9 @@ pub struct Config {
     #[arg(long, default_value = "100")]
     pub checkpoint_interval: usize,
 
-    #[arg(long, default_value = "1000000")]
-    pub num_pretrain_steps: usize,
-
-    /// Maximum number of easy positions to load for pretraining
-    #[arg(long)]
-    pub max_easy_positions: Option<usize>,
+    /// Number of TCEC (computer engine) samples to use for pretraining (0 to disable)
+    #[arg(long, default_value = "0")]
+    pub pretrain_samples: usize,
 }
 
 impl Config {
@@ -301,7 +290,7 @@ impl Config {
         self.embed_dim
     }
     pub fn global_dim(&self) -> usize {
-        12
+        NUM_GLOBALS
     }
     pub fn non_global_dim(&self) -> usize {
         self.embed_dim - self.global_dim()
@@ -314,9 +303,6 @@ impl Config {
         // num_heads = embed_dim / head_dim (rounded down)
         self.embed_dim / self.head_dim()
     }
-    pub fn num_kv_heads(&self) -> usize {
-        self.num_kv_heads.unwrap_or(self.num_heads())
-    }
     pub fn num_layers(&self) -> usize {
         self.num_layers
     }
@@ -326,22 +312,6 @@ impl Config {
     pub fn seq_len(&self) -> usize {
         64
     }
-    pub fn kv_dim(&self) -> usize {
-        self.num_kv_heads() * self.head_dim()
-    }
-    pub fn gqa_group_size(&self) -> usize {
-        return 1;
-        let num_kv = self.num_kv_heads();
-        let num_heads = self.num_heads();
-        assert!(
-            num_heads % num_kv == 0,
-            "num_heads ({}) must be divisible by num_kv_heads ({})",
-            num_heads,
-            num_kv
-        );
-        num_heads / num_kv
-    }
-
     pub fn mlp_ratio(&self) -> f32 {
         self.mlp_ratio
     }
@@ -448,19 +418,17 @@ impl Default for Config {
             gradnorm_value_priority: 1.0,
             gradnorm_time_priority: 1.0,
             gradnorm_probe_size: 256,
-            lr_max: 0.05,
             lr_min: 0.000001,
             measurement_batch_size: 4000,
-            lr_patience: 25,
+            lr_patience: 100,
             lr_reduction_factor: 0.1,
-            validation_samples: None,
+            lr_multiplier: 1.0,
             policy_loss_weight: 0.15,
             policy_label_smoothing: 0.03,
             value_loss_weight: 0.0001,
             value_entropy_weight: 0.05,
             embed_dim: 768,
             num_layers: 14,
-            num_kv_heads: None,
             mlp_ratio: 4.0,
             conv_layers: 0,
             max_samples: Some(240000000),
@@ -481,8 +449,7 @@ impl Default for Config {
             enable_ply_sampling: Some(true),
             enable_elo_sampling: Some(true),
             checkpoint_interval: 100,
-            num_pretrain_steps: 1000000,
-            max_easy_positions: Some(0),
+            pretrain_samples: 0,
         }
     }
 }

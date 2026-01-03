@@ -98,18 +98,19 @@ fn log_single_position<B: Backend>(
     if let Ok(global_features_slice) = global_features_data.as_slice::<f32>() {
         use crate::config::NUM_GLOBALS;
         let offset = pos_idx * NUM_GLOBALS;
-        // NUM_GLOBALS is currently 6: [time_self_norm, time_self_ratio, time_oppo_norm,
-        // time_oppo_ratio, move_count_norm, elo_norm]
+        // NUM_GLOBALS is currently 7: [time_self_norm, time_self_ratio, time_oppo_norm,
+        // time_oppo_ratio, increment_ratio, move_count_norm, elo_norm]
         // Material imbalance, momentum, and volatility are not included yet
         if offset + NUM_GLOBALS <= global_features_slice.len() {
             tracing::info!(
-                "Global features (normalized): time_self={:.3}, time_self_ratio={:.3}, time_oppo={:.3}, time_oppo_ratio={:.3}, move_count={:.3}, elo={:.3}",
+                "Global features (normalized): time_self={:.3}, time_self_ratio={:.3}, time_oppo={:.3}, time_oppo_ratio={:.3}, increment_ratio={:.3}, move_count={:.3}, elo={:.3}",
                 global_features_slice[offset],
                 global_features_slice[offset + 1],
                 global_features_slice[offset + 2],
                 global_features_slice[offset + 3],
                 global_features_slice[offset + 4],
                 global_features_slice[offset + 5],
+                global_features_slice[offset + 6],
             );
         } else {
             tracing::warn!(

@@ -10,14 +10,15 @@ path = "src/main.rs"
 [target.'cfg(target_os = "macos")'.dependencies]
 burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "wgpu", "metal", "autodiff", "fusion", "tch", "candle" ] }
 burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", features = ["metal"] }
+burn-tch = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "tch", "autodiff", "fusion", "candle", "cuda"] }
-burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", features = ["cuda"] }
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "ndarray", "autodiff", "fusion", "candle"] }
+burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+burn-ndarray = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 
 [dependencies]
 burn-train = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["tui"] }
-burn-tch = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false }
 burn-cuda = { git = "https://github.com/tracel-ai/burn", branch = "main", optional = true }
 clap = { version = "*", features = ["derive"] }
 serde = { version = "*", features = ["derive"] }
@@ -42,13 +43,7 @@ itertools = "*"
 bincode = "*"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = "0.28"
-
-# [patch."https://github.com/tracel-ai/cubecl"]
-# cubecl = { path = "./patches/cubecl/crates/cubecl" }
-# cubecl-runtime = { path = "./patches/cubecl/crates/cubecl-runtime" }
-# cubecl-ir = { path = "./patches/cubecl/crates/cubecl-ir" }
-# cubecl-common = { path = "./patches/cubecl/crates/cubecl-common" }
-# cubecl-core = { path = "./patches/cubecl/crates/cubecl-core" }
+zip = "0.6"
 
 [dev-dependencies]
 tempfile = "*"

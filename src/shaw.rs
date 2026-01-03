@@ -15,7 +15,7 @@ use crate::norm_debug::{log_attention_heatmap, log_tensor_stats};
 /// via (dr + 7) * 15 + (dc + 7).
 #[derive(Module, Debug)]
 pub struct ShawRelativePositionAttention<B: Backend> {
-    // Separate projections so K/V can have fewer heads (grouped-query attention)
+    // Separate projections for Q/K/V
     q_proj: Linear<B>,
     k_proj: Linear<B>,
     v_proj: Linear<B>,
@@ -34,12 +34,11 @@ impl<B: Backend> ShawRelativePositionAttention<B> {
         let config = get_global_config();
         let embed_dim = config.embed_dim();
         let head_dim = config.head_dim();
-        let kv_dim = config.kv_dim();
 
-        // Separate projections to support grouped-query attention (fewer KV heads than Q heads)
+        // Separate projections for Q, K, V
         let q_proj = LinearConfig::new(embed_dim, embed_dim).init(device);
-        let k_proj = LinearConfig::new(embed_dim, kv_dim).init(device);
-        let v_proj = LinearConfig::new(embed_dim, kv_dim).init(device);
+        let k_proj = LinearConfig::new(embed_dim, embed_dim).init(device);
+        let v_proj = LinearConfig::new(embed_dim, embed_dim).init(device);
         let o_proj = LinearConfig::new(embed_dim, embed_dim).init(device);
 
         // 2D relative offsets: (dr, dc) with dr, dc in [-7, 7] → 15 * 15 buckets
@@ -94,7 +93,7 @@ impl<B: Backend> ShawRelativePositionAttention<B> {
             "embed_dim must equal num_heads * head_dim"
         );
 
-        // Separate projections for Q, K, V (supports grouped-query attention)
+        // Separate projections for Q, K, V
         let q_proj = self.q_proj.forward(x.clone());
         log_tensor_stats("attention.q_linear", &q_proj);
         let k_proj = self.k_proj.forward(x.clone());
@@ -120,33 +119,18 @@ impl<B: Backend> ShawRelativePositionAttention<B> {
         );
 
         // Reshape to [B, H, S, D]
-        let num_kv_heads = config.num_kv_heads();
-        let group_size = config.gqa_group_size();
         let q = q_proj
             .reshape([batch_size, seq_len, num_heads, head_dim])
             .permute([0, 2, 1, 3]);
         log_tensor_stats("attention.q_heads", &q);
-        let mut k = k_proj
-            .reshape([batch_size, seq_len, num_kv_heads, head_dim])
+        let k = k_proj
+            .reshape([batch_size, seq_len, num_heads, head_dim])
             .permute([0, 2, 1, 3]);
         log_tensor_stats("attention.k_heads", &k);
-        let mut v = v_proj
-            .reshape([batch_size, seq_len, num_kv_heads, head_dim])
+        let v = v_proj
+            .reshape([batch_size, seq_len, num_heads, head_dim])
             .permute([0, 2, 1, 3]);
         log_tensor_stats("attention.v_heads", &v);
-
-        if group_size > 1 {
-            let mut k_expanded = Vec::with_capacity(group_size);
-            let mut v_expanded = Vec::with_capacity(group_size);
-            for _ in 0..group_size {
-                k_expanded.push(k.clone());
-                v_expanded.push(v.clone());
-            }
-            k = Tensor::cat(k_expanded, 1);
-            v = Tensor::cat(v_expanded, 1);
-            log_tensor_stats("attention.k_expanded", &k);
-            log_tensor_stats("attention.v_expanded", &v);
-        }
 
         // debug_assert multi-head shapes post expansion
         debug_assert_eq!(

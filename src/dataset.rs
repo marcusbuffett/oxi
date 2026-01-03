@@ -197,6 +197,7 @@ impl OXIDataset {
             time_remaining_self: example.time_remaining_self,
             time_remaining_oppo: example.time_remaining_oppo,
             base_time: example.original_time_control.0,
+            increment: example.original_time_control.1,
             move_count: example.move_count,
             elo_self: example.elo_self,
         };

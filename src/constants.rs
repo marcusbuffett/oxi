@@ -1,2 +1,5 @@
-/// Path to the file containing easy positions for pretraining
-pub const EASY_POSITIONS_PATH: &str = "easy_positions.bin";
+/// Directory containing TCEC (computer engine) games for pretraining
+pub const TCEC_GAMES_DIR: &str = "data/tcec";
+
+/// URL for downloading TCEC games archive
+pub const TCEC_DOWNLOAD_URL: &str = "https://github.com/TCEC-Chess/tcecgames/releases/download/S28-final/TCEC-everything-compact.zip";

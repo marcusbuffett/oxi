@@ -68,6 +68,7 @@ pub struct PgnVisitor {
 
     // Filters
     skip: bool,
+    tcec_mode: bool,
 
     previous_fens: VecDeque<BySide<String>>,
     previous_moves_uci: VecDeque<BySide<String>>, // UCI moves corresponding to previous_fens
@@ -119,6 +120,7 @@ impl PgnVisitor {
             },
             examples: Vec::new(),
             skip: false,
+            tcec_mode: false,
             max_examples_per_position: max_examples,
             pending_example: None,
         }
@@ -129,8 +131,25 @@ impl PgnVisitor {
         self
     }
 
+    pub fn with_tcec_mode(mut self, enabled: bool) -> Self {
+        self.tcec_mode = enabled;
+        self
+    }
+
     pub fn take_examples(&mut self) -> Vec<ChessExample> {
         std::mem::take(&mut self.examples)
+    }
+
+    pub fn moves_seen(&self) -> usize {
+        self.moves.len()
+    }
+
+    pub fn is_skipped(&self) -> bool {
+        self.skip
+    }
+
+    pub fn has_pending_example(&self) -> bool {
+        self.pending_example.is_some()
     }
 }
 
@@ -157,25 +176,23 @@ impl Visitor for PgnVisitor {
     }
 
     fn comment(&mut self, comment: RawComment<'_>) {
-        let Some((_time_control, increment)) = self.time_control else {
-            self.skip = true;
-            return;
-        };
-        // Don't process comments if we're already skipping
         if self.skip {
             return;
         }
 
-        // Parse clock time from comment if present
+        let Some((_time_control, increment)) = self.time_control else {
+            if !self.tcec_mode {
+                self.skip = true;
+            }
+            return;
+        };
+
         let comment_bytes = comment.as_bytes();
         if let Ok(comment_str) = std::str::from_utf8(comment_bytes) {
-            // Look for clock comment in format [%clk H:MM:SS]
             if let Some(clock_start) = comment_str.find("%clk ") {
                 if let Some(clock_end) = comment_str[clock_start..].find(']') {
                     let clock_str = &comment_str[clock_start + 5..clock_start + clock_end];
                     if let Some(clock_seconds) = parse_clock_time(clock_str) {
-                        // Update clock for the player whose move was just made
-                        // moves.len() gives us the number of completed moves
                         let move_count = self.moves.len();
 
                         if clock_seconds < MIN_CLOCK_TIME {
@@ -255,6 +272,26 @@ impl Visitor for PgnVisitor {
     }
 
     fn end_headers(&mut self) -> Skip {
+        // TCEC mode: assign default values for missing headers
+        if self.tcec_mode {
+            if self.white_elo.is_none() {
+                self.white_elo = Some(3500);
+            }
+            if self.black_elo.is_none() {
+                self.black_elo = Some(3500);
+            }
+            if self.time_control.is_none() {
+                self.time_control = Some((7200, 30));
+                self.current_clock.white = Some(7200);
+                self.current_clock.black = Some(7200);
+            }
+            if self.result.is_none() {
+                self.skip = true;
+                return Skip(true);
+            }
+            return Skip(false);
+        }
+
         // Skip games without required data
         if self.white_elo.is_none()
             || self.black_elo.is_none()
@@ -380,49 +417,77 @@ impl Visitor for PgnVisitor {
                 self.skip = true;
                 return;
             }
-            self.pending_example = Some(PendingChessExample {
-                fen: adjusted_fen.clone(),
-                move_uci: adjusted_move.clone(),
-                elo_self,
-                elo_oppo,
-                outcome,
-                previous_fens: self
-                    .previous_fens
-                    .iter()
-                    .take(PREVIOUS_POSITIONS)
-                    .map(|fen_by_side| match turn {
-                        Color::White => &fen_by_side.white,
-                        Color::Black => &fen_by_side.black,
-                    })
-                    .cloned()
-                    .collect(),
-                previous_moves: self
-                    .previous_moves_uci
-                    .iter()
-                    .take(PREVIOUS_POSITIONS)
-                    .map(|move_by_side| match turn {
-                        Color::White => &move_by_side.white,
-                        Color::Black => &move_by_side.black,
-                    })
-                    .cloned()
-                    .collect(),
-                time_remaining_oppo: match turn {
-                    Color::White => self.current_clock.black.unwrap(),
-                    Color::Black => self.current_clock.white.unwrap(),
-                },
-                time_remaining_self: match turn {
-                    Color::White => self.current_clock.white.unwrap(),
-                    Color::Black => self.current_clock.black.unwrap(),
-                },
-                move_count: self.moves.len(),
-                turn,
-                material_imbalance_history: self
-                    .previous_material_imbalances
-                    .iter()
-                    .take(PREVIOUS_POSITIONS)
-                    .cloned()
-                    .collect(),
-            });
+
+            let move_count = self.moves.len();
+            let previous_fens: Vec<String> = self
+                .previous_fens
+                .iter()
+                .take(PREVIOUS_POSITIONS)
+                .map(|fen_by_side| match turn {
+                    Color::White => &fen_by_side.white,
+                    Color::Black => &fen_by_side.black,
+                })
+                .cloned()
+                .collect();
+            let previous_moves: Vec<String> = self
+                .previous_moves_uci
+                .iter()
+                .take(PREVIOUS_POSITIONS)
+                .map(|move_by_side| match turn {
+                    Color::White => &move_by_side.white,
+                    Color::Black => &move_by_side.black,
+                })
+                .cloned()
+                .collect();
+            let time_remaining_self = match turn {
+                Color::White => self.current_clock.white.unwrap(),
+                Color::Black => self.current_clock.black.unwrap(),
+            };
+            let time_remaining_oppo = match turn {
+                Color::White => self.current_clock.black.unwrap(),
+                Color::Black => self.current_clock.white.unwrap(),
+            };
+            let material_imbalance_history: Vec<i32> = self
+                .previous_material_imbalances
+                .iter()
+                .take(PREVIOUS_POSITIONS)
+                .cloned()
+                .collect();
+
+            if self.tcec_mode {
+                if move_count > MIN_PLY {
+                    self.examples.push(ChessExample {
+                        fen: adjusted_fen.clone(),
+                        move_uci: adjusted_move.clone(),
+                        elo_self,
+                        elo_oppo,
+                        outcome,
+                        previous_fens,
+                        previous_moves,
+                        time_remaining_self,
+                        time_remaining_oppo,
+                        time_used_for_move: 30,
+                        original_time_control: self.time_control.expect("time control"),
+                        move_count,
+                        material_imbalance_history,
+                    });
+                }
+            } else {
+                self.pending_example = Some(PendingChessExample {
+                    fen: adjusted_fen.clone(),
+                    move_uci: adjusted_move.clone(),
+                    elo_self,
+                    elo_oppo,
+                    outcome,
+                    previous_fens,
+                    previous_moves,
+                    time_remaining_oppo,
+                    time_remaining_self,
+                    move_count,
+                    turn,
+                    material_imbalance_history,
+                });
+            }
         }
 
         self.previous_fens.push_front(BySide {
@@ -1153,6 +1218,146 @@ fn parse_clock_time(clock_str: &str) -> Option<u32> {
             Some(hours * 3600 + minutes * 60 + seconds)
         }
         _ => None,
+    }
+}
+
+pub fn process_tcec_directory_iter(
+    dir: &std::path::Path,
+) -> Result<impl Iterator<Item = ChessExample>> {
+    let mut pgn_files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        let is_pgn = path.extension().and_then(|s| s.to_str()) == Some("pgn")
+            || (path
+                .to_str()
+                .map(|s| s.ends_with(".pgn.zst"))
+                .unwrap_or(false));
+
+        if is_pgn {
+            pgn_files.push(path);
+        }
+    }
+
+    if pgn_files.is_empty() {
+        tracing::info!("No TCEC PGN files found in directory: {:?}", dir);
+    } else {
+        tracing::info!("Found {} TCEC PGN files to process", pgn_files.len());
+    }
+
+    Ok(TcecDirectoryIterator {
+        files: pgn_files,
+        current_file_index: 0,
+        current_reader: None,
+        current_visitor: PgnVisitor::with_position_counts().with_tcec_mode(true),
+        pending_examples: Vec::new(),
+        games_processed: 0,
+        games_with_examples: 0,
+        games_skipped: 0,
+        games_no_moves: 0,
+        total_examples: 0,
+    })
+}
+
+struct TcecDirectoryIterator {
+    files: Vec<std::path::PathBuf>,
+    current_file_index: usize,
+    current_reader: Option<BufferedReader<Box<dyn std::io::Read>>>,
+    current_visitor: PgnVisitor,
+    pending_examples: Vec<ChessExample>,
+    games_processed: usize,
+    games_with_examples: usize,
+    games_skipped: usize,
+    games_no_moves: usize,
+    total_examples: usize,
+}
+
+impl Iterator for TcecDirectoryIterator {
+    type Item = ChessExample;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(example) = self.pending_examples.pop() {
+                return Some(example);
+            }
+
+            if let Some(reader) = &mut self.current_reader {
+                match reader.read_game(&mut self.current_visitor) {
+                    Ok(Some(_)) => {
+                        self.games_processed += 1;
+                        let was_skipped = self.current_visitor.is_skipped();
+                        let moves_seen = self.current_visitor.moves_seen();
+                        let examples = self.current_visitor.take_examples();
+                        let example_count = examples.len();
+
+                        if was_skipped {
+                            self.games_skipped += 1;
+                        } else if moves_seen == 0 {
+                            self.games_no_moves += 1;
+                        }
+
+                        if !examples.is_empty() {
+                            self.games_with_examples += 1;
+                            self.total_examples += example_count;
+                            self.pending_examples.extend(examples);
+                        }
+
+                        if self.games_processed % 1000 == 0 {
+                            let pct_with_examples = if self.games_processed > 0 {
+                                100.0 * self.games_with_examples as f64
+                                    / self.games_processed as f64
+                            } else {
+                                0.0
+                            };
+                            tracing::info!(
+                                "TCEC: {} games | {} with examples ({:.1}%) | {} skipped | {} no moves | {} examples",
+                                self.games_processed,
+                                self.games_with_examples,
+                                pct_with_examples,
+                                self.games_skipped,
+                                self.games_no_moves,
+                                self.total_examples
+                            );
+                        }
+
+                        if example_count > 0 {
+                            continue;
+                        }
+                    }
+                    Ok(None) => {
+                        self.current_reader = None;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Error reading TCEC game: {:?}", e);
+                        continue;
+                    }
+                }
+            }
+
+            if self.current_reader.is_none() {
+                if self.current_file_index >= self.files.len() {
+                    return None;
+                }
+
+                let path = &self.files[self.current_file_index];
+                self.current_file_index += 1;
+
+                tracing::info!("Processing TCEC PGN file: {:?}", path);
+
+                match open_pgn_file(path) {
+                    Ok(reader) => {
+                        self.current_reader = Some(BufferedReader::new(reader));
+                        self.current_visitor =
+                            PgnVisitor::with_position_counts().with_tcec_mode(true);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to open TCEC file {:?}: {}", path, e);
+                        continue;
+                    }
+                }
+            }
+        }
     }
 }
 

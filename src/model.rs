@@ -492,7 +492,6 @@ impl<B: Backend> OXIModel<B> {
             batch.values.clone(),
             batch.legal_moves.clone(),
         )
-        .with_distributions(batch.move_distributions.clone())
         // .with_uncertainties((sigma_policy, sigma_value, sigma_time_usage))
         .with_raw_losses(
             base_policy_loss.clone(),
@@ -589,7 +588,7 @@ impl<B: Backend> OXIModel<B> {
 
         let mut top_moves = Vec::new();
         for b in 0..batch {
-            let batch_probs = &probs[b * 64 * 64..(b + 1) * LEGAL_MOVES];
+            let batch_probs = &probs[b * LEGAL_MOVES..(b + 1) * LEGAL_MOVES];
             let mut indexed_probs: Vec<(usize, f32)> = batch_probs
                 .iter()
                 .enumerate()
@@ -600,7 +599,7 @@ impl<B: Backend> OXIModel<B> {
             let top_k_moves: Vec<(usize, usize, f32)> = indexed_probs
                 .iter()
                 .take(top_k)
-                .map(|&(idx, prob)| (idx / 64, idx % 64, prob))
+                .map(|&(idx, prob)| (idx / 76, idx % 76, prob))
                 .collect();
             top_moves.push(top_k_moves);
         }

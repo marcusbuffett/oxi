@@ -153,7 +153,7 @@ Since norms reach 50, the transformer layers (attention + MLP) may be amplifying
   - **Fix**: If residuals cause spikes, try scaling attention/MLP outputs (e.g., multiply by 0.5 before adding).
 
 ### Step 5: Check Gradients and Optimizer
-High norms may result from unstable gradients, especially with `lr_max=1e-4` and gradient clipping at 1.0.
+High norms may result from unstable gradients, especially with an aggressive batch-scaled initial LR and gradient clipping at 1.0.
 
 - **Gradient Norms**:
   - Log gradient norms for all parameters.
@@ -164,11 +164,11 @@ High norms may result from unstable gradients, especially with `lr_max=1e-4` and
   - **Expectation**: Norms >10 indicate exploding gradients; frequent clipping at 1.0 suggests the learning rate or initialization is too aggressive.
 
 - **Learning Rate**:
-  - Verify the learning rate schedule (`lr_max=1e-4`, `lr_min=1e-6`) isn’t causing large parameter updates.
+  - Verify the current LR and min LR aren’t causing large parameter updates.
     ```rust
     log::info!("Current LR: {:.8}", optimizer.current_lr());
     ```
-  - **Fix**: Try reducing `lr_max` to 5e-5 or increasing warmup steps to stabilize early training.
+  - **Fix**: Try reducing the batch-scaled initial LR or increasing gradient clipping to stabilize early training.
 
 - **Weight Decay**:
   - Ensure weight decay (`1e-4`) is applied to prevent weights from growing excessively.

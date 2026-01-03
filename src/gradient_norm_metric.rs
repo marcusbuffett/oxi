@@ -185,7 +185,7 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
         let head_dim = self.config.head_dim();
         let head_count = match component {
             HeadComponent::Query => self.config.num_heads(),
-            HeadComponent::Key | HeadComponent::Value => self.config.num_kv_heads(),
+            HeadComponent::Key | HeadComponent::Value => self.config.num_heads(),
         };
 
         let axis = if D == 1 { 0 } else { 1 };

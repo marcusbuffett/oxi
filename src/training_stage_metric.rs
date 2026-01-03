@@ -22,13 +22,12 @@ impl TrainingStageMetric {
     }
 }
 
-/// Training stage enum
 #[derive(Debug, Clone, Copy)]
 pub enum TrainingStage {
     Pretrain {
         iteration: usize,
         total: usize,
-        easy_percentage: f64,
+        tcec_percentage: f64,
     },
     MainTraining,
 }
@@ -46,13 +45,13 @@ impl Metric for TrainingStageMetric {
             TrainingStage::Pretrain {
                 iteration,
                 total,
-                easy_percentage,
+                tcec_percentage,
             } => {
                 format!(
-                    "Pretrain ({}/{} - {:.0}% easy)",
+                    "Pretrain ({}/{} - {:.0}% TCEC)",
                     iteration,
                     total,
-                    easy_percentage * 100.0
+                    tcec_percentage * 100.0
                 )
             }
             TrainingStage::MainTraining => "Main Training".to_string(),
