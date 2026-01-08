@@ -9,3 +9,4 @@ model.mpk
 model
 .venv
 models
+train.log

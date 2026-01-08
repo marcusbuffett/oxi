@@ -2,7 +2,7 @@ use core::marker::PhantomData;
 
 use burn::prelude::*;
 use burn::tensor::ElementConversion;
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
+use burn::train::metric::{Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 
 /// The WDL (Win/Draw/Loss) accuracy metric.
 /// This metric tracks the accuracy of win/draw/loss predictions from the value head.
@@ -38,7 +38,11 @@ impl<B: Backend> WdlAccuracyMetric<B> {
 impl<B: Backend> Metric for WdlAccuracyMetric<B> {
     type Input = WdlAccuracyInput<B>;
 
-    fn update(&mut self, input: &WdlAccuracyInput<B>, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(
+        &mut self,
+        input: &WdlAccuracyInput<B>,
+        _metadata: &MetricMetadata,
+    ) -> SerializedEntry {
         let outputs = &input.outputs;
         let targets = &input.targets;
 
@@ -70,11 +74,7 @@ impl<B: Backend> Metric for WdlAccuracyMetric<B> {
 
         self.current_value = accuracy;
 
-        MetricEntry::new(
-            "WDL Accuracy".to_string().into(),
-            format!("{accuracy:.2}%"),
-            format!("{accuracy:.2}"),
-        )
+        SerializedEntry::new(format!("{accuracy:.2}%"), format!("{accuracy:.2}"))
     }
 
     fn clear(&mut self) {
@@ -91,6 +91,10 @@ impl<B: Backend> Numeric for WdlAccuracyMetric<B> {
         // Set min of 40 for display purposes
         NumericEntry::Value(self.current_value.max(40.0))
     }
+
+    fn running_value(&self) -> NumericEntry {
+        NumericEntry::Value(self.current_value.max(40.0))
+    }
 }
 
 #[cfg(test)]
@@ -99,14 +103,14 @@ mod tests {
     use burn::data::dataloader::Progress;
 
     #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Metal;
+    type TestBackend = burn::backend::Wgpu;
     #[cfg(not(target_os = "macos"))]
     type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_wdl_accuracy_perfect() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let mut metric = WdlAccuracyMetric::<TestBackend>::new();
@@ -156,7 +160,7 @@ mod tests {
     #[test]
     fn test_wdl_accuracy_partial() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let mut metric = WdlAccuracyMetric::<TestBackend>::new();
@@ -205,7 +209,7 @@ mod tests {
     #[test]
     fn test_wdl_accuracy_batch_update() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let mut metric = WdlAccuracyMetric::<TestBackend>::new();

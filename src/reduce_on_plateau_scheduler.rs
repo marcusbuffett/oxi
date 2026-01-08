@@ -1,190 +1,316 @@
 use burn::lr_scheduler::LrScheduler;
 use burn::tensor::backend::Backend;
+use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::Write;
 
-/// ReduceOnPlateau learning rate scheduler
-/// Reduces learning rate when loss plateaus for a specified number of measurement batches
 #[derive(Clone, Debug)]
-pub struct ReduceOnPlateauScheduler {
-    /// Current learning rate
-    current_lr: f64,
-    /// Minimum learning rate (never go below this)
-    min_lr: f64,
-    /// Factor to reduce LR by when plateau detected (e.g., 0.5 means halve the LR)
-    reduction_factor: f64,
-    /// Number of measurement batches without improvement before reducing LR
-    patience: usize,
-    /// Number of samples to accumulate before recording a measurement
-    measurement_batch_size: usize,
-    /// Number of samples accumulated since last measurement
-    samples_accumulated: usize,
-    /// Best (lowest) loss observed so far
-    best_loss: Option<f64>,
-    /// Number of measurement batches since best loss was updated
-    batches_without_improvement: usize,
-    /// Total number of samples processed
-    total_samples_processed: usize,
+pub struct PlateauDetector {
+    window: VecDeque<f64>,
+    window_size: usize,
+    improvement_threshold: f64,
 }
 
-impl ReduceOnPlateauScheduler {
-    /// Create a new ReduceOnPlateau scheduler
-    ///
-    /// # Arguments
-    /// * `initial_lr` - Starting learning rate
-    /// * `min_lr` - Minimum learning rate (floor)
-    /// * `reduction_factor` - Factor to multiply LR by when reducing (e.g., 0.5)
-    /// * `patience` - Number of measurement batches without improvement before reducing LR
-    /// * `measurement_batch_size` - Number of samples per measurement batch
-    pub fn new(
-        initial_lr: f64,
-        min_lr: f64,
-        reduction_factor: f64,
-        patience: usize,
-        measurement_batch_size: usize,
-    ) -> Self {
+impl PlateauDetector {
+    pub fn new(window_size: usize, improvement_threshold: f64) -> Self {
         Self {
-            current_lr: initial_lr,
-            min_lr,
-            reduction_factor,
-            patience,
-            measurement_batch_size,
-            samples_accumulated: 0,
-            best_loss: None,
-            batches_without_improvement: 0,
-            total_samples_processed: 0,
+            window: VecDeque::with_capacity(window_size),
+            window_size,
+            improvement_threshold,
         }
     }
 
-    /// Adjust measurement batch size to be a multiple of physical batch size
-    pub fn adjust_measurement_batch_size(&mut self, physical_batch_size: usize) {
-        // Round up to nearest multiple of physical_batch_size
-        let multiple =
-            (self.measurement_batch_size + physical_batch_size - 1) / physical_batch_size;
-        self.measurement_batch_size = multiple * physical_batch_size;
-    }
-
-    /// Get the adjusted measurement batch size
-    pub fn measurement_batch_size(&self) -> usize {
-        self.measurement_batch_size
-    }
-
-    /// Record samples processed in this batch and optionally a loss measurement
-    /// Returns true if a measurement was recorded (measurement batch completed)
-    pub fn record_batch(&mut self, batch_size: usize, loss: f64) -> bool {
-        self.samples_accumulated += batch_size;
-        self.total_samples_processed += batch_size;
-
-        // Check if we've reached a measurement boundary
-        if self.samples_accumulated >= self.measurement_batch_size {
-            self.samples_accumulated = 0;
-            self.record_measurement(loss);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Record a loss measurement and potentially reduce learning rate
-    fn record_measurement(&mut self, loss: f64) {
+    pub fn record(&mut self, loss: f64) {
         if !loss.is_finite() {
             return;
         }
 
-        match self.best_loss {
-            None => {
-                // First measurement
-                self.best_loss = Some(loss);
-                self.batches_without_improvement = 0;
-            }
-            Some(best) => {
-                if loss < best {
-                    // New best loss! Reset patience counter and update best
-                    self.best_loss = Some(loss);
-                    self.batches_without_improvement = 0;
-                } else {
-                    // No improvement
-                    self.batches_without_improvement += 1;
+        if self.window.len() >= self.window_size {
+            self.window.pop_front();
+        }
+        self.window.push_back(loss);
+    }
 
-                    // Check if we should reduce LR
-                    if self.batches_without_improvement >= self.patience {
-                        let new_lr = (self.current_lr * self.reduction_factor).max(self.min_lr);
-                        if new_lr < self.current_lr {
-                            self.current_lr = new_lr;
-                            // Reset best loss when LR is reduced
-                            self.best_loss = Some(loss);
-                            self.batches_without_improvement = 0;
-                        }
-                    }
-                }
-            }
+    pub fn is_plateau(&self) -> bool {
+        if self.window.len() < self.window_size {
+            return false;
+        }
+
+        let (old_avg, new_avg) = match self.half_window_averages() {
+            Some(avgs) => avgs,
+            None => return false,
+        };
+
+        if old_avg <= 0.0 {
+            return false;
+        }
+
+        let relative_improvement = (old_avg - new_avg) / old_avg;
+        relative_improvement < self.improvement_threshold
+    }
+
+    fn half_window_averages(&self) -> Option<(f64, f64)> {
+        if self.window.len() < 4 {
+            return None;
+        }
+
+        let mid = self.window.len() / 2;
+        let first_half: Vec<f64> = self.window.iter().take(mid).copied().collect();
+        let second_half: Vec<f64> = self.window.iter().skip(mid).copied().collect();
+
+        if first_half.is_empty() || second_half.is_empty() {
+            return None;
+        }
+
+        let old_avg = first_half.iter().sum::<f64>() / first_half.len() as f64;
+        let new_avg = second_half.iter().sum::<f64>() / second_half.len() as f64;
+
+        Some((old_avg, new_avg))
+    }
+
+    pub fn relative_improvement(&self) -> Option<f64> {
+        let (old_avg, new_avg) = self.half_window_averages()?;
+
+        if old_avg <= 0.0 {
+            return None;
+        }
+
+        Some((old_avg - new_avg) / old_avg)
+    }
+
+    pub fn oldest_loss(&self) -> Option<f64> {
+        self.window.front().copied()
+    }
+
+    pub fn newest_loss(&self) -> Option<f64> {
+        self.window.back().copied()
+    }
+
+    pub fn fill_ratio(&self) -> f64 {
+        self.window.len() as f64 / self.window_size as f64
+    }
+
+    pub fn window_size(&self) -> usize {
+        self.window_size
+    }
+
+    pub fn current_window_len(&self) -> usize {
+        self.window.len()
+    }
+
+    pub fn improvement_threshold(&self) -> f64 {
+        self.improvement_threshold
+    }
+
+    pub fn reset(&mut self) {
+        self.window.clear();
+    }
+
+    pub fn window_values(&self) -> Vec<f64> {
+        self.window.iter().copied().collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReduceOnPlateauScheduler {
+    initial_lr: f64,
+    current_lr: f64,
+    min_lr: f64,
+    reduction_factor: f64,
+    detector: PlateauDetector,
+    iteration: usize,
+    num_reductions: usize,
+    warmup_iterations: usize,
+}
+
+impl ReduceOnPlateauScheduler {
+    pub fn new(
+        initial_lr: f64,
+        min_lr: f64,
+        reduction_factor: f64,
+        window_size: usize,
+        improvement_threshold: f64,
+        warmup_iterations: usize,
+    ) -> Self {
+        Self {
+            initial_lr,
+            current_lr: initial_lr,
+            min_lr,
+            reduction_factor,
+            detector: PlateauDetector::new(window_size, improvement_threshold),
+            iteration: 0,
+            num_reductions: 0,
+            warmup_iterations,
         }
     }
 
-    /// Get current learning rate
+    pub fn record_batch(&mut self, loss: f64) -> bool {
+        self.iteration += 1;
+        self.record_measurement(loss)
+    }
+
+    fn record_measurement(&mut self, loss: f64) -> bool {
+        if !loss.is_finite() {
+            return false;
+        }
+
+        if self.is_warming_up() {
+            return false;
+        }
+
+        self.detector.record(loss);
+
+        if self.detector.is_plateau() {
+            let new_lr = (self.current_lr * self.reduction_factor).max(self.min_lr);
+            if new_lr < self.current_lr {
+                let window_values = self.detector.window_values();
+                let old_loss = self.detector.oldest_loss().unwrap_or(f64::NAN);
+                let new_loss = self.detector.newest_loss().unwrap_or(f64::NAN);
+                let rel_improvement = self.detector.relative_improvement().unwrap_or(f64::NAN);
+                let threshold = self.detector.improvement_threshold();
+
+                tracing::warn!(
+                    target: "plateau_detection",
+                    "PLATEAU DETECTED at iteration {}: LR {} -> {} | loss: {:.6} -> {:.6} | improvement: {:.4}% < threshold: {:.4}% | window_size: {} | reduction #{}",
+                    self.iteration,
+                    self.current_lr,
+                    new_lr,
+                    old_loss,
+                    new_loss,
+                    rel_improvement * 100.0,
+                    threshold * 100.0,
+                    window_values.len(),
+                    self.num_reductions + 1
+                );
+
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("plateau_detection.log")
+                {
+                    let _ = writeln!(
+                        file,
+                        "--- Plateau Detection at iteration {} ---",
+                        self.iteration
+                    );
+                    let _ = writeln!(file, "LR: {} -> {}", self.current_lr, new_lr);
+                    let _ = writeln!(file, "Loss: {:.6} -> {:.6}", old_loss, new_loss);
+                    let _ = writeln!(
+                        file,
+                        "Relative improvement: {:.4}% (threshold: {:.4}%)",
+                        rel_improvement * 100.0,
+                        threshold * 100.0
+                    );
+                    let _ = writeln!(file, "Window values ({}):", window_values.len());
+                    for (i, v) in window_values.iter().enumerate() {
+                        let _ = writeln!(file, "  [{:4}] {:.6}", i, v);
+                    }
+                    let _ = writeln!(file, "");
+                }
+
+                self.current_lr = new_lr;
+                self.num_reductions += 1;
+                self.detector.reset();
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn get_lr(&self) -> f64 {
-        self.current_lr
+        if self.warmup_iterations > 0 && self.iteration < self.warmup_iterations {
+            let warmup_progress = self.iteration as f64 / self.warmup_iterations as f64;
+            self.current_lr * warmup_progress
+        } else {
+            self.current_lr
+        }
     }
 
-    /// Get current best loss
-    pub fn best_loss(&self) -> Option<f64> {
-        self.best_loss
+    pub fn warmup_iterations(&self) -> usize {
+        self.warmup_iterations
     }
 
-    /// Get batches without improvement
-    pub fn batches_without_improvement(&self) -> usize {
-        self.batches_without_improvement
+    pub fn is_warming_up(&self) -> bool {
+        self.warmup_iterations > 0 && self.iteration < self.warmup_iterations
     }
 
-    /// Check if training should stop (at min LR with no improvement for patience batches)
+    pub fn warmup_progress(&self) -> f64 {
+        if self.warmup_iterations == 0 {
+            1.0
+        } else {
+            (self.iteration as f64 / self.warmup_iterations as f64).min(1.0)
+        }
+    }
+
+    pub fn relative_improvement(&self) -> Option<f64> {
+        self.detector.relative_improvement()
+    }
+
+    pub fn window_fill_ratio(&self) -> f64 {
+        self.detector.fill_ratio()
+    }
+
+    pub fn num_reductions(&self) -> usize {
+        self.num_reductions
+    }
+
+    pub fn improvement_threshold(&self) -> f64 {
+        self.detector.improvement_threshold()
+    }
+
     pub fn should_stop(&self) -> bool {
-        // Stop if we're at minimum LR and haven't improved for patience batches
-        (self.current_lr - self.min_lr).abs() < 1e-10
-            && self.batches_without_improvement >= self.patience
+        if self.is_warming_up() {
+            return false;
+        }
+        (self.current_lr - self.min_lr).abs() < 1e-10 && self.detector.is_plateau()
     }
 }
 
 impl LrScheduler for ReduceOnPlateauScheduler {
     type Record<B: Backend> = (
-        f64,
-        f64,
-        f64,
-        usize,
-        usize,
-        usize,
-        Option<f64>,
-        usize,
-        usize,
+        f64,      // initial_lr
+        f64,      // current_lr
+        f64,      // min_lr
+        f64,      // reduction_factor
+        usize,    // window_size
+        f64,      // improvement_threshold
+        usize,    // iteration
+        usize,    // num_reductions
+        usize,    // warmup_iterations
+        Vec<f64>, // detector window
     );
 
     fn step(&mut self) -> f64 {
-        // Unlike the cosine scheduler, we don't step automatically
-        // The LR only changes when record_batch detects a plateau
-        self.current_lr
+        self.get_lr()
     }
 
     fn to_record<B: Backend>(&self) -> Self::Record<B> {
         (
+            self.initial_lr,
             self.current_lr,
             self.min_lr,
             self.reduction_factor,
-            self.patience,
-            self.measurement_batch_size,
-            self.samples_accumulated,
-            self.best_loss,
-            self.batches_without_improvement,
-            self.total_samples_processed,
+            self.detector.window_size,
+            self.detector.improvement_threshold,
+            self.iteration,
+            self.num_reductions,
+            self.warmup_iterations,
+            self.detector.window.iter().copied().collect(),
         )
     }
 
     fn load_record<B: Backend>(mut self, record: Self::Record<B>) -> Self {
-        self.current_lr = record.0;
-        self.min_lr = record.1;
-        self.reduction_factor = record.2;
-        self.patience = record.3;
-        self.measurement_batch_size = record.4;
-        self.samples_accumulated = record.5;
-        self.best_loss = record.6;
-        self.batches_without_improvement = record.7;
-        self.total_samples_processed = record.8;
+        self.initial_lr = record.0;
+        self.current_lr = record.1;
+        self.min_lr = record.2;
+        self.reduction_factor = record.3;
+        self.detector = PlateauDetector::new(record.4, record.5);
+        for loss in record.9 {
+            self.detector.record(loss);
+        }
+        self.iteration = record.6;
+        self.num_reductions = record.7;
+        self.warmup_iterations = record.8;
         self
     }
 }

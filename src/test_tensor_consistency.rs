@@ -13,7 +13,7 @@ mod tests {
     use crate::model::OXIModel;
 
     #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Metal;
+    type TestBackend = burn::backend::Wgpu;
     #[cfg(not(target_os = "macos"))]
     type TestBackend = burn::backend::LibTorch<f32>;
 
@@ -47,7 +47,7 @@ mod tests {
         fs::write(temp_file.path(), pgn_content).expect("Failed to write PGN content");
 
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
 
@@ -67,7 +67,7 @@ mod tests {
         let chess_item = dataset.get(0).expect("Should have first item");
 
         // Create ChessBatch from single item
-        let batcher: ChessBatcher<TestBackend> = ChessBatcher::new(device);
+        let batcher: ChessBatcher<TestBackend> = ChessBatcher::new(device.clone());
         let batch = batcher.batch(vec![chess_item.clone()], &device);
 
         // Extract dataset tensors
@@ -190,7 +190,7 @@ mod tests {
 
         // Test that reshaping works as expected
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let board_tensor = Tensor::<TestBackend, 1>::from_floats(encoded_board.as_slice(), &device)

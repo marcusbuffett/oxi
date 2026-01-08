@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use burn::prelude::*;
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
+use burn::train::metric::{Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 
 /// Input type for value loss metric
 pub struct ValueLossInput<B: Backend> {
@@ -56,7 +56,7 @@ impl<B: Backend> ValueLossMetric<B> {
 impl<B: Backend> Metric for ValueLossMetric<B> {
     type Input = ValueLossInput<B>;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         let loss_value = input.loss.clone().into_scalar().elem::<f32>() as f64;
 
         self.current_value = loss_value;
@@ -88,11 +88,7 @@ impl<B: Backend> Metric for ValueLossMetric<B> {
             grad = grad_display
         );
 
-        MetricEntry::new(
-            "Value Loss".to_string().into(),
-            formatted.clone(),
-            formatted,
-        )
+        SerializedEntry::new(formatted.clone(), formatted)
     }
 
     fn clear(&mut self) {
@@ -111,6 +107,11 @@ impl<B: Backend> Numeric for ValueLossMetric<B> {
     fn value(&self) -> NumericEntry {
         // Return raw loss if available, otherwise return weighted loss
         // Cap at 10 for display purposes
+        let value = self.current_raw_value.unwrap_or(self.current_value);
+        NumericEntry::Value(value.min(10.0))
+    }
+
+    fn running_value(&self) -> NumericEntry {
         let value = self.current_raw_value.unwrap_or(self.current_value);
         NumericEntry::Value(value.min(10.0))
     }

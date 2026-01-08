@@ -2,7 +2,7 @@ use core::marker::PhantomData;
 use std::sync::Arc;
 
 use burn::prelude::*;
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
+use burn::train::metric::{Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 
 /// A metric that measures the sum probability assigned to legal moves
 /// after applying softmax normalization. This should be close to 1.0 if the
@@ -32,7 +32,7 @@ impl<B: Backend> LegalMoveProbabilityMetric<B> {
 impl<B: Backend> Metric for LegalMoveProbabilityMetric<B> {
     type Input = LegalMoveProbabilityInput<B>;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         // Apply softmax to get probabilities from logits
         let policy_probs = burn::tensor::activation::softmax(input.policy_logits.clone(), 1);
 
@@ -49,8 +49,7 @@ impl<B: Backend> Metric for LegalMoveProbabilityMetric<B> {
 
         self.current_value = avg_legal_prob;
 
-        MetricEntry::new(
-            Arc::new("Legal Move Probability".to_string()),
+        SerializedEntry::new(
             format!("{avg_legal_prob:.4}"),
             format!("{avg_legal_prob:.4}"),
         )
@@ -69,6 +68,10 @@ impl<B: Backend> Numeric for LegalMoveProbabilityMetric<B> {
     fn value(&self) -> NumericEntry {
         NumericEntry::Value(self.current_value)
     }
+
+    fn running_value(&self) -> NumericEntry {
+        NumericEntry::Value(self.current_value)
+    }
 }
 
 #[cfg(test)]
@@ -77,14 +80,14 @@ mod tests {
     use burn::data::dataloader::Progress;
 
     #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Metal;
+    type TestBackend = burn::backend::Wgpu;
     #[cfg(not(target_os = "macos"))]
     type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_legal_move_probability_perfect() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let mut metric = LegalMoveProbabilityMetric::<TestBackend>::new();
@@ -144,7 +147,7 @@ mod tests {
     #[test]
     fn test_legal_move_probability_batch() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let mut metric = LegalMoveProbabilityMetric::<TestBackend>::new();

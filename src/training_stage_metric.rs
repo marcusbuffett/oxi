@@ -1,4 +1,4 @@
-use burn_train::metric::{Metric, MetricEntry, MetricMetadata};
+use burn_train::metric::{Metric, MetricMetadata, SerializedEntry};
 
 /// Metric to display the current training stage (pretrain vs main training)
 #[derive(Default, Clone)]
@@ -40,7 +40,7 @@ pub struct TrainingStageInput {
 impl Metric for TrainingStageMetric {
     type Input = TrainingStageInput;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         self.stage = match input.stage {
             TrainingStage::Pretrain {
                 iteration,
@@ -57,11 +57,7 @@ impl Metric for TrainingStageMetric {
             TrainingStage::MainTraining => "Main Training".to_string(),
         };
 
-        MetricEntry::new(
-            "Stage".to_string().into(),
-            self.stage.clone(),
-            self.stage.clone(),
-        )
+        SerializedEntry::new(self.stage.clone(), self.stage.clone())
     }
 
     fn clear(&mut self) {

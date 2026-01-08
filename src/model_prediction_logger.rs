@@ -700,14 +700,14 @@ mod tests {
     use burn::tensor::Tensor;
 
     #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Metal;
+    type TestBackend = burn::backend::Wgpu;
     #[cfg(not(target_os = "macos"))]
     type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_log_wdl_prediction() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
 
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn test_format_time_usage_distribution_snapshot() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
 
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn test_format_time_usage_distribution_edge_case() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
 
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn test_format_time_usage_distribution_high_variance() {
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
 

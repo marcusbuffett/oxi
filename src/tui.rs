@@ -199,35 +199,21 @@ impl ProgressState {
         self.iteration.saturating_add(1)
     }
 
-    fn ratio(&self) -> f64 {
-        if self.total_iterations == 0 {
-            return 0.0;
-        }
-        (self.iteration as f64 / self.total_iterations as f64).clamp(0.0, 1.0)
+    fn is_streaming(&self) -> bool {
+        self.total_iterations == usize::MAX
     }
 
-    fn average_iteration_secs(&self) -> Option<f64> {
-        if !self.durations.is_empty() {
-            let sum: f64 = self.durations.iter().copied().sum();
-            Some(sum / self.durations.len() as f64)
-        } else if let (Some(start), Some(last)) = (self.start_time, self.last_timestamp) {
-            if self.iteration > 0 {
-                let elapsed = last.saturating_duration_since(start).as_secs_f64();
-                return Some(elapsed / self.iteration as f64);
-            }
-            None
-        } else {
-            None
+    fn ratio(&self) -> Option<f64> {
+        if self.is_streaming() || self.total_iterations == 0 {
+            return None;
         }
+        Some((self.iteration as f64 / self.total_iterations as f64).clamp(0.0, 1.0))
     }
 
-    fn eta(&self) -> Option<Duration> {
-        let avg = self.average_iteration_secs()?;
-        if self.total_iterations <= self.iteration {
-            return Some(Duration::ZERO);
-        }
-        let remaining = self.total_iterations - self.iteration;
-        Some(Duration::from_secs_f64(avg * remaining as f64))
+    fn elapsed(&self) -> Option<Duration> {
+        let start = self.start_time?;
+        let last = self.last_timestamp?;
+        Some(last.saturating_duration_since(start))
     }
 }
 
@@ -433,7 +419,7 @@ impl TuiApp {
         if self.confirm_exit {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('C') => {
-                    self.interrupter.stop();
+                    self.interrupter.stop(None);
                     self.should_exit = true;
                     self.confirm_exit = false;
                 }
@@ -682,13 +668,25 @@ impl TuiApp {
             return;
         }
 
+        let legend_names: Vec<String> = group
+            .series
+            .iter()
+            .map(|line| {
+                if let Some(formatted) = &line.last_formatted {
+                    format!("{}: {}", line.label, formatted)
+                } else {
+                    line.label.clone()
+                }
+            })
+            .collect();
+
         let datasets: Vec<Dataset> = group
             .series
             .iter()
             .enumerate()
             .map(|(i, line)| {
                 Dataset::default()
-                    .name(line.label.as_str())
+                    .name(legend_names[i].as_str())
                     .marker(symbols::Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(line.color))
@@ -709,7 +707,7 @@ impl TuiApp {
             .x_axis(x_axis)
             .y_axis(y_axis)
             .legend_position(Some(LegendPosition::TopLeft))
-            .hidden_legend_constraints((Constraint::Ratio(1, 5), Constraint::Length(4)));
+            .hidden_legend_constraints((Constraint::Min(0), Constraint::Min(0)));
 
         frame.render_widget(chart, area);
     }
@@ -1048,41 +1046,55 @@ impl TuiApp {
     }
 
     fn draw_progress(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(3, 4), Constraint::Ratio(1, 4)])
-            .split(area);
+        let is_streaming = self.progress.is_streaming();
 
-        let ratio = self.progress.ratio();
-        let label = format!("{:.1}%", ratio * 100.0);
+        let (gauge_area, info_area) = if is_streaming {
+            (None, area)
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Ratio(3, 4), Constraint::Ratio(1, 4)])
+                .split(area);
+            (Some(chunks[0]), chunks[1])
+        };
 
-        let gauge = Gauge::default()
-            .block(
-                Block::default()
-                    .title("Training Progress")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+        if let Some(gauge_area) = gauge_area {
+            let ratio = self.progress.ratio().unwrap_or(0.0);
+            let label = format!("{:.1}%", ratio * 100.0);
+
+            let gauge = Gauge::default()
+                .block(
+                    Block::default()
+                        .title("Training Progress")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                )
+                .gauge_style(
+                    Style::default()
+                        .fg(Color::Green)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .ratio(ratio)
+                .label(label);
+
+            frame.render_widget(gauge, gauge_area);
+        }
+
+        let iterations_text = if is_streaming {
+            format!("Iteration: {}", self.progress.iteration)
+        } else {
+            format!(
+                "{} / {} iterations",
+                self.progress.iteration, self.progress.total_iterations
             )
-            .gauge_style(
-                Style::default()
-                    .fg(Color::Green)
-                    .bg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .ratio(ratio)
-            .label(label);
+        };
 
-        frame.render_widget(gauge, chunks[0]);
-
-        let eta_text = self
+        let elapsed_text = self
             .progress
-            .eta()
+            .elapsed()
             .map(format_duration)
             .unwrap_or_else(|| "--".to_string());
-        let iterations_text = format!(
-            "{} / {} iterations",
-            self.progress.iteration, self.progress.total_iterations
-        );
 
         let mut info_lines = vec![
             Line::from(Span::styled(
@@ -1090,8 +1102,8 @@ impl TuiApp {
                 Style::default().fg(Color::White),
             )),
             Line::from(vec![
-                Span::styled("ETA: ", Style::default().fg(Color::Gray)),
-                Span::styled(eta_text, Style::default().fg(Color::Yellow)),
+                Span::styled("Elapsed: ", Style::default().fg(Color::Gray)),
+                Span::styled(elapsed_text, Style::default().fg(Color::Yellow)),
             ]),
         ];
 
@@ -1102,16 +1114,22 @@ impl TuiApp {
             ]));
         }
 
+        let title = if is_streaming {
+            "Training (Streaming)"
+        } else {
+            "Progress Info"
+        };
+
         let info = Paragraph::new(info_lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray))
-                    .title("Progress Info"),
+                    .title(title),
             )
             .alignment(ratatui::layout::Alignment::Left);
 
-        frame.render_widget(info, chunks[1]);
+        frame.render_widget(info, info_area);
     }
 
     fn draw_exit_confirmation(&self, frame: &mut Frame) {
@@ -1506,21 +1524,21 @@ impl OxiTuiRenderer {
 
     fn forward_metric(&mut self, split: MetricSplit, state: MetricState) {
         match state {
-            MetricState::Generic(entry) => {
+            MetricState::Generic { name, entry } => {
                 self.send(TuiMessage::Metric {
                     split,
-                    name: entry.name.as_ref().clone(),
+                    name,
                     formatted: entry.formatted.clone(),
                     numeric: None,
                     predictions: None,
                 });
             }
-            MetricState::Numeric(entry, numeric) => {
+            MetricState::Numeric { name, entry, value } => {
                 self.send(TuiMessage::Metric {
                     split,
-                    name: entry.name.as_ref().clone(),
+                    name,
                     formatted: entry.formatted.clone(),
-                    numeric: Some(numeric.current()),
+                    numeric: Some(value.current()),
                     predictions: None,
                 });
             }

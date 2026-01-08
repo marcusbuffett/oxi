@@ -294,106 +294,98 @@ where
     B::IntElem: From<i32>,
 {
     fn batch(&self, items: Vec<ChessItem>, device: &Device<B>) -> ChessBatch<B> {
-        // Convert board inputs
-        let board_inputs: Vec<Tensor<B, 3>> = items
-            .iter()
-            .map(|item| {
-                Tensor::<B, 1>::from_data(TensorData::from(item.board_encoded.as_slice()), device)
-                    .reshape([1, 64, FEATURES_PER_TOKEN])
-            })
-            .collect();
+        let batch_size = items.len();
+        let board_elem_count = 64 * FEATURES_PER_TOKEN;
+        let side_info_len = if items.is_empty() {
+            0
+        } else {
+            items[0].side_info.len()
+        };
 
-        // Convert move distributions
-        let move_distributions = items
-            .iter()
-            .map(|item| {
-                Tensor::<B, 1>::from_data(
-                    TensorData::from(item.move_distribution.as_slice()),
-                    device,
-                )
-                .reshape([1, LEGAL_MOVES])
-            })
-            .collect::<Vec<_>>();
+        let mut board_data = vec![0.0f32; batch_size * board_elem_count];
+        let mut move_dist_data = vec![0.0f32; batch_size * LEGAL_MOVES];
+        let mut legal_moves_data = vec![0.0f32; batch_size * LEGAL_MOVES];
+        let mut side_info_data = vec![0i32; batch_size * side_info_len];
+        let mut values_data = vec![0.0f32; batch_size * 3];
+        let mut time_usages_data = vec![0.0f32; batch_size];
+        let mut global_features_data = vec![0.0f32; batch_size * NUM_GLOBALS];
+        let mut fens = Vec::with_capacity(batch_size);
 
-        // Convert legal moves
-        let legal_moves = items
-            .iter()
-            .map(|item| {
-                Tensor::<B, 1>::from_data(TensorData::from(item.legal_moves.as_slice()), device)
-                    .reshape([1, LEGAL_MOVES])
-            })
-            .collect::<Vec<_>>();
+        for (i, item) in items.iter().enumerate() {
+            let board_offset = i * board_elem_count;
+            board_data[board_offset..board_offset + item.board_encoded.len()]
+                .copy_from_slice(&item.board_encoded);
 
-        // let illegal_moves = legal_moves
-        //     .iter()
-        //     .map(|m| {
-        //         Tensor::<B, 1>::from_data(TensorData::from([1.0]), device).reshape([1, 4096]) - m
-        //     })
-        //     .collect::<Vec<_>>();
+            let move_offset = i * LEGAL_MOVES;
+            move_dist_data[move_offset..move_offset + LEGAL_MOVES]
+                .copy_from_slice(&item.move_distribution);
 
-        // Convert side info
-        let side_infos = items
-            .iter()
-            .map(|item| {
-                Tensor::<B, 1, Int>::from_data(TensorData::from(item.side_info.as_slice()), device)
-                    .reshape([1, item.side_info.len()])
-            })
-            .collect::<Vec<_>>();
+            legal_moves_data[move_offset..move_offset + LEGAL_MOVES]
+                .copy_from_slice(&item.legal_moves);
 
-        // Convert values (win/draw/loss probabilities)
-        let values = items
-            .iter()
-            .map(|item| {
-                Tensor::<B, 2>::from_data(
-                    TensorData::from([[
-                        item.outcome == 0.0,
-                        item.outcome == 0.5,
-                        item.outcome == 1.0,
-                    ]]),
-                    device,
-                )
-            })
-            .collect::<Vec<_>>();
+            let side_offset = i * side_info_len;
+            side_info_data[side_offset..side_offset + side_info_len]
+                .copy_from_slice(&item.side_info);
 
-        let time_usages = items
-            .iter()
-            .map(|item| {
-                Tensor::<B, 2>::from_data(
-                    TensorData::from([[item.time_used_for_move as f32
-                        / item.global_features.time_remaining_self as f32]]),
-                    device,
-                )
-            })
-            .collect::<Vec<_>>();
+            let value_offset = i * 3;
+            values_data[value_offset] = if item.outcome == 0.0 { 1.0 } else { 0.0 };
+            values_data[value_offset + 1] = if item.outcome == 0.5 { 1.0 } else { 0.0 };
+            values_data[value_offset + 2] = if item.outcome == 1.0 { 1.0 } else { 0.0 };
 
-        // Collect FENs
-        let fens = items.iter().map(|item| item.fen.clone()).collect();
+            time_usages_data[i] =
+                item.time_used_for_move as f32 / item.global_features.time_remaining_self as f32;
 
-        // Compute global features for each item using centralized conversion
-        let global_features = items
-            .iter()
-            .map(|item| {
-                // Convert GlobalFeatures -> GlobalFeaturesInternal -> Vec<f32>
-                let global_features_internal = item.global_features.to_internal(
-                    item.material_imbalance,
-                    item.material_imbalance_history.clone(),
-                );
-                let features = global_features_internal.to_feature_vector();
-                Tensor::<B, 1, Float>::from_data(TensorData::from(features.as_slice()), device)
-                    .reshape([1, NUM_GLOBALS])
-            })
-            .collect::<Vec<_>>();
+            let global_offset = i * NUM_GLOBALS;
+            let global_features_internal = item.global_features.to_internal(
+                item.material_imbalance,
+                item.material_imbalance_history.clone(),
+            );
+            let features = global_features_internal.to_feature_vector();
+            global_features_data[global_offset..global_offset + NUM_GLOBALS]
+                .copy_from_slice(&features);
+
+            fens.push(item.fen.clone());
+        }
+        let board_input =
+            Tensor::<B, 1>::from_data(TensorData::from(board_data.as_slice()), device).reshape([
+                batch_size,
+                64,
+                FEATURES_PER_TOKEN,
+            ]);
+
+        let move_distributions =
+            Tensor::<B, 1>::from_data(TensorData::from(move_dist_data.as_slice()), device)
+                .reshape([batch_size, LEGAL_MOVES]);
+
+        let legal_moves =
+            Tensor::<B, 1>::from_data(TensorData::from(legal_moves_data.as_slice()), device)
+                .reshape([batch_size, LEGAL_MOVES]);
+
+        let side_info =
+            Tensor::<B, 1, Int>::from_data(TensorData::from(side_info_data.as_slice()), device)
+                .reshape([batch_size, side_info_len]);
+
+        let values = Tensor::<B, 1>::from_data(TensorData::from(values_data.as_slice()), device)
+            .reshape([batch_size, 3]);
+
+        let time_usages =
+            Tensor::<B, 1>::from_data(TensorData::from(time_usages_data.as_slice()), device)
+                .reshape([batch_size, 1]);
+
+        let global_features =
+            Tensor::<B, 1>::from_data(TensorData::from(global_features_data.as_slice()), device)
+                .reshape([batch_size, NUM_GLOBALS]);
 
         ChessBatch {
-            board_input: Tensor::cat(board_inputs, 0),
-            move_distributions: Tensor::cat(move_distributions, 0),
-            time_usages: Tensor::cat(time_usages, 0),
-            legal_moves: Tensor::cat(legal_moves, 0),
-            side_info: Tensor::cat(side_infos, 0),
-            values: Tensor::cat(values, 0),
+            board_input,
+            move_distributions,
+            time_usages,
+            legal_moves,
+            side_info,
+            values,
             fens,
             items,
-            global_features: Tensor::cat(global_features, 0),
+            global_features,
         }
     }
 }

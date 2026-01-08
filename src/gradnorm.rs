@@ -153,6 +153,22 @@ impl GradNormState {
         self.enabled
     }
 
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn reset_weights_to_config(&mut self, config: &Config) {
+        for task_state in &mut self.tasks {
+            let weight = match task_state.task {
+                GradNormTask::Policy => config.policy_loss_weight,
+                GradNormTask::Value => config.value_loss_weight,
+                GradNormTask::TimeUsage => config.time_usage_loss_weight,
+            };
+            task_state.weight = weight;
+            task_state.enabled = weight > 0.0;
+        }
+    }
+
     pub fn weight_for(&self, task: GradNormTask) -> f32 {
         self.tasks[task as usize].weight
     }

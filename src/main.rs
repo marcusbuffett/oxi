@@ -1,11 +1,14 @@
 use anyhow::Result;
-use burn::backend::LibTorch;
-use burn_tch::LibTorchDevice;
 use clap::{Parser, Subcommand};
+use crossterm::{
+    cursor, execute,
+    terminal::{disable_raw_mode, LeaveAlternateScreen},
+};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -15,6 +18,22 @@ use oxi::config::{set_global_config, Config};
 use oxi::constants::TCEC_DOWNLOAD_URL;
 use oxi::custom_training::train_custom;
 use oxi::inference::InferenceEngine;
+
+#[cfg(all(target_os = "linux", feature = "backend-cuda"))]
+use burn_cuda::{Cuda, CudaDevice};
+
+#[cfg(all(target_os = "linux", feature = "backend-candle"))]
+use burn_candle::{Candle, CandleDevice};
+
+#[cfg(all(target_os = "linux", feature = "backend-tch"))]
+use burn::backend::LibTorch;
+#[cfg(all(target_os = "linux", feature = "backend-tch"))]
+use burn_tch::LibTorchDevice;
+
+#[cfg(target_os = "macos")]
+use burn::backend::LibTorch;
+#[cfg(target_os = "macos")]
+use burn_tch::LibTorchDevice;
 
 #[derive(Parser, Debug)]
 #[command(name = "oxi")]
@@ -60,7 +79,7 @@ enum Commands {
     /// Download all Lichess PGN files since 2022
     DownloadAll {
         /// Output directory for downloaded files
-        #[arg(long, default_value = "./data/pgn")]
+        #[arg(long, default_value = "/lambda/nfs/chessbook")]
         output_dir: PathBuf,
     },
 
@@ -72,9 +91,9 @@ enum Commands {
 
     /// Download TCEC (Top Chess Engine Championship) games for pretraining
     DownloadTcec {
-        /// Output directory for downloaded files
-        #[arg(long, default_value = "./data/tcec")]
-        output_dir: PathBuf,
+        /// Data directory (TCEC files will be downloaded to <data-path>/tcec)
+        #[arg(long, default_value = "/lambda/nfs/chessbook")]
+        data_path: PathBuf,
     },
 }
 
@@ -155,52 +174,67 @@ struct EvaluateConfig {
     device: String,
 }
 
-
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging to train.log
-    let _guard = oxi::custom_training::init_train_logging();
+    install_panic_hook();
 
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Train(config) => {
+            let _guard = oxi::custom_training::init_train_logging(config.log_dir.as_deref());
             tracing::info!("Starting training with config: {:?}", config);
             set_global_config(config.clone()).unwrap();
 
-            // Validate that data_path is provided
-            let _data_path = config
-                .data_path
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("--data-path is required for training"))?;
-
-            // Use LibTorch backend on all platforms (MPS on macOS, CUDA elsewhere)
-            type Backend = Autodiff<LibTorch<f32>>;
+            use burn::backend::Autodiff;
 
             #[cfg(target_os = "macos")]
-            let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
-                .num_devices)
-                .map(|_| LibTorchDevice::Mps)
-                .collect();
+            {
+                type Backend = Autodiff<LibTorch<f32>>;
+                let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
+                    .num_devices)
+                    .map(|_| LibTorchDevice::Mps)
+                    .collect();
+                train_custom::<Backend>(config.clone(), devices)?;
+            }
 
-            #[cfg(not(target_os = "macos"))]
-            let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-                (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
+            #[cfg(all(target_os = "linux", feature = "backend-cuda"))]
+            {
+                type Backend = Autodiff<Cuda>;
+                let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
+                    .num_devices)
+                    .map(|i| CudaDevice::new(i))
+                    .collect();
+                println!("Using burn-cuda backend with fusion + autotune");
+                train_custom::<Backend>(config.clone(), devices)?;
+            }
 
-            // Run training with unified config
-            use burn::backend::Autodiff;
-            train_custom::<Backend>(config.clone(), devices)?;
+            #[cfg(all(target_os = "linux", feature = "backend-candle"))]
+            {
+                type Backend = Autodiff<Candle<f32, i64>>;
+                let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                    vec![CandleDevice::Cpu; config.num_devices];
+                println!("Using burn-candle backend (CPU for now - CUDA device construction TBD)");
+                train_custom::<Backend>(config.clone(), devices)?;
+            }
+
+            #[cfg(all(target_os = "linux", feature = "backend-tch"))]
+            {
+                type Backend = Autodiff<LibTorch<f32>>;
+                let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                    (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
+                println!("Using burn-tch backend (LibTorch) - WARNING: No fusion support");
+                train_custom::<Backend>(config.clone(), devices)?;
+            }
+
             Ok(())
         }
 
         Commands::Inference(config) => {
             tracing::info!("Running inference with config: {:?}", config);
 
-            // Collect FEN positions
             let mut positions = config.fen.clone();
 
-            // Load from file if provided
             if let Some(fen_file) = &config.fen_file {
                 let file = File::open(fen_file)?;
                 let reader = BufReader::new(file);
@@ -213,27 +247,25 @@ async fn main() -> Result<()> {
                 anyhow::bail!("No positions provided. Use --fen or --fen-file");
             }
 
-            #[cfg(target_os = "macos")]
-            let device = burn_tch::LibTorchDevice::Mps;
-            #[cfg(not(target_os = "macos"))]
-            let device = burn_tch::LibTorchDevice::Cuda(0);
+            #[cfg(any(target_os = "macos", feature = "backend-tch"))]
+            {
+                #[cfg(target_os = "macos")]
+                let device = LibTorchDevice::Mps;
+                #[cfg(all(target_os = "linux", feature = "backend-tch"))]
+                let device = LibTorchDevice::Cuda(0);
 
-            // Load model and create engine
-            // TODO: We need to store model config with checkpoint to know num_blocks/channels
-            // For now, use defaults
-            let model_config = Config::default();
-            #[cfg(target_os = "macos")]
-            let _engine = InferenceEngine::<LibTorch<f32>>::from_checkpoint(
-                &config.model_path,
-                model_config,
-                device,
-            )?;
-            #[cfg(not(target_os = "macos"))]
-            let _engine = InferenceEngine::<LibTorch<f32>>::from_checkpoint(
-                &config.model_path,
-                model_config,
-                device,
-            )?;
+                let model_config = Config::default();
+                let _engine = InferenceEngine::<LibTorch<f32>>::from_checkpoint(
+                    &config.model_path,
+                    model_config,
+                    device,
+                )?;
+            }
+
+            #[cfg(all(target_os = "linux", not(feature = "backend-tch")))]
+            {
+                anyhow::bail!("Inference currently only supported with backend-tch feature");
+            }
 
             // Run inference on positions
             // for position in &positions {
@@ -374,9 +406,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::DownloadTcec { output_dir } => {
-            tracing::info!("Downloading TCEC games to {:?}", output_dir);
-            download_tcec_games(&output_dir).await?;
+        Commands::DownloadTcec { data_path } => {
+            let tcec_dir = data_path.join("tcec");
+            tracing::info!("Downloading TCEC games to {:?}", tcec_dir);
+            download_tcec_games(&tcec_dir).await?;
             Ok(())
         }
     }
@@ -418,7 +451,6 @@ async fn download_all_lichess_files(output_dir: &PathBuf) -> Result<()> {
                 return Ok::<(), anyhow::Error>(());
             }
 
-            println!("Downloading {file_name}");
             let client = reqwest::Client::new();
             let response = client.get(&url).send().await?;
 
@@ -430,16 +462,44 @@ async fn download_all_lichess_files(output_dir: &PathBuf) -> Result<()> {
                 );
             }
 
+            let total_size = response.content_length().unwrap_or(0);
+            println!(
+                "Downloading {file_name} ({:.1} GB)",
+                total_size as f64 / 1_073_741_824.0
+            );
+
             let mut file = tokio::fs::File::create(&path).await?;
             let mut stream = response.bytes_stream();
+            let mut downloaded: u64 = 0;
+            let mut last_report: u64 = 0;
 
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result?;
                 file.write_all(&chunk).await?;
+                downloaded += chunk.len() as u64;
+
+                // Report progress every 100MB
+                if downloaded - last_report >= 100 * 1_048_576 {
+                    last_report = downloaded;
+                    if total_size > 0 {
+                        let progress = (downloaded as f64 / total_size as f64 * 100.0).min(100.0);
+                        println!(
+                            "  {file_name}: {:.1}% ({:.0} MB / {:.0} MB)",
+                            progress,
+                            downloaded as f64 / 1_048_576.0,
+                            total_size as f64 / 1_048_576.0
+                        );
+                    } else {
+                        println!(
+                            "  {file_name}: {:.0} MB downloaded",
+                            downloaded as f64 / 1_048_576.0
+                        );
+                    }
+                }
             }
 
             file.flush().await?;
-            println!("Downloaded {file_name}");
+            println!("Completed {file_name}");
             Ok(())
         })
     });
@@ -553,4 +613,39 @@ async fn download_tcec_games(output_dir: &PathBuf) -> Result<()> {
     println!("\nTCEC games ready at: {}", output_dir.display());
     println!("Use --pretrain-samples N with train command to pretrain on these games");
     Ok(())
+}
+
+fn install_panic_hook() {
+    let original_hook = std::panic::take_hook();
+
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, cursor::Show);
+
+        let panic_message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic payload".to_string()
+        };
+
+        let location = panic_info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+
+        let log_message = format!("PANIC at {}: {}", location, panic_message);
+
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("train.log")
+        {
+            let _ = writeln!(file, "{}", log_message);
+            let _ = file.flush();
+        }
+
+        original_hook(panic_info);
+    }));
 }

@@ -48,8 +48,9 @@ impl NormDebugScope {
         }
 
         let count = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        let interval = config.norm_log_interval().max(1);
-        let active = count % interval == 0;
+        let active = config
+            .full_metrics_interval()
+            .map_or(false, |interval| count % interval == 0);
 
         let previous = DEBUG_ACTIVE.with(|flag| {
             let prev = flag.get();

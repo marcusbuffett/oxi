@@ -1,4 +1,4 @@
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
+use burn::train::metric::{Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 
 use crate::gradnorm::{GradNormTask, GradNormTaskStatus};
 
@@ -27,7 +27,7 @@ impl GradNormStatusMetric {
 impl Metric for GradNormStatusMetric {
     type Input = GradNormStatusInput;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         self.last_tasks = input.tasks.clone();
         let formatted = if self.last_tasks.is_empty() {
             "GradNorm disabled".to_string()
@@ -39,11 +39,7 @@ impl Metric for GradNormStatusMetric {
                 .join(" | ")
         };
 
-        MetricEntry::new(
-            "GradNorm Status".to_string().into(),
-            formatted.clone(),
-            formatted,
-        )
+        SerializedEntry::new(formatted.clone(), formatted)
     }
 
     fn clear(&mut self) {
@@ -57,6 +53,10 @@ impl Metric for GradNormStatusMetric {
 
 impl Numeric for GradNormStatusMetric {
     fn value(&self) -> NumericEntry {
+        NumericEntry::Value(0.0)
+    }
+
+    fn running_value(&self) -> NumericEntry {
         NumericEntry::Value(0.0)
     }
 }

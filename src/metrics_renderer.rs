@@ -1,5 +1,5 @@
 use burn::data::dataloader::Progress;
-use burn_train::metric::{MetricEntry, NumericEntry};
+use burn_train::metric::{NumericEntry, SerializedEntry};
 
 /// Alias representing the name of an evaluation run.
 pub type EvaluationName = String;
@@ -39,8 +39,15 @@ pub struct PredictionMetric {
 /// State update communicated to metric renderers.
 #[allow(clippy::large_enum_variant)]
 pub enum MetricState {
-    Generic(MetricEntry),
-    Numeric(MetricEntry, NumericEntry),
+    Generic {
+        name: String,
+        entry: SerializedEntry,
+    },
+    Numeric {
+        name: String,
+        entry: SerializedEntry,
+        value: NumericEntry,
+    },
     Predictions(PredictionMetric),
 }
 

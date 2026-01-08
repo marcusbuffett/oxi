@@ -612,6 +612,11 @@ pub fn process_pgn_file_with_dedup(
                 }
             }
             Err(e) => {
+                let error_str = format!("{:?}", e);
+                if error_str.contains("incomplete frame") || error_str.contains("UnexpectedEof") {
+                    tracing::warn!("Fatal decompression error, file may be truncated: {:?}", e);
+                    break;
+                }
                 tracing::warn!("Error reading game: {:?}", e);
                 continue;
             }
@@ -957,6 +962,15 @@ fn process_single_file_for_worker(
                 }
             }
             Err(e) => {
+                let error_str = format!("{:?}", e);
+                if error_str.contains("incomplete frame") || error_str.contains("UnexpectedEof") {
+                    tracing::warn!(
+                        "Fatal decompression error in {:?}, file may be truncated: {:?}",
+                        path,
+                        e
+                    );
+                    break;
+                }
                 tracing::warn!("Error reading game from {:?}: {:?}", path, e);
                 continue;
             }
@@ -997,8 +1011,14 @@ pub fn process_pgn_directory_iter(
 
     if pgn_files.is_empty() {
         tracing::info!("No PGN files found in directory: {:?}", dir);
+        println!("Warning: No PGN files found in directory: {:?}", dir);
     } else {
         tracing::info!("Found {} PGN files to process", pgn_files.len());
+        println!(
+            "Found {} PGN files to process in {:?}",
+            pgn_files.len(),
+            dir
+        );
     }
 
     Ok(PgnDirectoryIterator {
@@ -1045,6 +1065,20 @@ impl Iterator for PgnDirectoryIterator {
                         self.current_reader = None;
                     }
                     Err(e) => {
+                        // Check if this is a fatal error (like truncated zstd file)
+                        // that means we should skip to the next file
+                        let error_str = format!("{:?}", e);
+                        if error_str.contains("incomplete frame")
+                            || error_str.contains("UnexpectedEof")
+                        {
+                            tracing::warn!(
+                                "Fatal decompression error in file {:?}, skipping to next file: {:?}",
+                                self.files.get(self.current_file_index.saturating_sub(1)),
+                                e
+                            );
+                            self.current_reader = None;
+                            continue;
+                        }
                         tracing::warn!("Error reading game: {:?}", e);
                         continue;
                     }

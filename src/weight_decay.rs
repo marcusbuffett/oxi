@@ -210,10 +210,6 @@ impl<B: AutodiffBackend> WeightDecayClassifier<B> {
             WeightDecayGroup::NoDecay
         } else if path_contains(path, "global_embed") {
             WeightDecayGroup::NoDecay
-        } else if path_contains(path, "a_qk") || path_contains(path, "a_v") {
-            WeightDecayGroup::NoDecay
-        } else if path_contains(path, "scale_qk") || path_contains(path, "scale_v") {
-            WeightDecayGroup::NoDecay
         } else if path_contains(path, "gate_logits") {
             WeightDecayGroup::NoDecay
         } else if path_contains(path, "policy_uncertainty")
@@ -226,16 +222,9 @@ impl<B: AutodiffBackend> WeightDecayClassifier<B> {
             WeightDecayGroup::Decay
         };
 
-        // Determine learning rate group
-        let lr = if path_contains(path, "rel_scale_qk") || path_contains(path, "rel_scale_v") {
-            // Scale parameters get sqrt(embed_dim) multiplier (same as embeddings)
-            LearningRateGroup::HighLR
-        } else if (path_contains(path, "token_embed") && path_contains(path, "weight"))
+        let lr = if (path_contains(path, "token_embed") && path_contains(path, "weight"))
             || (path_contains(path, "global_embed") && path_contains(path, "weight"))
-            || (path_contains(path, "a_qk") && path_contains(path, "weight"))
-            || (path_contains(path, "a_v") && path_contains(path, "weight"))
         {
-            // Embeddings get sqrt(embed_dim) multiplier
             LearningRateGroup::HighLR
         } else {
             LearningRateGroup::Normal

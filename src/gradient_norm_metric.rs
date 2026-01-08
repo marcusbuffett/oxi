@@ -6,7 +6,7 @@ use burn::module::{AutodiffModule, ModuleVisitor, Param, ParamId};
 use burn::optim::GradientsParams;
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
+use burn::train::metric::{Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 
 use crate::config::{get_global_config, Config};
 
@@ -62,16 +62,26 @@ pub struct HeadGradientNorm {
 }
 
 /// Compute gradient norm statistics (total norm, per-layer, per-head).
+/// When `need_breakdown` is false, skips per-layer and per-head tracking for faster execution.
 pub fn compute_gradient_norm<B: AutodiffBackend, M: AutodiffModule<B>>(
     grads: &GradientsParams,
     model: &M,
 ) -> GradientNormBreakdown {
-    let mut visitor = GradientNormVisitor::new(grads);
+    compute_gradient_norm_with_breakdown(grads, model, true)
+}
+
+/// Compute gradient norm with optional breakdown.
+/// When `need_breakdown` is false, only computes total norm (skips expensive head slicing).
+pub fn compute_gradient_norm_with_breakdown<B: AutodiffBackend, M: AutodiffModule<B>>(
+    grads: &GradientsParams,
+    model: &M,
+    need_breakdown: bool,
+) -> GradientNormBreakdown {
+    let mut visitor = GradientNormVisitor::new(grads, need_breakdown);
     model.visit(&mut visitor);
     visitor.into_breakdown()
 }
 
-/// Visitor for computing gradient norm
 struct GradientNormVisitor<'a, B: AutodiffBackend> {
     grads: &'a GradientsParams,
     total_norm_squared: f64,
@@ -79,11 +89,12 @@ struct GradientNormVisitor<'a, B: AutodiffBackend> {
     per_head_norms: HashMap<HeadKey, f64>,
     config: &'static Config,
     path_stack: Vec<String>,
+    need_breakdown: bool,
     _backend: PhantomData<B>,
 }
 
 impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
-    fn new(grads: &'a GradientsParams) -> Self {
+    fn new(grads: &'a GradientsParams, need_breakdown: bool) -> Self {
         Self {
             grads,
             total_norm_squared: 0.0,
@@ -91,6 +102,7 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
             per_head_norms: HashMap::new(),
             config: get_global_config(),
             path_stack: Vec::new(),
+            need_breakdown,
             _backend: PhantomData,
         }
     }
@@ -135,10 +147,11 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
                 .elem::<f32>() as f64;
             self.total_norm_squared += norm_sq;
 
-            let layer_key = self.layer_key(path);
-            *self.per_layer_norms.entry(layer_key.clone()).or_default() += norm_sq;
-
-            self.accumulate_head_norm::<D>(path, &layer_key, &grad_tensor);
+            if self.need_breakdown {
+                let layer_key = self.layer_key(path);
+                *self.per_layer_norms.entry(layer_key.clone()).or_default() += norm_sq;
+                self.accumulate_head_norm::<D>(path, &layer_key, &grad_tensor);
+            }
         }
     }
 
@@ -154,6 +167,10 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
             .find(|segment| !segment.is_empty())
             .cloned()
             .unwrap_or_else(|| "root".to_string())
+    }
+
+    fn is_fused_qkv(&self, path: &[String]) -> bool {
+        path.iter().any(|p| p == "qkv_proj")
     }
 
     fn head_component(&self, path: &[String]) -> Option<HeadComponent> {
@@ -174,19 +191,21 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
         layer_key: &str,
         grad_tensor: &Tensor<B::InnerBackend, D>,
     ) {
-        let Some(component) = self.head_component(path) else {
-            return;
-        };
-
         if D != 1 && D != 2 {
             return;
         }
 
-        let head_dim = self.config.head_dim();
-        let head_count = match component {
-            HeadComponent::Query => self.config.num_heads(),
-            HeadComponent::Key | HeadComponent::Value => self.config.num_heads(),
+        if self.is_fused_qkv(path) {
+            self.accumulate_fused_qkv_head_norm::<D>(layer_key, grad_tensor);
+            return;
+        }
+
+        let Some(component) = self.head_component(path) else {
+            return;
         };
+
+        let head_dim = self.config.head_dim();
+        let head_count = self.config.num_heads();
 
         let axis = if D == 1 { 0 } else { 1 };
         let axis_size = grad_tensor.dims()[axis];
@@ -206,6 +225,39 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
                 head_index,
             };
             *self.per_head_norms.entry(key).or_default() += norm_sq;
+        }
+    }
+
+    fn accumulate_fused_qkv_head_norm<const D: usize>(
+        &mut self,
+        layer_key: &str,
+        grad_tensor: &Tensor<B::InnerBackend, D>,
+    ) {
+        let embed_dim = self.config.embed_dim();
+        let head_dim = self.config.head_dim();
+        let head_count = self.config.num_heads();
+
+        let axis = if D == 1 { 0 } else { 1 };
+
+        let components = [
+            (HeadComponent::Query, 0),
+            (HeadComponent::Key, embed_dim),
+            (HeadComponent::Value, 2 * embed_dim),
+        ];
+
+        for (component, component_offset) in components {
+            for head_index in 0..head_count {
+                let start = component_offset + head_index * head_dim;
+                let slice = grad_tensor.clone().narrow(axis, start, head_dim);
+                let norm_sq = slice.powi_scalar(2).sum().into_scalar().elem::<f32>() as f64;
+
+                let key = HeadKey {
+                    layer: layer_key.to_string(),
+                    component,
+                    head_index,
+                };
+                *self.per_head_norms.entry(key).or_default() += norm_sq;
+            }
         }
     }
 }
@@ -267,7 +319,7 @@ impl<B: Backend> GradientNormMetric<B> {
 impl<B: Backend> Metric for GradientNormMetric<B> {
     type Input = GradientNormInput;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         self.current_value = input.norm;
 
         let formatted = if input.norm < 0.01 {
@@ -276,11 +328,7 @@ impl<B: Backend> Metric for GradientNormMetric<B> {
             format!("{:.6}", input.norm)
         };
 
-        MetricEntry::new(
-            "Gradient Norm".to_string().into(),
-            formatted.clone(),
-            formatted,
-        )
+        SerializedEntry::new(formatted.clone(), formatted)
     }
 
     fn clear(&mut self) {
@@ -295,6 +343,10 @@ impl<B: Backend> Metric for GradientNormMetric<B> {
 impl<B: Backend> Numeric for GradientNormMetric<B> {
     fn value(&self) -> NumericEntry {
         // Cap at 10 for display purposes
+        NumericEntry::Value(self.current_value.min(10.0))
+    }
+
+    fn running_value(&self) -> NumericEntry {
         NumericEntry::Value(self.current_value.min(10.0))
     }
 }

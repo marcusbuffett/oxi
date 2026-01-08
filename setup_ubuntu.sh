@@ -47,7 +47,7 @@ echo "==> Installing PyTorch with CUDA 12.8 wheels"
 UV_PYTHON="$REPO_ROOT/.venv/bin/python"
 uv pip install --python "$UV_PYTHON" --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-LIBTORCH_PATH="$("$UV_PYTHON" -c 'import torch, pathlib; print(pathlib.Path(torch.utils.cmake_prefix_path).resolve())')"
+LIBTORCH_PATH="$("$UV_PYTHON" -c 'import torch; print(torch.__path__[0])')"
 if [ ! -d "$LIBTORCH_PATH" ]; then
   echo "ERROR: Expected libtorch directory at $LIBTORCH_PATH but it was not found."
   exit 1

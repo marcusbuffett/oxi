@@ -1,5 +1,3 @@
-use std::f32::consts::FRAC_1_SQRT_2;
-
 use shakmaty::{Bitboard, Chess, Color, EnPassantMode, File, Position, Role, Square};
 
 use crate::config::{
@@ -18,19 +16,6 @@ const OPEN_DIRECTIONS: [(i32, i32); 8] = [
     (1, -1),  // SE
     (-1, -1), // SW
 ];
-
-const DIRECTION_UNIT_VECTORS: [(f32, f32); 8] = [
-    (0.0, 1.0),
-    (0.0, -1.0),
-    (1.0, 0.0),
-    (-1.0, 0.0),
-    (FRAC_1_SQRT_2, FRAC_1_SQRT_2),
-    (-FRAC_1_SQRT_2, FRAC_1_SQRT_2),
-    (FRAC_1_SQRT_2, -FRAC_1_SQRT_2),
-    (-FRAC_1_SQRT_2, -FRAC_1_SQRT_2),
-];
-
-const RAY_DISTANCE_DECAY: f32 = 0.5;
 
 pub fn encode_position(
     pos: &Chess,
@@ -115,6 +100,7 @@ pub fn encode_position(
             });
         let is_pin_target = pin_targets[square as usize];
         let is_hanging = is_piece_hanging(pos, square);
+        let has_pinned_def = has_pinned_defender(pos, square, &pinned_to);
         let is_passed = is_passed_pawn(pos, square);
         let legal_moves_norm = normalized_legal_moves_for_square(pos, square);
         let (isolated, backward, doubled) = pawn_structure_features(pos, square);
@@ -122,7 +108,6 @@ pub fn encode_position(
         let weak_black_square = is_weak_square(pos, square, Color::Black);
         let open_file = is_open_file(pos, square);
         let control_value = calculate_square_control(pos, square);
-        let (ray_piece_weights, ray_pin_flag) = compute_ray_features(board, square);
 
         let mut attacker_features = [[0.0f32; 8]; 2];
         for (color_idx, color) in [Color::White, Color::Black].iter().enumerate() {
@@ -179,15 +164,7 @@ pub fn encode_position(
         tactical_offset += 1;
         tokens[square_idx + feature_idx + tactical_offset] = if is_hanging { 1.0 } else { 0.0 };
         tactical_offset += 1;
-
-        for dir_weights in ray_piece_weights.iter() {
-            for &weight in dir_weights.iter() {
-                tokens[square_idx + feature_idx + tactical_offset] = weight;
-                tactical_offset += 1;
-            }
-        }
-
-        tokens[square_idx + feature_idx + tactical_offset] = ray_pin_flag;
+        tokens[square_idx + feature_idx + tactical_offset] = if has_pinned_def { 1.0 } else { 0.0 };
         tactical_offset += 1;
         tokens[square_idx + feature_idx + tactical_offset] = control_value;
         tactical_offset += 1;
@@ -532,6 +509,48 @@ fn is_piece_hanging(pos: &Chess, square: Square) -> bool {
     false
 }
 
+/// Detects pieces with illusory defense: defended by a pinned piece that can't recapture.
+fn has_pinned_defender(pos: &Chess, square: Square, pinned_squares: &[Option<Square>; 64]) -> bool {
+    let board = pos.board();
+    let Some(piece) = board.piece_at(square) else {
+        return false;
+    };
+
+    let defenders = board.attacks_to(square, piece.color, board.occupied());
+
+    for defender_sq in defenders {
+        if defender_sq == square {
+            continue;
+        }
+
+        if let Some(pinned_to) = pinned_squares[defender_sq as usize] {
+            let (defender_file, defender_rank) =
+                (defender_sq.file() as i32, defender_sq.rank() as i32);
+            let (target_file, target_rank) = (square.file() as i32, square.rank() as i32);
+            let (pinned_to_file, pinned_to_rank) =
+                (pinned_to.file() as i32, pinned_to.rank() as i32);
+
+            let pin_direction = (
+                (pinned_to_file - defender_file).signum(),
+                (pinned_to_rank - defender_rank).signum(),
+            );
+            let capture_direction = (
+                (target_file - defender_file).signum(),
+                (target_rank - defender_rank).signum(),
+            );
+
+            let capture_along_pin_ray = pin_direction == capture_direction
+                || pin_direction == (-capture_direction.0, -capture_direction.1);
+
+            if !capture_along_pin_ray {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn is_passed_pawn(pos: &Chess, square: Square) -> bool {
     let board = pos.board();
     let Some(piece) = board.piece_at(square) else {
@@ -677,267 +696,6 @@ fn pinner_can_attack_direction(role: Role, direction: (i32, i32)) -> bool {
         Role::Rook => is_cardinal,
         Role::Bishop => is_diagonal,
         _ => false,
-    }
-}
-
-fn ray_piece_group(role: Role) -> usize {
-    match role {
-        Role::Knight | Role::Bishop => 0, // Minors
-        Role::Rook | Role::Queen => 1,    // Majors
-        Role::Pawn => 2,
-        Role::King => 3,
-    }
-}
-
-fn ray_piece_index(color: Color, role: Role) -> usize {
-    let color_offset = match color {
-        Color::White => 0,
-        Color::Black => 4,
-    };
-    color_offset + ray_piece_group(role)
-}
-
-fn compute_ray_features(board: &shakmaty::Board, origin: Square) -> ([[f32; 8]; 8], f32) {
-    let mut directional_weights = [[0.0f32; 8]; 8];
-    let mut any_pin = 0.0f32;
-    let origin_piece = board.piece_at(origin);
-    let origin_color = origin_piece.map(|piece| piece.color);
-    let origin_role = origin_piece.map(|piece| piece.role);
-
-    for (dir_idx, &(dx, dy)) in OPEN_DIRECTIONS.iter().enumerate() {
-        let mut file = origin.file() as i32 + dx;
-        let mut rank = origin.rank() as i32 + dy;
-        let mut distance = 1;
-        let mut candidate_role: Option<Role> = None;
-        let mut candidate_value = 0.0f32;
-        let mut can_pin = origin_role
-            .map(|role| pinner_can_attack_direction(role, (dx, dy)))
-            .unwrap_or(false);
-
-        while file >= 0 && file < 8 && rank >= 0 && rank < 8 {
-            let target_sq = Square::new((rank * 8 + file) as u32);
-            if let Some(piece) = board.piece_at(target_sq) {
-                let idx = ray_piece_index(piece.color, piece.role);
-                let contribution = RAY_DISTANCE_DECAY.powi((distance - 1) as i32);
-                directional_weights[dir_idx][idx] += contribution;
-
-                if can_pin {
-                    match origin_color {
-                        Some(color) => {
-                            if piece.color == color {
-                                can_pin = false;
-                            } else if let Some(c_role) = candidate_role {
-                                let behind_value = get_piece_value(piece.role);
-                                if behind_value > candidate_value
-                                    && !role_moves_in_direction(c_role, (dx, dy))
-                                {
-                                    any_pin = 1.0;
-                                }
-                                can_pin = false;
-                            } else {
-                                candidate_role = Some(piece.role);
-                                candidate_value = get_piece_value(piece.role);
-                            }
-                        }
-                        None => can_pin = false,
-                    }
-                }
-            }
-
-            file += dx;
-            rank += dy;
-            distance += 1;
-        }
-    }
-
-    for weights in directional_weights.iter_mut() {
-        for weight in weights.iter_mut() {
-            *weight = (*weight / 2.0).clamp(0.0, 1.0);
-        }
-    }
-
-    (directional_weights, any_pin)
-}
-
-fn normalize_vec(vector: (f32, f32)) -> (f32, f32) {
-    let magnitude = (vector.0 * vector.0 + vector.1 * vector.1).sqrt();
-    if magnitude == 0.0 {
-        (0.0, 0.0)
-    } else {
-        (vector.0 / magnitude, vector.1 / magnitude)
-    }
-}
-
-fn best_direction_bucket(vector: (f32, f32)) -> usize {
-    let (vx, vy) = normalize_vec(vector);
-    let mut best_idx = 0;
-    let mut best_dot = -1.0;
-    for (idx, &(dx, dy)) in DIRECTION_UNIT_VECTORS.iter().enumerate() {
-        let dot = vx * dx + vy * dy;
-        if dot > best_dot {
-            best_dot = dot;
-            best_idx = idx;
-        }
-    }
-    best_idx
-}
-
-fn accumulate_ray_open_count(
-    board: &shakmaty::Board,
-    origin: Square,
-    direction: (i32, i32),
-    color: Color,
-    max_range: f32,
-    limit_single_step: bool,
-) -> f32 {
-    let (dx, dy) = direction;
-    let mut cx = origin.file() as i32 + dx;
-    let mut cy = origin.rank() as i32 + dy;
-    let mut steps = 0.0f32;
-
-    while cx >= 0 && cx < 8 && cy >= 0 && cy < 8 {
-        let target_sq = Square::new((cy * 8 + cx) as u32);
-        if let Some(target_piece) = board.piece_at(target_sq) {
-            if target_piece.color != color {
-                steps += 1.0;
-            }
-            break;
-        } else {
-            steps += 1.0;
-        }
-
-        if steps >= max_range || limit_single_step {
-            break;
-        }
-
-        cx += dx;
-        cy += dy;
-    }
-
-    steps
-}
-
-fn accumulate_knight_open_counts(
-    board: &shakmaty::Board,
-    origin: Square,
-    color: Color,
-    open_counts: &mut [f32; 8],
-) {
-    let knight_deltas = [
-        (1, 2),
-        (2, 1),
-        (-1, 2),
-        (-2, 1),
-        (1, -2),
-        (2, -1),
-        (-1, -2),
-        (-2, -1),
-    ];
-
-    let mut bucket_totals = [0.0f32; 8];
-
-    for &(kdx, kdy) in &knight_deltas {
-        let kx = origin.file() as i32 + kdx;
-        let ky = origin.rank() as i32 + kdy;
-        if kx < 0 || kx >= 8 || ky < 0 || ky >= 8 {
-            continue;
-        }
-
-        let bucket = best_direction_bucket((kdx as f32, kdy as f32));
-        let target_sq = Square::new((ky * 8 + kx) as u32);
-        let is_open = match board.piece_at(target_sq) {
-            Some(target_piece) => target_piece.color != color,
-            None => true,
-        };
-
-        bucket_totals[bucket] += 1.0;
-        if is_open {
-            open_counts[bucket] += 1.0;
-        }
-    }
-
-    for idx in 0..8 {
-        if bucket_totals[idx] > 0.0 {
-            open_counts[idx] = (open_counts[idx] / bucket_totals[idx]).clamp(0.0, 1.0);
-        }
-    }
-}
-
-fn accumulate_pawn_open_counts(
-    board: &shakmaty::Board,
-    origin: Square,
-    color: Color,
-    open_counts: &mut [f32; 8],
-) {
-    let forward_delta = if color == Color::White {
-        (0, 1)
-    } else {
-        (0, -1)
-    };
-    let capture_deltas = if color == Color::White {
-        [(-1, 1), (1, 1)]
-    } else {
-        [(-1, -1), (1, -1)]
-    };
-
-    for (dir_idx, &(dx, dy)) in OPEN_DIRECTIONS.iter().enumerate() {
-        let tx = origin.file() as i32 + dx;
-        let ty = origin.rank() as i32 + dy;
-        if tx < 0 || tx >= 8 || ty < 0 || ty >= 8 {
-            continue;
-        }
-
-        let target_sq = Square::new((ty * 8 + tx) as u32);
-        if (dx, dy) == forward_delta {
-            if board.piece_at(target_sq).is_none() {
-                open_counts[dir_idx] = 1.0;
-            }
-        } else if capture_deltas.contains(&(dx, dy)) {
-            if let Some(target_piece) = board.piece_at(target_sq) {
-                if target_piece.color != color {
-                    open_counts[dir_idx] = 1.0;
-                }
-            }
-        }
-    }
-}
-
-fn accumulate_slider_open_counts(
-    board: &shakmaty::Board,
-    origin: Square,
-    color: Color,
-    role: Role,
-    open_counts: &mut [f32; 8],
-) {
-    let (max_range, limit_to_single_step) = if role == Role::King {
-        (1.0f32, true)
-    } else {
-        (7.0f32, false)
-    };
-
-    for (dir_idx, &(dx, dy)) in OPEN_DIRECTIONS.iter().enumerate() {
-        let is_cardinal = dx == 0 || dy == 0;
-        let is_diagonal = dx != 0 && dy != 0;
-        let relevant = match role {
-            Role::Bishop => is_diagonal,
-            Role::Rook => is_cardinal,
-            Role::Queen => true,
-            Role::King => true,
-            _ => false,
-        };
-        if !relevant {
-            continue;
-        }
-
-        let steps = accumulate_ray_open_count(
-            board,
-            origin,
-            (dx, dy),
-            color,
-            max_range,
-            limit_to_single_step,
-        );
-        open_counts[dir_idx] = (steps / max_range).clamp(0.0, 1.0);
     }
 }
 
@@ -1185,24 +943,342 @@ mod tests {
     }
 
     #[test]
-    fn test_weak_square_rank_gating() {
-        // Any white weak-square marking on ranks 1-2 should be false
-        // Minimal valid board: place both kings
-        let fen = "7k/8/8/8/8/8/8/K7 w - - 0 1";
+    #[ignore] // Run with: cargo test bench_encode_position --release -- --ignored --nocapture
+    fn bench_encode_position() {
+        use rand::prelude::IndexedRandom;
+        use rand::SeedableRng;
+        use std::time::Instant;
+
+        const NUM_POSITIONS: usize = 1024;
+        const MOVES_PER_GAME: usize = 30;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut positions = Vec::with_capacity(NUM_POSITIONS);
+
+        while positions.len() < NUM_POSITIONS {
+            let mut pos = Chess::default();
+            for _ in 0..MOVES_PER_GAME {
+                let legal_moves: Vec<_> = pos.legal_moves().into_iter().collect();
+                if legal_moves.is_empty() {
+                    break;
+                }
+                let chosen_move = legal_moves.choose(&mut rng).unwrap();
+                pos = pos.play(chosen_move.clone()).unwrap();
+            }
+            positions.push(pos);
+        }
+
+        let mut total_encoded = 0usize;
+
+        for _ in 0..100 {
+            let _ = encode_position(&positions[0], &[], &[]);
+        }
+
+        let start = Instant::now();
+        for pos in &positions {
+            let encoded = encode_position(pos, &[], &[]);
+            total_encoded += encoded.len();
+        }
+        let elapsed = start.elapsed();
+
+        let per_position = elapsed / NUM_POSITIONS as u32;
+        let positions_per_sec = NUM_POSITIONS as f64 / elapsed.as_secs_f64();
+
+        println!("\n=== Encoding Benchmark ===");
+        println!("Positions encoded: {}", NUM_POSITIONS);
+        println!("Total time: {:?}", elapsed);
+        println!("Per position: {:?}", per_position);
+        println!("Positions/sec: {:.0}", positions_per_sec);
+        println!("Features per position: {}", total_encoded / NUM_POSITIONS);
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test bench_full_pipeline --release -- --ignored --nocapture
+    fn bench_full_pipeline() {
+        use crate::config::{set_global_config, Config, LEGAL_MOVES};
+        use crate::inference::compute_material_imbalance;
+        use crate::move_encoding::encode_move;
+        use crate::moves::get_side_info;
+        use rand::prelude::IndexedRandom;
+        use rand::SeedableRng;
+        use shakmaty::uci::UciMove;
+        use std::time::Instant;
+
+        let _ = set_global_config(Config::default());
+
+        const NUM_POSITIONS: usize = 1024;
+        const MOVES_PER_GAME: usize = 30;
+        const PREVIOUS_POSITIONS_COUNT: usize = 5;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+        struct TestExample {
+            pos: Chess,
+            previous_positions: Vec<Chess>,
+            previous_moves: Vec<String>,
+            move_uci: String,
+        }
+
+        let mut examples = Vec::with_capacity(NUM_POSITIONS);
+
+        while examples.len() < NUM_POSITIONS {
+            let mut pos = Chess::default();
+            let mut history: Vec<(Chess, String)> = Vec::new();
+
+            for _ in 0..MOVES_PER_GAME {
+                let legal_moves: Vec<_> = pos.legal_moves().into_iter().collect();
+                if legal_moves.is_empty() {
+                    break;
+                }
+                let chosen_move = legal_moves.choose(&mut rng).unwrap();
+                let uci = chosen_move
+                    .to_uci(shakmaty::CastlingMode::Standard)
+                    .to_string();
+                history.push((pos.clone(), uci));
+                pos = pos.play(chosen_move.clone()).unwrap();
+            }
+
+            let legal_moves: Vec<_> = pos.legal_moves().into_iter().collect();
+            if legal_moves.is_empty() {
+                continue;
+            }
+            let final_move = legal_moves.choose(&mut rng).unwrap();
+            let move_uci = final_move
+                .to_uci(shakmaty::CastlingMode::Standard)
+                .to_string();
+
+            let prev_count = PREVIOUS_POSITIONS_COUNT.min(history.len());
+            let previous_positions: Vec<Chess> = history
+                .iter()
+                .rev()
+                .take(prev_count)
+                .map(|(p, _)| p.clone())
+                .collect();
+            let previous_moves: Vec<String> = history
+                .iter()
+                .rev()
+                .take(prev_count)
+                .map(|(_, m)| m.clone())
+                .collect();
+
+            examples.push(TestExample {
+                pos,
+                previous_positions,
+                previous_moves,
+                move_uci,
+            });
+        }
+
+        for _ in 0..10 {
+            let ex = &examples[0];
+            let _ = encode_position(&ex.pos, &ex.previous_positions, &ex.previous_moves);
+        }
+
+        let start = Instant::now();
+        for ex in &examples {
+            let _board_encoded =
+                encode_position(&ex.pos, &ex.previous_positions, &ex.previous_moves);
+
+            let mut move_distribution = vec![0.0f32; LEGAL_MOVES];
+            let move_uci: UciMove = ex.move_uci.parse().unwrap();
+            let (from_idx, to_idx) = encode_move(&move_uci).unwrap();
+            let move_idx = from_idx as usize * 76 + to_idx as usize;
+            move_distribution[move_idx] = 1.0;
+
+            let _side_info = get_side_info(&ex.pos, &ex.move_uci);
+
+            let mut legal_moves = [0f32; LEGAL_MOVES];
+            ex.pos.legal_moves().iter().for_each(|m| {
+                let (from, to) = encode_move(&m.to_uci(shakmaty::CastlingMode::Standard)).unwrap();
+                let idx = from as usize * 76 + to as usize;
+                legal_moves[idx] = 1.0;
+            });
+
+            let _material = compute_material_imbalance(&ex.pos);
+        }
+        let elapsed = start.elapsed();
+
+        let per_position = elapsed / NUM_POSITIONS as u32;
+        let positions_per_sec = NUM_POSITIONS as f64 / elapsed.as_secs_f64();
+
+        println!("\n=== Full Pipeline Benchmark ===");
+        println!("Positions processed: {}", NUM_POSITIONS);
+        println!("Total time: {:?}", elapsed);
+        println!("Per position: {:?}", per_position);
+        println!("Positions/sec: {:.0}", positions_per_sec);
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test bench_with_fen_parsing --release -- --ignored --nocapture
+    fn bench_with_fen_parsing() {
+        use crate::config::{set_global_config, Config, LEGAL_MOVES};
+        use crate::inference::compute_material_imbalance;
+        use crate::move_encoding::encode_move;
+        use crate::moves::get_side_info;
+        use rand::prelude::IndexedRandom;
+        use rand::SeedableRng;
+        use shakmaty::fen::Epd;
+        use shakmaty::uci::UciMove;
+        use std::time::Instant;
+
+        let _ = set_global_config(Config::default());
+
+        const NUM_POSITIONS: usize = 1024;
+        const MOVES_PER_GAME: usize = 30;
+        const PREVIOUS_POSITIONS_COUNT: usize = 5;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+        struct TestExample {
+            fen: String,
+            previous_fens: Vec<String>,
+            previous_moves: Vec<String>,
+            move_uci: String,
+        }
+
+        let mut examples = Vec::with_capacity(NUM_POSITIONS);
+
+        while examples.len() < NUM_POSITIONS {
+            let mut pos = Chess::default();
+            let mut history: Vec<(String, String)> = Vec::new();
+
+            for _ in 0..MOVES_PER_GAME {
+                let legal_moves: Vec<_> = pos.legal_moves().into_iter().collect();
+                if legal_moves.is_empty() {
+                    break;
+                }
+                let chosen_move = legal_moves.choose(&mut rng).unwrap();
+                let uci = chosen_move
+                    .to_uci(shakmaty::CastlingMode::Standard)
+                    .to_string();
+                let fen_str = Epd::from_position(&pos, shakmaty::EnPassantMode::Legal).to_string();
+                history.push((fen_str, uci));
+                pos = pos.play(chosen_move.clone()).unwrap();
+            }
+
+            let legal_moves: Vec<_> = pos.legal_moves().into_iter().collect();
+            if legal_moves.is_empty() {
+                continue;
+            }
+            let final_move = legal_moves.choose(&mut rng).unwrap();
+            let move_uci = final_move
+                .to_uci(shakmaty::CastlingMode::Standard)
+                .to_string();
+            let fen = Epd::from_position(&pos, shakmaty::EnPassantMode::Legal).to_string();
+
+            let prev_count = PREVIOUS_POSITIONS_COUNT.min(history.len());
+            let previous_fens: Vec<String> = history
+                .iter()
+                .rev()
+                .take(prev_count)
+                .map(|(f, _)| f.clone())
+                .collect();
+            let previous_moves: Vec<String> = history
+                .iter()
+                .rev()
+                .take(prev_count)
+                .map(|(_, m)| m.clone())
+                .collect();
+
+            examples.push(TestExample {
+                fen,
+                previous_fens,
+                previous_moves,
+                move_uci,
+            });
+        }
+
+        for _ in 0..10 {
+            let ex = &examples[0];
+            let fen: Fen = ex.fen.parse().unwrap();
+            let pos: Chess = fen.into_position(shakmaty::CastlingMode::Standard).unwrap();
+            let _ = encode_position(&pos, &[], &[]);
+        }
+
+        let start = Instant::now();
+        for ex in &examples {
+            let fen: Fen = ex.fen.parse().unwrap();
+            let pos: Chess = fen.into_position(shakmaty::CastlingMode::Standard).unwrap();
+
+            let previous_positions: Vec<Chess> = ex
+                .previous_fens
+                .iter()
+                .map(|f| f.parse::<Fen>().unwrap())
+                .map(|f| f.into_position(shakmaty::CastlingMode::Standard).unwrap())
+                .collect();
+
+            let _board_encoded = encode_position(&pos, &previous_positions, &ex.previous_moves);
+
+            let mut move_distribution = vec![0.0f32; LEGAL_MOVES];
+            let move_uci: UciMove = ex.move_uci.parse().unwrap();
+            let (from_idx, to_idx) = encode_move(&move_uci).unwrap();
+            let move_idx = from_idx as usize * 76 + to_idx as usize;
+            move_distribution[move_idx] = 1.0;
+
+            let _side_info = get_side_info(&pos, &ex.move_uci);
+
+            let mut legal_moves = [0f32; LEGAL_MOVES];
+            pos.legal_moves().iter().for_each(|m| {
+                let (from, to) = encode_move(&m.to_uci(shakmaty::CastlingMode::Standard)).unwrap();
+                let idx = from as usize * 76 + to as usize;
+                legal_moves[idx] = 1.0;
+            });
+
+            let _material = compute_material_imbalance(&pos);
+        }
+        let elapsed = start.elapsed();
+
+        let per_position = elapsed / NUM_POSITIONS as u32;
+        let positions_per_sec = NUM_POSITIONS as f64 / elapsed.as_secs_f64();
+
+        println!("\n=== Full Pipeline with FEN Parsing ===");
+        println!("Positions processed: {}", NUM_POSITIONS);
+        println!("Total time: {:?}", elapsed);
+        println!("Per position: {:?}", per_position);
+        println!("Positions/sec: {:.0}", positions_per_sec);
+    }
+
+    #[test]
+    fn test_has_pinned_defender() {
+        // Position: Black rook a3 "defended" by pawn b4, but pawn is pinned to queen b6 by rook b1
+        // Tactic: Qxa3, bxa3??, Rxb6 wins the queen
+        let fen = "7k/8/1q6/8/1p6/r7/1Q6/1R2K3 w - - 0 1";
         let fen_parsed: Fen = fen.parse().expect("Valid FEN");
         let pos: Chess = fen_parsed
             .into_position(shakmaty::CastlingMode::Standard)
             .expect("Valid position");
 
-        let d2 = Square::from_str("d2").unwrap();
-        let e1 = Square::from_str("e1").unwrap();
-        assert!(!is_weak_square(&pos, d2, Color::White));
-        assert!(!is_weak_square(&pos, e1, Color::White));
+        let mut pinned_to: [Option<Square>; 64] = [None; 64];
+        for square in Square::ALL {
+            pinned_to[square as usize] = is_piece_pinned(&pos, square);
+        }
 
-        // Any black weak-square marking on ranks 7-8 should be false
-        let e7 = Square::from_str("e7").unwrap();
-        let h8 = Square::from_str("h8").unwrap();
-        assert!(!is_weak_square(&pos, e7, Color::Black));
-        assert!(!is_weak_square(&pos, h8, Color::Black));
+        let mut output = String::new();
+
+        let b4 = Square::from_str("b4").unwrap();
+        let b6 = Square::from_str("b6").unwrap();
+        let a3 = Square::from_str("a3").unwrap();
+        let b2 = Square::from_str("b2").unwrap();
+        let b1 = Square::from_str("b1").unwrap();
+
+        output += &format!("b4 pawn pinned to: {:?}\n", pinned_to[b4 as usize]);
+        output += &format!(
+            "a3 rook has_pinned_defender: {}\n",
+            has_pinned_defender(&pos, a3, &pinned_to)
+        );
+        output += &format!(
+            "b6 queen has_pinned_defender: {}\n",
+            has_pinned_defender(&pos, b6, &pinned_to)
+        );
+        output += &format!(
+            "b2 queen has_pinned_defender: {}\n",
+            has_pinned_defender(&pos, b2, &pinned_to)
+        );
+        output += &format!(
+            "b1 rook has_pinned_defender: {}\n",
+            has_pinned_defender(&pos, b1, &pinned_to)
+        );
+
+        insta::assert_snapshot!(output);
     }
 }

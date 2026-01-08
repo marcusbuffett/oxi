@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use burn::prelude::*;
 use burn::tensor::activation::softmax;
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata, Numeric, NumericEntry};
+use burn::train::metric::{Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 
 /// Input type for move accuracy metric
 #[derive(Clone)]
@@ -37,47 +37,26 @@ impl<B: Backend> MoveAccuracyMetric<B> {
 impl<B: Backend> Metric for MoveAccuracyMetric<B> {
     type Input = MoveAccuracyInput<B>;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         let batch_size = input.policy_logits.shape().dims[0];
 
         // Convert logits to probabilities
         let probs = softmax(input.policy_logits.clone(), 1);
 
-        // Sum of probabilities assigned to correct moves
-        let mut batch_prob_sum = 0.0;
+        // Vectorized: gather probabilities at target indices
+        // targets: [batch_size] -> reshape to [batch_size, 1] for gather
+        let targets_2d = input.policy_targets.clone().reshape([batch_size, 1]);
 
-        // Process each example in the batch
-        for i in 0..batch_size {
-            // Get target index for this example
-            let target = input
-                .policy_targets
-                .clone()
-                .slice([i..i + 1])
-                .into_scalar()
-                .elem::<i32>() as usize;
+        // Gather the probability at each target index: [batch_size, 1]
+        let target_probs = probs.gather(1, targets_2d);
 
-            // Get probability assigned to the target move
-            let target_prob = probs
-                .clone()
-                .slice([i..i + 1, target..target + 1])
-                .into_scalar()
-                .elem::<f32>() as f64;
-
-            batch_prob_sum += target_prob;
-        }
-
-        // Calculate average probability for this batch
-        let batch_avg = if batch_size > 0 {
-            batch_prob_sum / batch_size as f64
-        } else {
-            0.0
-        };
+        // Sum all target probabilities and get mean (single GPU sync)
+        let batch_avg = target_probs.mean().into_scalar().elem::<f32>() as f64;
 
         // Update current value
         self.current = batch_avg;
 
-        MetricEntry::new(
-            "Move Accuracy".to_string().into(),
+        SerializedEntry::new(
             format!("Avg Prob: {batch_avg:.4}"),
             format!("{batch_avg:.4}"),
         )
@@ -96,9 +75,14 @@ impl<B: Backend> Numeric for MoveAccuracyMetric<B> {
     fn value(&self) -> NumericEntry {
         NumericEntry::Value(self.current)
     }
+
+    fn running_value(&self) -> NumericEntry {
+        NumericEntry::Value(self.current)
+    }
 }
 
-/// Metric for tracking top-k accuracy (percentage of targets contained in the model's top-k predictions)
+/// Combined metric for computing both top-1 and top-k accuracy efficiently.
+/// Uses argmax for top-1 (fast) and only computes topk once for top-k.
 #[derive(Clone)]
 pub struct MoveTopKAccuracyMetric<B: Backend> {
     current: f64,
@@ -120,55 +104,40 @@ impl<B: Backend> MoveTopKAccuracyMetric<B> {
 impl<B: Backend> Metric for MoveTopKAccuracyMetric<B> {
     type Input = MoveAccuracyInput<B>;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         let batch_size = input.policy_logits.shape().dims[0];
-        let num_moves = input.policy_logits.shape().dims[1];
-        let effective_k = self.k.min(num_moves);
-
-        let mut correct_count = 0;
-
-        if batch_size > 0 && effective_k > 0 {
-            let (_, top_indices) = input
-                .policy_logits
-                .clone()
-                .topk_with_indices(effective_k, 1);
-
-            for i in 0..batch_size {
-                let target = input
-                    .policy_targets
-                    .clone()
-                    .slice([i..i + 1])
-                    .into_scalar()
-                    .elem::<i32>();
-
-                let candidate_indices =
-                    top_indices.clone().slice([i..i + 1]).reshape([effective_k]);
-
-                for j in 0..effective_k {
-                    let candidate = candidate_indices
-                        .clone()
-                        .slice([j..j + 1])
-                        .into_scalar()
-                        .elem::<i32>();
-                    if candidate == target {
-                        correct_count += 1;
-                        break;
-                    }
-                }
-            }
-        }
 
         let batch_accuracy = if batch_size > 0 {
-            correct_count as f64 / batch_size as f64
+            if self.k == 1 {
+                let predictions = input.policy_logits.clone().argmax(1);
+                let targets = input.policy_targets.clone().reshape([batch_size, 1]);
+                let correct = predictions.equal(targets);
+                let correct_count = correct.int().sum().into_scalar().elem::<i32>() as f64;
+                correct_count / batch_size as f64
+            } else {
+                // Fast top-k: count moves with higher logits than target.
+                // If fewer than k moves beat the target, target is in top-k.
+                // O(batch * moves) comparisons vs O(batch * moves * log(moves)) for topk sort.
+                let targets_2d = input.policy_targets.clone().reshape([batch_size, 1]);
+
+                let target_logits = input.policy_logits.clone().gather(1, targets_2d);
+
+                let higher_than_target = input.policy_logits.clone().greater(target_logits);
+
+                let num_higher = higher_than_target.int().sum_dim(1);
+
+                let in_top_k = num_higher.lower_elem(self.k as i32);
+
+                let correct_count = in_top_k.int().sum().into_scalar().elem::<i32>() as f64;
+                correct_count / batch_size as f64
+            }
         } else {
             0.0
         };
 
         self.current = batch_accuracy;
 
-        let label = format!("Move Top-{} Accuracy", self.k);
-        MetricEntry::new(
-            label.clone().into(),
+        SerializedEntry::new(
             format!("Top-{}: {:.1}%", self.k, batch_accuracy * 100.0),
             format!("{batch_accuracy:.4}"),
         )
@@ -185,6 +154,10 @@ impl<B: Backend> Metric for MoveTopKAccuracyMetric<B> {
 
 impl<B: Backend> Numeric for MoveTopKAccuracyMetric<B> {
     fn value(&self) -> NumericEntry {
+        NumericEntry::Value(self.current)
+    }
+
+    fn running_value(&self) -> NumericEntry {
         NumericEntry::Value(self.current)
     }
 }

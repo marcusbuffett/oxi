@@ -18,6 +18,7 @@ SSH_OPTS=${SSH_OPTS:-"-o StrictHostKeyChecking=accept-new -o ServerAliveInterval
 DO_DELETE=false          # delete extraneous files on remote (safe; respects excludes)
 DO_DRY_RUN=false         # preview rsync actions only
 DO_BUILD=false           # run cargo build on remote after sync
+DO_SETUP=false           # run setup_ubuntu.sh on remote before build
 SYSTEMD_SERVICE=""       # if set, restart this systemd service after build
 REMOTE_CMD=""            # if set, run this command after sync/build
 
@@ -39,6 +40,7 @@ Options:
   -n                Dry run (preview rsync changes)
   -N                No delete (do not remove extraneous remote files)
   -b                After sync, run: cargo build --release --bin oxi on remote
+  -i                Run setup_ubuntu.sh on remote (first-time setup)
   -s <service>      After build, restart this systemd service on remote
   -c <command>      After sync/build, run this shell command on remote (in project dir)
   -S <ssh_opts>     Extra SSH options (quoted) e.g. -S "-o ProxyJump=..."
@@ -55,13 +57,14 @@ EOF
 
 EXTRA_EXCLUDES=()
 
-while getopts ":h:d:nNbS:s:c:x:-:" opt; do
+while getopts ":h:d:nNbiS:s:c:x:-:" opt; do
   case "$opt" in
     h) REMOTE_HOST="$OPTARG" ;;
     d) REMOTE_DIR="$OPTARG" ;;
     n) DO_DRY_RUN=true ;;
     N) DO_DELETE=false ;;
     b) DO_BUILD=true ;;
+    i) DO_SETUP=true ;;
     s) SYSTEMD_SERVICE="$OPTARG" ;;
     c) REMOTE_CMD="$OPTARG" ;;
     S) SSH_OPTS="$SSH_OPTS $OPTARG" ;;
@@ -131,9 +134,14 @@ echo "Syncing project (rsync)..."
 rsync "${RSYNC_OPTS[@]}" -e "${RSYNC_RSH}" \
   "${LOCAL_DIR}/" "${REMOTE_HOST}:${REMOTE_DIR}/"
 
+if [ "${DO_SETUP}" = true ]; then
+  echo "Running setup_ubuntu.sh on remote..."
+  ssh ${SSH_OPTS} -t "${REMOTE_HOST}" "set -euo pipefail; cd '${REMOTE_DIR}'; bash setup_ubuntu.sh"
+fi
+
 if [ "${DO_BUILD}" = true ]; then
   echo "Building on remote (cargo build --release --bin oxi)..."
-  ssh ${SSH_OPTS} -t "${REMOTE_HOST}" "set -euo pipefail; cd '${REMOTE_DIR}'; cargo build --release --bin oxi"
+  ssh ${SSH_OPTS} -t "${REMOTE_HOST}" "set -euo pipefail; source ~/.cargo/env; cd '${REMOTE_DIR}'; source .venv/bin/activate; export LIBTORCH=\"\$(python -c 'import torch; print(torch.__path__[0])')\"; export LD_LIBRARY_PATH=\"\$LIBTORCH/lib:\${LD_LIBRARY_PATH:-}\"; cargo build --release --bin oxi"
 fi
 
 if [[ -n "${SYSTEMD_SERVICE}" ]]; then
@@ -143,7 +151,7 @@ fi
 
 if [[ -n "${REMOTE_CMD}" ]]; then
   echo "Running remote command: ${REMOTE_CMD}"
-  ssh ${SSH_OPTS} -t "${REMOTE_HOST}" "set -euo pipefail; cd '${REMOTE_DIR}'; ${REMOTE_CMD}"
+  ssh ${SSH_OPTS} -t "${REMOTE_HOST}" "set -euo pipefail; source ~/.cargo/env; cd '${REMOTE_DIR}'; source .venv/bin/activate; export LIBTORCH=\"\$(python -c 'import torch; print(torch.__path__[0])')\"; export LD_LIBRARY_PATH=\"\$LIBTORCH/lib:\${LD_LIBRARY_PATH:-}\"; ${REMOTE_CMD}"
 fi
 
 echo "Done."

@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use burn::prelude::*;
-use burn::train::metric::{Metric, MetricEntry, MetricMetadata};
+use burn::train::metric::{Metric, MetricMetadata, SerializedEntry};
 
 /// Input type for uncertainty metric
 pub struct UncertaintyInput {
@@ -39,7 +39,7 @@ impl<B: Backend> UncertaintyMetric<B> {
 impl<B: Backend> Metric for UncertaintyMetric<B> {
     type Input = UncertaintyInput;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         self.policy_sigma = input.policy_sigma;
         self.value_sigma = input.value_sigma;
         self.time_usage_sigma = input.time_usage_sigma;
@@ -50,11 +50,7 @@ impl<B: Backend> Metric for UncertaintyMetric<B> {
             self.policy_sigma, self.value_sigma, self.time_usage_sigma
         );
 
-        MetricEntry::new(
-            "Uncertainties (σ)".to_string().into(),
-            formatted.clone(),
-            formatted,
-        )
+        SerializedEntry::new(formatted.clone(), formatted)
     }
 
     fn clear(&mut self) {

@@ -5,7 +5,7 @@ Oxi models human decision making in chess across the full rating spectrum. To ou
 ## Highlights
 - State-of-the-art human move prediction accuracy with Elo-aware conditioning and timing signals.
 - Dual-stream board encoder with learned gating between token features and global context.
-- Shaw-style relative positional transformers with Peri-LN residual routing (14 layers by default).
+- Smolgen dynamic positional attention with Peri-LN residual routing (14 layers by default).
 - Multi-task heads for policy (64x76 moves), value (win/draw/loss), auxiliary side information, and time usage, each with calibrated uncertainty estimates.
 - Adaptive training loop with GradNorm balancing, cosine schedules, curriculum sampling, and a Ratatui dashboard for live metrics.
 
@@ -56,7 +56,7 @@ Run any subcommand with `--help` for the full list of options and defaults.
 - Board encoding splits each square into per-token features (piece identity, tactical, positional, misc) and recency channels for the latest moves.
 - Optional convolutional stem (disabled by default) can be enabled with `--conv-layers`.
 - Token and global streams are normalized separately, then fused through learned gates before entering the transformer stack.
-- Attention layers use Shaw-style relative biases with grouped query support and Peri-LN (post-residual normalization) in both the attention and MLP paths.
+- Attention layers use Smolgen dynamic position-dependent biases with Peri-LN (post-residual normalization) in both the attention and MLP paths.
 - Policy head outputs 64x76 logits covering from-to square pairs (including underpromotions), masked by legality during training.
 - Value head predicts win/draw/loss logits and shares pooled representations with the side-information and time-usage heads.
 - Each head owns a learnable log-variance parameter, enabling adaptive loss weighting that works hand-in-hand with GradNorm.

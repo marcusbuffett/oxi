@@ -83,19 +83,26 @@ where
         model: &OXIModel<B>,
         renderer: &mut dyn MetricsRenderer,
     ) -> Result<()> {
+        let t_total = Instant::now();
+
         for position in &self.positions {
+            let t_batch = Instant::now();
             let batch = self
                 .batcher
                 .batch(vec![position.item.clone()], &self.device)
                 .to_device(&self.device);
+            let batch_time = t_batch.elapsed();
 
-            let start = Instant::now();
+            let t_forward = Instant::now();
             let output = model.forward_classification(batch.clone());
-            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let forward_time = t_forward.elapsed();
 
+            let t_to_data = Instant::now();
             let policy_probs = softmax(output.policy_output.clone(), 1)
                 .to_data()
                 .convert::<f32>();
+            let to_data_time = t_to_data.elapsed();
+
             let prob_slice = policy_probs
                 .as_slice::<f32>()
                 .expect("policy probabilities should be accessible");
@@ -105,12 +112,14 @@ where
                 .as_slice::<f32>()
                 .expect("legal moves should be accessible");
 
+            let t_select = Instant::now();
             let predictions = select_top_moves(
                 prob_slice,
                 legal_slice,
                 position.query_top,
                 &position.reference_pos,
             );
+            let select_time = t_select.elapsed();
 
             let entries = predictions
                 .into_iter()
@@ -123,12 +132,30 @@ where
 
             let metric = PredictionMetric {
                 name: format!("Debug Prediction {}", position.name),
-                formatted: format!("Iteration {iteration} duration: {:.3} ms", duration_ms),
+                formatted: format!("Iteration {iteration}"),
                 predictions: entries,
             };
 
             renderer.update_train(MetricState::Predictions(metric));
+
+            tracing::info!(
+                "perf_debug_monitor_position: iter={} pos={} batch={:?} forward={:?} to_data={:?} select={:?}",
+                iteration,
+                position.name,
+                batch_time,
+                forward_time,
+                to_data_time,
+                select_time
+            );
         }
+
+        let total_time = t_total.elapsed();
+        tracing::info!(
+            "perf_debug_monitor_total: iter={} total={:?} positions={}",
+            iteration,
+            total_time,
+            self.positions.len()
+        );
 
         Ok(())
     }
