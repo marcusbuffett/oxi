@@ -37,7 +37,7 @@ rand = "*"
 statrs = "*"
 itertools = "*"
 rayon = "*"
-bincode = "*"
+bincode = "2"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = "0.28"
 zip = "0.6"
