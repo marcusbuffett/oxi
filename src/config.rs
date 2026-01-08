@@ -19,11 +19,11 @@ pub const LEGAL_MOVES: usize = 64 * 76;
 // - 1 number of attackers (black), normalized by 6
 // Feature grouping per square (current position only, excluding recency channels):
 // - Piece identity group (12): white/black one-hots for all roles
-// - Tactical group (86): attackers, pins, pin target, hanging flag, square control, directional ray features
+// - Tactical group (22): attackers, pins, pin target, hanging flag, has_pinned_defender, square control
 // - Positional group (25): legal moves, pawn structure, weak squares, open file, passed pawn, dark-square flag, rank/file one-hots
 // - Misc group (2): en passant target, local castling right
 pub const PIECE_IDENTITY_FEATURES: usize = 12;
-pub const TACTICAL_FEATURES: usize = 86;
+pub const TACTICAL_FEATURES: usize = 22;
 pub const POSITIONAL_FEATURES: usize = 25;
 pub const MISC_FEATURES: usize = 2;
 pub const RECENCY_FEATURES: usize = 4; // white_from, white_to, black_from, black_to
@@ -53,8 +53,12 @@ pub const MIN_CLOCK_TIME: u32 = 30;
 pub struct Config {
     // === DATA AND RUNTIME ===
     /// Path to data (PGN directory, PGN file, or CSV file)
-    #[arg(long)]
+    #[arg(long, default_value = "/lambda/nfs/chessbook")]
     pub data_path: Option<std::path::PathBuf>,
+
+    /// Directory for training logs (train.log, metrics_logs/)
+    #[arg(long)]
+    pub log_dir: Option<std::path::PathBuf>,
 
     #[arg(long)]
     pub max_samples: Option<usize>,
@@ -95,21 +99,25 @@ pub struct Config {
     #[arg(long, default_value = "1e-6")]
     pub lr_min: f64,
 
-    /// Number of samples to accumulate before recording a loss measurement for ReduceOnPlateau
-    #[arg(long, default_value = "4000")]
-    pub measurement_batch_size: usize,
+    /// Window size for plateau detection (number of iterations to compare)
+    #[arg(long, default_value = "1000")]
+    pub lr_window_size: usize,
 
-    /// Number of measurement batches without improvement before reducing learning rate
-    #[arg(long, default_value = "100")]
-    pub lr_patience: usize,
+    /// Minimum relative improvement threshold for plateau detection (e.g., 0.0005 = 0.05% improvement required)
+    #[arg(long, default_value = "0.0005")]
+    pub lr_improvement_threshold: f64,
 
     /// Factor to reduce learning rate by when plateau is detected (e.g., 0.5 means halve the LR)
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value = "0.5")]
     pub lr_reduction_factor: f64,
 
     /// Multiplier applied to the learning rate calculated from batch size
     #[arg(long, default_value = "1.0")]
     pub lr_multiplier: f64,
+
+    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size samples
+    #[arg(long, default_value = "2.0")]
+    pub warmup_multiplier: f64,
 
     /// Weight for policy loss
     #[arg(long, default_value = "0.15")]
@@ -143,11 +151,6 @@ pub struct Config {
     #[serde(default)]
     pub log_gradient_breakdown: Option<bool>,
 
-    /// How often (in optimizer steps) to log gradient breakdown details
-    #[arg(long, default_value = "16")]
-    #[serde(default)]
-    pub gradient_breakdown_interval: usize,
-
     /// Number of attention heads to include when logging gradient breakdowns
     #[arg(long, default_value = "128")]
     #[serde(default)]
@@ -158,18 +161,13 @@ pub struct Config {
     #[serde(default)]
     pub gradient_layer_limit: usize,
 
-    /// How often (in optimizer steps) to log L2 penalty from weight decay
-    #[arg(long, default_value = "100")]
-    #[serde(default)]
-    pub l2_penalty_log_interval: usize,
-
     /// Enable adaptive GradNorm reweighting across heads
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
     pub enable_gradnorm: Option<bool>,
 
     /// Optimizer steps between GradNorm weight updates
-    #[arg(long, default_value = "8")]
+    #[arg(long, default_value = "20")]
     #[serde(default)]
     pub gradnorm_interval: usize,
 
@@ -206,6 +204,10 @@ pub struct Config {
     #[arg(long, default_value = "14")]
     pub num_layers: usize,
 
+    /// Number of attention heads (head_dim = embed_dim / num_heads)
+    #[arg(long, default_value = "8")]
+    pub num_heads: usize,
+
     /// MLP hidden dimension ratio
     #[arg(long, default_value = "4.0")]
     pub mlp_ratio: f32,
@@ -236,11 +238,6 @@ pub struct Config {
     #[serde(default)]
     pub log_tensor_norms: Option<bool>,
 
-    /// How often (in forward passes) to record tensor norm snapshots
-    #[arg(long, default_value = "8")]
-    #[serde(default)]
-    pub norm_log_interval: usize,
-
     /// Maximum number of tensor elements to print when previewing small tensors
     #[arg(long, default_value = "6")]
     #[serde(default)]
@@ -250,9 +247,22 @@ pub struct Config {
     #[arg(long, default_value = "2.0")]
     pub focal_loss_gamma: f32,
 
-    /// Disable Shaw-style relative positional representations in attention
+    #[arg(long, default_value = "24")]
+    pub smolgen_hidden: usize,
+
+    #[arg(long, default_value = "128")]
+    pub smolgen_global_dim: usize,
+
+    #[arg(long, default_value = "128")]
+    pub smolgen_gen_size: usize,
+
+    /// Enable forward pass timing instrumentation for profiling
     #[arg(long, default_missing_value="true", num_args=0..=1)]
-    pub disable_shaw_pr: Option<bool>,
+    pub enable_forward_timing: Option<bool>,
+
+    /// Sample interval for forward timing (time every Nth forward pass)
+    #[arg(long, default_value = "100")]
+    pub forward_timing_interval: u64,
 
     #[arg(long, default_value = "1")]
     pub num_devices: usize,
@@ -272,6 +282,19 @@ pub struct Config {
     /// Number of TCEC (computer engine) samples to use for pretraining (0 to disable)
     #[arg(long, default_value = "0")]
     pub pretrain_samples: usize,
+
+    /// Size of shuffle buffer for streaming data loading (number of examples to buffer before sampling)
+    #[arg(long, default_value = "100000")]
+    pub shuffle_buffer_size: usize,
+
+    /// Interval for computing expensive metrics (top-5 accuracy, debug predictions, gradient breakdown, L2 penalty, tensor norms). 0 = never, 1 = every iteration.
+    #[arg(long, default_value = "50")]
+    pub full_metrics_interval: usize,
+
+    /// Priority boost for advanced/expert ELO games (2000+). Value of 1.0 = 2x boost at 2500 ELO,
+    /// 2.0 = 3x boost, 3.0 = 4x boost. Set to 0.0 to disable.
+    #[arg(long, default_value = "3.0")]
+    pub elo_priority_boost: f64,
 }
 
 impl Config {
@@ -295,13 +318,17 @@ impl Config {
     pub fn non_global_dim(&self) -> usize {
         self.embed_dim - self.global_dim()
     }
-    pub fn head_dim(&self) -> usize {
-        // head_dim is min(64, embed_dim)
-        64.min(self.embed_dim)
-    }
     pub fn num_heads(&self) -> usize {
-        // num_heads = embed_dim / head_dim (rounded down)
-        self.embed_dim / self.head_dim()
+        assert!(
+            self.embed_dim % self.num_heads == 0,
+            "embed_dim ({}) must be divisible by num_heads ({})",
+            self.embed_dim,
+            self.num_heads
+        );
+        self.num_heads
+    }
+    pub fn head_dim(&self) -> usize {
+        self.embed_dim / self.num_heads()
     }
     pub fn num_layers(&self) -> usize {
         self.num_layers
@@ -320,10 +347,6 @@ impl Config {
         self.log_tensor_norms.unwrap_or(false)
     }
 
-    pub fn norm_log_interval(&self) -> usize {
-        self.norm_log_interval.max(1)
-    }
-
     pub fn norm_preview_limit(&self) -> usize {
         self.norm_preview_limit.max(1)
     }
@@ -332,20 +355,12 @@ impl Config {
         self.log_gradient_breakdown.unwrap_or(false)
     }
 
-    pub fn gradient_breakdown_interval(&self) -> usize {
-        self.gradient_breakdown_interval.max(1)
-    }
-
     pub fn gradient_head_limit(&self) -> usize {
         self.gradient_head_limit.max(1)
     }
 
     pub fn gradient_layer_limit(&self) -> usize {
         self.gradient_layer_limit.max(1)
-    }
-
-    pub fn l2_penalty_log_interval(&self) -> usize {
-        self.l2_penalty_log_interval.max(1)
     }
 
     pub fn gradnorm_enabled(&self) -> bool {
@@ -380,7 +395,25 @@ impl Config {
         self.gradnorm_probe_size.max(1)
     }
 
-    // etc... (other accessors)
+    pub fn forward_timing_enabled(&self) -> bool {
+        self.enable_forward_timing.unwrap_or(false)
+    }
+
+    pub fn forward_timing_interval(&self) -> u64 {
+        self.forward_timing_interval.max(1)
+    }
+
+    pub fn smolgen_hidden(&self) -> usize {
+        self.smolgen_hidden
+    }
+
+    pub fn smolgen_global_dim(&self) -> usize {
+        self.smolgen_global_dim
+    }
+
+    pub fn smolgen_gen_size(&self) -> usize {
+        self.smolgen_gen_size
+    }
 }
 
 /// Set the global config (should be called once at startup)
@@ -398,6 +431,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_path: Some(std::path::PathBuf::from("/lambda/nfs/chessbook")),
+            log_dir: None,
             train_ratio: 1.0,
             batch_size: None,
             physical_batch_size: 16000,
@@ -406,12 +440,10 @@ impl Default for Config {
             weight_decay: 0.00001,
             gradient_clip: 3.0,
             log_gradient_breakdown: Some(false),
-            gradient_breakdown_interval: 16,
             gradient_head_limit: 128,
             gradient_layer_limit: 128,
-            l2_penalty_log_interval: 100,
             enable_gradnorm: Some(true),
-            gradnorm_interval: 8,
+            gradnorm_interval: 20,
             gradnorm_alpha: 0.5,
             gradnorm_learning_rate: 0.5,
             gradnorm_policy_priority: 20.0,
@@ -419,19 +451,21 @@ impl Default for Config {
             gradnorm_time_priority: 1.0,
             gradnorm_probe_size: 256,
             lr_min: 0.000001,
-            measurement_batch_size: 4000,
-            lr_patience: 100,
-            lr_reduction_factor: 0.1,
+            lr_window_size: 1000,
+            lr_improvement_threshold: 0.0005,
+            lr_reduction_factor: 0.5,
             lr_multiplier: 1.0,
+            warmup_multiplier: 2.0,
             policy_loss_weight: 0.15,
             policy_label_smoothing: 0.03,
             value_loss_weight: 0.0001,
             value_entropy_weight: 0.05,
-            embed_dim: 768,
+            embed_dim: 512,
             num_layers: 14,
+            num_heads: 8,
             mlp_ratio: 4.0,
             conv_layers: 0,
-            max_samples: Some(240000000),
+            max_samples: None,
             skip: None,
             timeout: None,
             resume: Some(false),
@@ -439,17 +473,33 @@ impl Default for Config {
             checkmate_only: Some(false),
             item_log_probability: 1.00,
             log_tensor_norms: Some(false),
-            norm_log_interval: 100,
             norm_preview_limit: 6,
             time_usage_loss_weight: 0.0,
             disable_tui: Some(false),
-            disable_shaw_pr: Some(false),
+            smolgen_hidden: 24,
+            smolgen_global_dim: 128,
+            smolgen_gen_size: 128,
+            enable_forward_timing: Some(false),
+            forward_timing_interval: 100,
             num_devices: 1,
             focal_loss_gamma: 1.0,
             enable_ply_sampling: Some(true),
             enable_elo_sampling: Some(true),
             checkpoint_interval: 100,
             pretrain_samples: 0,
+            shuffle_buffer_size: 100000,
+            full_metrics_interval: 50,
+            elo_priority_boost: 3.0,
+        }
+    }
+}
+
+impl Config {
+    pub fn full_metrics_interval(&self) -> Option<usize> {
+        if self.full_metrics_interval == 0 {
+            None
+        } else {
+            Some(self.full_metrics_interval)
         }
     }
 }
@@ -465,40 +515,48 @@ pub fn ply_keep_probability(ply: usize) -> f64 {
     }
 }
 
+const ELO_DISTRIBUTION_MEAN: f64 = 1672.0;
+const ELO_DISTRIBUTION_STD: f64 = 404.0;
+const ELO_FLATTENING_FACTOR: f64 = 0.05;
+
 static ELO_DISTRIBUTION: Lazy<Normal> = Lazy::new(|| {
-    // Fix mean to 1500; adjust std based on data (try 350-400 for blitz/rapid)
-    Normal::new(1500.0, 400.0).expect("Failed to create normal distribution")
+    Normal::new(ELO_DISTRIBUTION_MEAN, ELO_DISTRIBUTION_STD)
+        .expect("Failed to create normal distribution")
 });
 
+const ADVANCED_ELO_THRESHOLD: f64 = 2000.0;
+const ADVANCED_ELO_RANGE: f64 = 500.0;
+
 pub fn elo_keep_probability(avg_elo: f64) -> f64 {
-    let normalize_keep_prob = {
-        let natural_frequency = ELO_DISTRIBUTION.pdf(avg_elo);
-        if natural_frequency == 0.0 {
-            return 0.0;
-        } // Edge case for extreme ELO
+    elo_keep_probability_with_boost(avg_elo, 0.0)
+}
 
-        let peak_density = ELO_DISTRIBUTION.pdf(1500.0);
-        let relative_frequency = natural_frequency / peak_density; // 0 to 1
+pub fn elo_keep_probability_with_boost(avg_elo: f64, priority_boost: f64) -> f64 {
+    if avg_elo < MIN_ELO as f64 || avg_elo > MAX_ELO as f64 {
+        return 0.0;
+    }
 
-        // Tunable: 0.1 = keep ~10% at mean, flat up to ~ELO 2570 (with std=400, z~2.15)
-        // Increase to 0.3-0.5 for less aggressive (more 1500 games, but flat only to ~2000-2200)
-        // Decrease to 0.01 for more aggressive (like your current, flat farther but fewer center games)
-        let flattening_factor = 0.1;
+    let natural_frequency = ELO_DISTRIBUTION.pdf(avg_elo);
+    if natural_frequency == 0.0 {
+        return 0.0;
+    }
 
-        // Inverse: boost tails, downsample center
-        (flattening_factor / relative_frequency).clamp(0.0, 1.0)
-    };
+    let peak_density = ELO_DISTRIBUTION.pdf(ELO_DISTRIBUTION_MEAN);
+    let relative_frequency = natural_frequency / peak_density;
+    let flatten_prob = (ELO_FLATTENING_FACTOR / relative_frequency).clamp(0.0, 1.0);
 
-    let graduated_keep_prob = {
-        let min_elo = 1000;
-        let max_elo = 2300;
-        let elo_clamped = avg_elo.clamp(min_elo as f64, max_elo as f64);
-        let elo_normalized = (elo_clamped - min_elo as f64) / (max_elo - min_elo) as f64;
-        let keep_prob = 0.2 + (0.8 * elo_normalized);
-        keep_prob
-    };
+    let elo_clamped = avg_elo.clamp(MIN_ELO as f64, MAX_ELO as f64);
+    let graduated_prob = (elo_clamped - MIN_ELO as f64) / (MAX_ELO - MIN_ELO) as f64;
 
-    normalize_keep_prob * graduated_keep_prob
+    let base_prob = flatten_prob * graduated_prob;
+
+    if priority_boost > 0.0 && avg_elo >= ADVANCED_ELO_THRESHOLD {
+        let boost_progress = ((avg_elo - ADVANCED_ELO_THRESHOLD) / ADVANCED_ELO_RANGE).min(1.0);
+        let boost_factor = 1.0 + priority_boost * boost_progress;
+        (base_prob * boost_factor).min(1.0)
+    } else {
+        base_prob
+    }
 }
 
 /// Randomly decide whether to log this item based on `item_log_probability`.
@@ -527,7 +585,6 @@ pub fn should_keep_position_by_ply(ply: usize, rng_value: f64) -> bool {
     rng_value < ply_keep_probability(ply)
 }
 
-/// Check if a game should be kept based on Elo and random sampling
 pub fn should_keep_game_by_elo(white_elo: i32, black_elo: i32, rng_value: f64) -> bool {
     let config = get_global_config();
     if !config.enable_elo_sampling.unwrap_or(true) {
@@ -535,10 +592,8 @@ pub fn should_keep_game_by_elo(white_elo: i32, black_elo: i32, rng_value: f64) -
         return true;
     }
     let avg_elo = (white_elo + black_elo) as f64 / 2.0;
-    let keep_prob = elo_keep_probability(avg_elo);
-    let result = rng_value < keep_prob;
-
-    result
+    let keep_prob = elo_keep_probability_with_boost(avg_elo, config.elo_priority_boost);
+    rng_value < keep_prob
 }
 
 // Legacy type aliases for backward compatibility during transition
