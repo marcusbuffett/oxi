@@ -5,21 +5,27 @@ use burn::tensor::Device;
 use burn::tensor::{backend::Backend, Tensor};
 
 use crate::config::get_global_config;
+use crate::smolgen::{SmolgenAttention, SmolgenWeightGen};
+
+#[cfg(feature = "train")]
+use crate::forward_timing::TimingScope;
+#[cfg(feature = "train")]
 use crate::norm_debug::log_tensor_stats;
-use crate::shaw::ShawRelativePositionAttention;
+#[cfg(not(feature = "train"))]
+use crate::train_stubs::{log_tensor_stats, TimingScope};
 
 #[derive(Module, Debug)]
 pub struct TransformerBlock<B: Backend> {
-    attention: ShawRelativePositionAttention<B>,
-    norm_post_attn: LayerNorm<B>, // New: Post-residual norm for attention
-    norm_post_mlp: LayerNorm<B>,  // Repurposed from norm_final: Post-residual norm for MLP
+    attention: SmolgenAttention<B>,
+    norm_post_attn: LayerNorm<B>,
+    norm_post_mlp: LayerNorm<B>,
     mlp: MLP<B>,
 }
 
 impl<B: Backend> TransformerBlock<B> {
     pub fn new(device: &Device<B>) -> Self {
         let config = get_global_config();
-        let attention = ShawRelativePositionAttention::new(device);
+        let attention = SmolgenAttention::new(device);
         let norm_post_attn = LayerNormConfig::new(config.embed_dim()).init(device);
         let norm_post_mlp = LayerNormConfig::new(config.embed_dim()).init(device);
         let mlp = MLP::new(device);
@@ -31,30 +37,41 @@ impl<B: Backend> TransformerBlock<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(
+        &self,
+        x: Tensor<B, 3>,
+        shared_weight_gen: &SmolgenWeightGen<B>,
+    ) -> Tensor<B, 3> {
+        let device = x.device();
         log_tensor_stats("block.input", &x);
 
-        // Attention without pre-norm
-        let attn_out = self.attention.forward(x.clone());
+        let attn_out = {
+            let _t = TimingScope::new_with_sync::<B>("block_attention", &device);
+            self.attention.forward(x.clone(), shared_weight_gen)
+        };
         log_tensor_stats("block.attn_out", &attn_out);
 
-        // Attention residual
         let residual_attn = x + attn_out;
         log_tensor_stats("block.post_attn", &residual_attn);
 
-        // Post-residual norm (Peri-LN key change)
-        let post_attn = self.norm_post_attn.forward(residual_attn);
+        let post_attn = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_attn", &device);
+            self.norm_post_attn.forward(residual_attn)
+        };
         log_tensor_stats("block.norm_post_attn", &post_attn);
 
-        // MLP without pre-norm
-        let mlp_out = self.mlp.forward(post_attn.clone());
+        let mlp_out = {
+            let _t = TimingScope::new_with_sync::<B>("block_mlp", &device);
+            self.mlp.forward(post_attn.clone())
+        };
         log_tensor_stats("block.mlp_out", &mlp_out);
 
-        // MLP residual
         let residual_mlp = post_attn + mlp_out;
 
-        // Final post-residual norm (Peri-LN for MLP)
-        let output = self.norm_post_mlp.forward(residual_mlp.clone());
+        let output = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_mlp", &device);
+            self.norm_post_mlp.forward(residual_mlp.clone())
+        };
         log_tensor_stats("block.output", &output);
 
         output
@@ -94,12 +111,11 @@ mod tests {
     use crate::config::{set_global_config, Config};
 
     #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Metal;
+    type TestBackend = burn::backend::Wgpu;
     #[cfg(not(target_os = "macos"))]
     type TestBackend = burn::backend::LibTorch<f32>;
 
     fn ensure_config() {
-        // Try setting a small config; ignore error if already set
         let _ = set_global_config(Config::new(128, 2));
     }
 
@@ -107,16 +123,17 @@ mod tests {
     fn transformer_block_smoke_shapes() {
         ensure_config();
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let config = get_global_config();
         let block = TransformerBlock::<TestBackend>::new(&device);
+        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&device);
         let batch_size = 2usize;
-        let seq_len = 64usize; // 8x8 board
+        let seq_len = 64usize;
         let embed_dim = config.embed_dim();
         let x = Tensor::zeros([batch_size, seq_len, embed_dim], &device);
-        let y = block.forward(x);
+        let y = block.forward(x, &weight_gen);
         assert_eq!(y.dims(), [batch_size, seq_len, embed_dim]);
     }
 
@@ -125,16 +142,17 @@ mod tests {
     fn transformer_block_panics_on_wrong_seq_len() {
         ensure_config();
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let config = get_global_config();
         let block = TransformerBlock::<TestBackend>::new(&device);
+        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&device);
         let batch_size = 1usize;
-        let seq_len = 32usize; // wrong: not 8x8
+        let seq_len = 32usize;
         let embed_dim = config.embed_dim();
         let x = Tensor::zeros([batch_size, seq_len, embed_dim], &device);
-        let _ = block.forward(x); // should panic inside attention due to seq len mismatch
+        let _ = block.forward(x, &weight_gen);
     }
 
     #[test]
@@ -142,16 +160,17 @@ mod tests {
     fn transformer_block_large_batch_shapes() {
         ensure_config();
         #[cfg(target_os = "macos")]
-        let device = burn::backend::metal::MetalDevice::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         #[cfg(not(target_os = "macos"))]
         let device = burn_tch::LibTorchDevice::Cpu;
         let config = get_global_config();
         let block = TransformerBlock::<TestBackend>::new(&device);
+        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&device);
         let batch_size = 1024usize;
-        let seq_len = 64usize; // 8x8 board
+        let seq_len = 64usize;
         let embed_dim = config.embed_dim();
         let x = Tensor::zeros([batch_size, seq_len, embed_dim], &device);
-        let y = block.forward(x);
+        let y = block.forward(x, &weight_gen);
         assert_eq!(y.dims(), [batch_size, seq_len, embed_dim]);
     }
 }

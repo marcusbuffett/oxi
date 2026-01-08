@@ -3,6 +3,12 @@ use burn::record::{CompactRecorder, Recorder};
 use burn::tensor::activation::log_softmax;
 use std::path::Path;
 
+#[cfg(all(target_os = "linux", feature = "backend-cuda"))]
+use burn_cuda;
+
+#[cfg(feature = "backend-candle")]
+use burn_candle;
+
 use crate::config::{Config, LEGAL_MOVES, NUM_GLOBALS, PREVIOUS_POSITIONS};
 use crate::encoding::encode_position;
 use crate::model::OXIModel;
@@ -11,11 +17,17 @@ use crate::moves::{mirror_fen, mirror_move};
 use shakmaty::EnPassantMode;
 use shakmaty::{fen::Fen, san::SanPlus, Chess, Color, Position, Square};
 
-#[cfg(target_os = "macos")]
+#[cfg(feature = "backend-ndarray")]
+pub type InferenceBackend = burn_ndarray::NdArray<f32>;
+
+#[cfg(all(not(feature = "backend-ndarray"), feature = "backend-tch"))]
 pub type InferenceBackend = burn::backend::LibTorch<f32>;
 
-#[cfg(target_os = "linux")]
-pub type InferenceBackend = burn_ndarray::NdArray<f32>;
+#[cfg(all(not(feature = "backend-ndarray"), feature = "backend-cuda"))]
+pub type InferenceBackend = burn_cuda::Cuda;
+
+#[cfg(all(not(feature = "backend-ndarray"), feature = "backend-candle"))]
+pub type InferenceBackend = burn_candle::Candle<f32, i64>;
 
 /// Compute signed material imbalance (white - black) using standard piece values
 pub fn compute_material_imbalance(pos: &Chess) -> i32 {

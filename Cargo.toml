@@ -7,19 +7,15 @@ edition = "2021"
 name = "oxi"
 path = "src/main.rs"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "wgpu", "metal", "autodiff", "fusion", "tch", "candle" ] }
-burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", features = ["metal"] }
-burn-tch = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std", "train", "ndarray", "autodiff", "fusion", "candle"] }
-burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main" }
-burn-ndarray = { git = "https://github.com/tracel-ai/burn", branch = "main" }
-
 [dependencies]
-burn-train = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["tui"] }
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std"] }
+burn-train = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["tui"], optional = true }
+
+burn-ndarray = { git = "https://github.com/tracel-ai/burn", branch = "main", optional = true }
+burn-tch = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, optional = true }
 burn-cuda = { git = "https://github.com/tracel-ai/burn", branch = "main", optional = true }
+burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", optional = true }
+
 clap = { version = "*", features = ["derive"] }
 serde = { version = "*", features = ["derive"] }
 serde_yaml = "*"
@@ -40,6 +36,7 @@ num_cpus = "*"
 rand = "*"
 statrs = "*"
 itertools = "*"
+rayon = "*"
 bincode = "*"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = "0.28"
@@ -52,5 +49,12 @@ insta = "*"
 
 [features]
 default = []
-metal = []
-cuda = []
+train = ["burn/train", "burn/autodiff", "burn-train"]
+backend-ndarray = ["burn-ndarray"]
+backend-tch = ["burn-tch", "burn/tch"]
+backend-cuda = ["burn-cuda", "burn/cuda", "burn/fusion", "burn/autotune"]
+backend-candle = ["burn-candle"]
+backend-candle-cuda = ["backend-candle", "burn-candle/cuda", "burn/candle-cuda"]
+backend-candle-metal = ["backend-candle", "burn-candle/metal"]
+backend-wgpu = ["burn/wgpu"]
+backend-metal = ["backend-wgpu", "burn/metal", "burn/fusion"]

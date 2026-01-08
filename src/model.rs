@@ -1,30 +1,40 @@
-use crate::chess_output::ChessOutput;
 use crate::config::{
     get_global_config, ModelConfig, BOARD_FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS,
     RECENCY_FEATURES,
 };
 use crate::distribution_utils::beta_log_pdf;
-use crate::model_prediction_logger::log_model_predictions;
-use crate::norm_debug::{log_tensor_stats, LayerScope, NormDebugScope, StreamScope};
 use crate::relative_position_transformer::TransformerBlock;
+use crate::smolgen::SmolgenWeightGen;
 use burn::module::Param;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d};
 use burn::prelude::*;
-use burn::tensor::activation::{gelu, log_softmax, sigmoid, softmax, softplus};
+use burn::tensor::activation::{gelu, log_softmax, softmax, softplus};
+
+#[cfg(feature = "train")]
+use crate::forward_timing::{finish_and_log_forward_pass, start_forward_pass, TimingScope};
+#[cfg(feature = "train")]
+use crate::model_prediction_logger::log_model_predictions;
+#[cfg(feature = "train")]
+use crate::norm_debug::{log_tensor_stats, LayerScope, NormDebugScope, StreamScope};
+#[cfg(feature = "train")]
 use burn::tensor::backend::AutodiffBackend;
+#[cfg(feature = "train")]
 use burn::train::{TrainOutput, TrainStep, ValidStep};
+
+#[cfg(not(feature = "train"))]
+use crate::train_stubs::*;
 
 #[derive(Module, Debug)]
 pub struct OXIModel<B: Backend> {
     token_embed: Linear<B>,
     conv_layers: Vec<Conv2d<B>>,
     global_embed: Linear<B>,
-    // Per-stream normalization and gating to balance token/global embeddings
     token_norm: LayerNorm<B>,
     global_norm: LayerNorm<B>,
-    gate_logits: Param<Tensor<B, 1>>, // [2] -> softmax to get gates for [token, global]
+    gate_logits: Param<Tensor<B, 1>>,
+    smolgen_weight_gen: SmolgenWeightGen<B>,
     blocks: Vec<TransformerBlock<B>>,
     norm: LayerNorm<B>,
     policy_head: Linear<B>,
@@ -71,6 +81,8 @@ impl<B: Backend> OXIModel<B> {
         }
 
         let global_embed = LinearConfig::new(NUM_GLOBALS, base_embed_dim).init(device);
+
+        let smolgen_weight_gen = SmolgenWeightGen::new(device);
 
         let mut blocks = Vec::new();
         for _ in 0..config.num_layers() {
@@ -123,6 +135,7 @@ impl<B: Backend> OXIModel<B> {
             token_norm,
             global_norm,
             gate_logits,
+            smolgen_weight_gen,
             blocks,
             norm,
             policy_head,
@@ -152,6 +165,9 @@ impl<B: Backend> OXIModel<B> {
         board: Tensor<B, 3>,
         globals: Tensor<B, 2, Float>,
     ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
+        start_forward_pass();
+        let device = board.device();
+        let total_timing = TimingScope::new_with_sync::<B>("forward_total", &device);
         let _norm_scope = NormDebugScope::start("OXIModel::forward");
         let _root_stream = StreamScope::enter("root");
 
@@ -201,10 +217,16 @@ impl<B: Backend> OXIModel<B> {
             log_tensor_stats("embed.token_features_convolved", &token_features);
         }
 
-        let token_embeds = self.token_embed.forward(token_features);
+        let token_embeds = {
+            let _t = TimingScope::new_with_sync::<B>("token_embed", &device);
+            self.token_embed.forward(token_features)
+        };
         log_tensor_stats("embed.token_embeds", &token_embeds);
 
-        let global_embeds = self.global_embed.forward(globals.clone()).unsqueeze_dim(1);
+        let global_embeds = {
+            let _t = TimingScope::new_with_sync::<B>("global_embed", &device);
+            self.global_embed.forward(globals.clone()).unsqueeze_dim(1)
+        };
         log_tensor_stats("embed.global_embeds", &global_embeds);
         debug_assert_eq!(
             token_embeds.dims()[1],
@@ -247,10 +269,12 @@ impl<B: Backend> OXIModel<B> {
 
         {
             let _encoder_stream = StreamScope::enter("encoder");
+            let _encoder_timing = TimingScope::new_with_sync::<B>("encoder_blocks", &device);
             for (layer_idx, block) in self.blocks.iter().enumerate() {
                 let _layer_scope = LayerScope::enter(layer_idx);
+                let _block_timing = TimingScope::new_with_sync::<B>("encoder_block", &device);
                 log_tensor_stats("encoder.pre_block", &x);
-                x = block.forward(x);
+                x = block.forward(x, &self.smolgen_weight_gen);
                 log_tensor_stats("encoder.post_block", &x);
             }
         }
@@ -260,97 +284,27 @@ impl<B: Backend> OXIModel<B> {
 
         let policy_logits = {
             let _stream = StreamScope::enter("policy");
-            let tokens = self.policy_block.forward(x.clone());
+            let _timing = TimingScope::new_with_sync::<B>("policy_head", &device);
+            let tokens = {
+                let _t = TimingScope::new_with_sync::<B>("policy_block", &device);
+                self.policy_block
+                    .forward(x.clone(), &self.smolgen_weight_gen)
+            };
             log_tensor_stats("policy.tokens", &tokens);
             let logits = self.policy_head.forward(tokens);
             log_tensor_stats("policy.logits", &logits);
             logits
         };
 
-        let value_logits = {
-            let _stream = StreamScope::enter("value");
-            let value_tokens = self.value_block.forward(x.clone());
-            log_tensor_stats("value.tokens", &value_tokens);
-            let value_pool_hidden = self.value_pool_fc1.forward(value_tokens.clone());
-            log_tensor_stats("value.pool_fc1", &value_pool_hidden);
-            let value_pool_act = gelu(value_pool_hidden);
-            log_tensor_stats("value.pool_fc1_gelu", &value_pool_act);
-            let value_scores = self.value_pool_fc2.forward(value_pool_act);
-            log_tensor_stats("value.attn_scores", &value_scores);
-            let value_attn = softmax(value_scores.clone(), 1); // [batch, seq, 1]
-            log_tensor_stats("value.attn_weights", &value_attn);
-            let pooled_tokens = (value_tokens.clone() * value_attn.clone())
-                .sum_dim(1)
-                .squeeze_dim(1);
-            log_tensor_stats("value.pooled_tokens", &pooled_tokens);
-            let value_input = Tensor::cat(vec![pooled_tokens.clone(), globals.clone()], 1);
-            log_tensor_stats("value.concat_input", &value_input);
-            let value_hidden = gelu(self.value_head_hidden.forward(value_input));
-            log_tensor_stats("value.hidden", &value_hidden);
-            let logits = self.value_head.forward(value_hidden);
-            log_tensor_stats("value.logits", &logits);
-            logits
-        };
+        // Auxiliary heads disabled - return dummy zeros
+        // (parameters kept in struct for checkpoint compatibility)
+        let aux_batch_size = board.dims()[0];
+        let value_logits = Tensor::zeros([aux_batch_size, 3], &device);
+        let side_info_logits = Tensor::zeros([aux_batch_size, 13], &device);
+        let time_usage_logits = Tensor::zeros([aux_batch_size, 2], &device);
 
-        let side_info_logits = {
-            let _stream = StreamScope::enter("side_info");
-            let mean_features = x.clone().mean_dim(1).squeeze_dim(1);
-            log_tensor_stats("side.mean_features", &mean_features);
-            let logits = self.side_info_head.forward(mean_features);
-            log_tensor_stats("side.logits", &logits);
-            logits
-        };
-
-        let time_usage_logits = {
-            let _stream = StreamScope::enter("time");
-            let time_tokens = self.time_block.forward(x.clone());
-            log_tensor_stats("time.tokens", &time_tokens);
-            let time_pool_hidden = self.time_pool_fc1.forward(time_tokens.clone());
-            log_tensor_stats("time.pool_fc1", &time_pool_hidden);
-            let time_pool_act = gelu(time_pool_hidden);
-            log_tensor_stats("time.pool_fc1_gelu", &time_pool_act);
-            let time_scores = self.time_pool_fc2.forward(time_pool_act);
-            log_tensor_stats("time.attn_scores", &time_scores);
-            let time_attn = softmax(time_scores.clone(), 1); // [batch, seq, 1]
-            log_tensor_stats("time.attn_weights", &time_attn);
-            let time_pooled_tokens = (time_tokens.clone() * time_attn.clone())
-                .sum_dim(1)
-                .squeeze_dim(1);
-            log_tensor_stats("time.pooled_tokens", &time_pooled_tokens);
-            let time_input = Tensor::cat(vec![time_pooled_tokens.clone(), globals.clone()], 1);
-            log_tensor_stats("time.concat_input", &time_input);
-            let time_hidden = gelu(self.time_usage_head_hidden.forward(time_input));
-            log_tensor_stats("time.hidden", &time_hidden);
-            let time_usage_raw = self.time_usage_head.forward(time_hidden);
-            log_tensor_stats("time.raw_logits", &time_usage_raw);
-
-            // Reparameterize time usage outputs into Beta(alpha, beta)
-            let mean_raw = time_usage_raw
-                .clone()
-                .slice([0..time_usage_raw.dims()[0], 0..1]);
-            let concentration_raw = time_usage_raw
-                .clone()
-                .slice([0..time_usage_raw.dims()[0], 1..2]);
-            log_tensor_stats("time.mean_raw", &mean_raw);
-            log_tensor_stats("time.concentration_raw", &concentration_raw);
-
-            let eps = 1e-4f32;
-            let mean = sigmoid(mean_raw).clamp(eps, 1.0 - eps);
-            let min_concentration = 2.0;
-            let concentration = softplus(concentration_raw, 1.0).add_scalar(min_concentration);
-            log_tensor_stats("time.mean", &mean);
-            log_tensor_stats("time.concentration", &concentration);
-
-            let alphas = mean.clone() * concentration.clone();
-            let betas = (Tensor::ones_like(&mean) - mean) * concentration.clone();
-            log_tensor_stats("time.alphas", &alphas);
-            log_tensor_stats("time.betas", &betas);
-
-            let logits = Tensor::cat(vec![alphas, betas], 1);
-            log_tensor_stats("time.logits", &logits);
-            logits
-        };
-
+        drop(total_timing);
+        finish_and_log_forward_pass();
         (
             policy_logits,
             value_logits,
@@ -359,7 +313,8 @@ impl<B: Backend> OXIModel<B> {
         )
     }
 
-    pub fn forward_classification(&self, batch: crate::dataset::ChessBatch<B>) -> ChessOutput<B>
+    #[cfg(feature = "train")]
+    pub fn forward_classification(&self, batch: crate::dataset::ChessBatch<B>) -> crate::chess_output::ChessOutput<B>
     where
         B::FloatElem: From<f32>,
     {
@@ -607,11 +562,12 @@ impl<B: Backend> OXIModel<B> {
     }
 }
 
-impl<B: AutodiffBackend> TrainStep<crate::dataset::ChessBatch<B>, ChessOutput<B>> for OXIModel<B>
+#[cfg(feature = "train")]
+impl<B: AutodiffBackend> TrainStep<crate::dataset::ChessBatch<B>, crate::chess_output::ChessOutput<B>> for OXIModel<B>
 where
     B::FloatElem: From<f32>,
 {
-    fn step(&self, batch: crate::dataset::ChessBatch<B>) -> TrainOutput<ChessOutput<B>> {
+    fn step(&self, batch: crate::dataset::ChessBatch<B>) -> TrainOutput<crate::chess_output::ChessOutput<B>> {
         let item = self.forward_classification(batch);
         let grads = item.loss.backward();
 
@@ -619,11 +575,12 @@ where
     }
 }
 
-impl<B: Backend> ValidStep<crate::dataset::ChessBatch<B>, ChessOutput<B>> for OXIModel<B>
+#[cfg(feature = "train")]
+impl<B: Backend> ValidStep<crate::dataset::ChessBatch<B>, crate::chess_output::ChessOutput<B>> for OXIModel<B>
 where
     B::FloatElem: From<f32>,
 {
-    fn step(&self, batch: crate::dataset::ChessBatch<B>) -> ChessOutput<B> {
+    fn step(&self, batch: crate::dataset::ChessBatch<B>) -> crate::chess_output::ChessOutput<B> {
         self.forward_classification(batch)
     }
 }
@@ -635,7 +592,7 @@ mod tests {
     use burn::tensor::TensorData;
 
     #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Metal;
+    type TestBackend = burn::backend::Wgpu;
     #[cfg(not(target_os = "macos"))]
     type TestBackend = burn::backend::LibTorch<f32>;
 
