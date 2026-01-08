@@ -10,3 +10,4 @@ model
 .venv
 models
 train.log
+metrics_logs
