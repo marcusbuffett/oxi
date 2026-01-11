@@ -68,18 +68,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Wgpu;
-    #[cfg(not(target_os = "macos"))]
-    type TestBackend = burn::backend::LibTorch<f32>;
+    use crate::test_backend::{test_device, TestBackend};
 
     #[test]
     fn test_log_gamma_approx() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
         let x = Tensor::<TestBackend, 1>::from_floats([1.0, 2.0, 3.0, 4.0], &device);
         let result = log_gamma_approx(x);
 
@@ -105,7 +98,7 @@ mod tests {
 
     #[test]
     fn test_beta_log_pdf_matches_known_values() {
-        let device = Default::default();
+        let device = test_device();
         let x = Tensor::<TestBackend, 1>::from_floats([0.2, 0.5, 0.8], &device);
         let alpha = Tensor::<TestBackend, 1>::from_floats([2.0, 2.0, 2.0], &device);
         let beta = Tensor::<TestBackend, 1>::from_floats([3.0, 3.0, 3.0], &device);

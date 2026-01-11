@@ -1,0 +1,15 @@
+# Local development configuration
+# This file sets default features for cargo commands
+
+[build]
+# Default features for local development (macOS with LibTorch)
+# Override with --no-default-features --features "..." if needed
+
+[alias]
+# Convenient aliases for common commands
+t = "test --features backend-tch,train"
+c = "check --features backend-tch,train"
+b = "build --features backend-tch,train"
+r = "run --features backend-tch,train"
+br = "build --release --features backend-tch,train"
+rr = "run --release --features backend-tch,train"

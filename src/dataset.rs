@@ -69,6 +69,9 @@ pub struct ChessExample {
     pub move_count: usize,
     /// Material imbalance history for momentum calculation
     pub material_imbalance_history: Vec<i32>,
+    /// Whether this example comes from a puzzle (tactical training position)
+    #[serde(default)]
+    pub is_puzzle: bool,
 }
 
 /// Grouped dataset item - contains raw data with probability distributions
@@ -88,6 +91,7 @@ pub struct ChessItem {
     pub material_imbalance_history: Vec<i32>, // Material imbalance history for momentum
     // Global features (raw, unnormalized)
     pub global_features: GlobalFeatures,
+    pub is_puzzle: bool,
 }
 
 /// Grouped dataset for Oxi training
@@ -192,7 +196,6 @@ impl OXIDataset {
         assert!(example.original_time_control.0 > 0);
         let material_imbalance = compute_material_imbalance(&pos);
 
-        // Create global features from raw values
         let global_features = GlobalFeatures {
             time_remaining_self: example.time_remaining_self,
             time_remaining_oppo: example.time_remaining_oppo,
@@ -200,6 +203,7 @@ impl OXIDataset {
             increment: example.original_time_control.1,
             move_count: example.move_count,
             elo_self: example.elo_self,
+            is_puzzle: example.is_puzzle,
         };
 
         Ok(ChessItem {
@@ -216,6 +220,7 @@ impl OXIDataset {
             time_used_for_move: example.time_used_for_move,
             material_imbalance_history: example.material_imbalance_history.clone(),
             global_features,
+            is_puzzle: example.is_puzzle,
         })
     }
 

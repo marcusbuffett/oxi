@@ -2,6 +2,7 @@ pub mod config;
 pub mod constants;
 pub mod distribution_utils;
 pub mod encoding;
+pub mod factorized_policy;
 pub mod inference;
 pub mod model;
 pub mod move_encoding;
@@ -12,43 +13,52 @@ pub mod smolgen;
 #[cfg(not(feature = "train"))]
 pub mod train_stubs {
     use burn::prelude::*;
-    
+
     pub struct TimingScope;
     impl TimingScope {
-        pub fn new_with_sync<B: Backend>(_name: &str, _device: &B::Device) -> Self { Self }
+        pub fn new_with_sync<B: Backend>(_name: &str, _device: &B::Device) -> Self {
+            Self
+        }
     }
-    
+
     pub struct NormDebugScope;
     impl NormDebugScope {
-        pub fn start(_name: &str) -> Self { Self }
+        pub fn start(_name: &str) -> Self {
+            Self
+        }
     }
-    
+
     pub struct StreamScope;
     impl StreamScope {
-        pub fn enter(_name: &str) -> Self { Self }
+        pub fn enter(_name: &str) -> Self {
+            Self
+        }
     }
-    
+
     pub struct LayerScope;
     impl LayerScope {
-        pub fn enter(_idx: usize) -> Self { Self }
+        pub fn enter(_idx: usize) -> Self {
+            Self
+        }
     }
-    
+
     #[inline(always)]
     pub fn start_forward_pass() {}
-    
+
     #[inline(always)]
     pub fn finish_and_log_forward_pass() {}
-    
+
     #[inline(always)]
     pub fn log_tensor_stats<B: Backend, const D: usize>(_name: &str, _tensor: &Tensor<B, D>) {}
-    
+
     #[inline(always)]
     pub fn log_model_predictions<B: Backend, T>(
         _policy_logits: &Tensor<B, 2>,
         _value_logits: &Tensor<B, 2>,
         _time_usage_logits: &Tensor<B, 2>,
         _batch: &T,
-    ) {}
+    ) {
+    }
 }
 
 #[cfg(feature = "train")]
@@ -59,8 +69,6 @@ pub mod custom_training;
 pub mod dataset;
 #[cfg(feature = "train")]
 pub mod debug_prediction_monitor;
-#[cfg(feature = "train")]
-pub mod reduce_on_plateau_scheduler;
 #[cfg(feature = "train")]
 pub mod forward_timing;
 #[cfg(feature = "train")]
@@ -86,6 +94,10 @@ pub mod pgn_processor;
 #[cfg(feature = "train")]
 pub mod policy_loss_metric;
 #[cfg(feature = "train")]
+pub mod puzzle_processor;
+#[cfg(feature = "train")]
+pub mod reduce_on_plateau_scheduler;
+#[cfg(feature = "train")]
 pub mod time_usage_loss_metric;
 #[cfg(feature = "train")]
 pub mod training_stage_metric;
@@ -100,5 +112,7 @@ pub mod wdl_accuracy_metric;
 #[cfg(feature = "train")]
 pub mod weight_decay;
 
+#[cfg(test)]
+pub mod test_backend;
 #[cfg(test)]
 pub mod test_tensor_consistency;

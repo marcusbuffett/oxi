@@ -268,11 +268,7 @@ impl<B: Backend> SmolgenAttention<B> {
 mod tests {
     use super::*;
     use crate::config::{set_global_config, Config};
-
-    #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Wgpu;
-    #[cfg(not(target_os = "macos"))]
-    type TestBackend = burn::backend::LibTorch<f32>;
+    use crate::test_backend::{test_device, TestBackend};
 
     fn ensure_config() {
         let _ = set_global_config(Config::new(128, 2));
@@ -281,10 +277,7 @@ mod tests {
     #[test]
     fn smolgen_shapes() {
         ensure_config();
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
 
         let config = get_global_config();
         let smolgen = Smolgen::<TestBackend>::new(&device);
@@ -306,10 +299,7 @@ mod tests {
     #[test]
     fn smolgen_attention_shapes() {
         ensure_config();
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
 
         let config = get_global_config();
         let attention = SmolgenAttention::<TestBackend>::new(&device);

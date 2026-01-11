@@ -697,19 +697,12 @@ fn create_unicode_bar(length: usize, max_length: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_backend::{test_device, TestBackend};
     use burn::tensor::Tensor;
-
-    #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Wgpu;
-    #[cfg(not(target_os = "macos"))]
-    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_log_wdl_prediction() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
 
         // Create test tensor with value logits [loss, draw, win]
         let value_logits = Tensor::<TestBackend, 2>::from_data([[0.1, 0.2, 0.7]], &device);
@@ -726,10 +719,7 @@ mod tests {
 
     #[test]
     fn test_format_time_usage_distribution_snapshot() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
 
         // Create test tensor with gamma parameters that fit in 0-0.1 range
         // [alpha, beta]
@@ -746,10 +736,7 @@ mod tests {
 
     #[test]
     fn test_format_time_usage_distribution_edge_case() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
 
         // Test with parameters that create distributions in the 0-0.1 range
         let time_usage_logits =
@@ -766,10 +753,7 @@ mod tests {
 
     #[test]
     fn test_format_time_usage_distribution_high_variance() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
 
         // Test with high variance scenario that still fits in 0-0.1 range
         let time_usage_logits =

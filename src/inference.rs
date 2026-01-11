@@ -164,6 +164,8 @@ pub struct GlobalFeatures {
     pub move_count: usize,
     /// Self Elo rating
     pub elo_self: i32,
+    /// Whether this is a puzzle position
+    pub is_puzzle: bool,
 }
 
 /// Internal global features with material imbalance (used for prediction)
@@ -191,6 +193,8 @@ pub struct GlobalFeaturesInternal {
     pub elo_self: i32,
     /// Material imbalance history for momentum calculation
     pub material_imbalance_history: Vec<i32>,
+    /// Whether this is a puzzle position
+    pub is_puzzle: bool,
 }
 
 /// Normalized global features ready for model input
@@ -227,6 +231,7 @@ impl GlobalFeatures {
             move_count: self.move_count,
             elo_self: self.elo_self,
             material_imbalance_history,
+            is_puzzle: self.is_puzzle,
         }
     }
 }
@@ -276,9 +281,7 @@ impl GlobalFeaturesInternal {
             normalized.increment_ratio,
             normalized.move_count_normalized,
             normalized.elo_normalized,
-            // normalized.material_imbalance_normalized,
-            // normalized.momentum,   // normalized momentum [0,1]
-            // normalized.volatility, // normalized volatility [0,1]
+            if self.is_puzzle { 1.0 } else { 0.0 },
         ];
         assert_eq!(globals.len(), NUM_GLOBALS);
         globals
@@ -288,12 +291,13 @@ impl GlobalFeaturesInternal {
 impl Default for GlobalFeatures {
     fn default() -> Self {
         Self {
-            time_remaining_self: 1500, // 25 minutes
-            time_remaining_oppo: 1500, // 25 minutes
-            base_time: 1800,           // 30 minutes
+            time_remaining_self: 1500,
+            time_remaining_oppo: 1500,
+            base_time: 1800,
             increment: 0,
-            move_count: 20, // Mid-game
-            elo_self: 1500, // Average rating
+            move_count: 20,
+            elo_self: 1500,
+            is_puzzle: false,
         }
     }
 }
@@ -521,8 +525,7 @@ where
         let current_position = &positions[0];
         let is_black_to_move = current_position.turn() == Color::Black;
 
-        // Forward pass
-        let (policy_logits, value_logits, side_info_logits, time_usage_logits) =
+        let (policy_logits, value_logits, _side_info_logits, time_usage_logits) =
             self.model.forward(board_tensor, global_features_tensor);
 
         // Get legal moves mask

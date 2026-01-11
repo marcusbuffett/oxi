@@ -7,27 +7,20 @@ mod tests {
     use std::fs;
     use tempfile::NamedTempFile;
 
-    use crate::config::{set_global_config, Config, ModelConfig, FEATURES_PER_TOKEN, NUM_GLOBALS};
+    use crate::config::{set_global_config, Config, ModelConfig, FEATURES_PER_TOKEN};
     use crate::dataset::{ChessBatcher, OXIDataset};
     use crate::inference::{GlobalFeatures, InferenceEngine};
     use crate::model::OXIModel;
-
-    #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Wgpu;
-    #[cfg(not(target_os = "macos"))]
-    type TestBackend = burn::backend::LibTorch<f32>;
+    use crate::test_backend::{test_device, TestBackend};
 
     #[test]
     fn test_tensor_consistency_between_inference_and_dataset() {
-        // Initialize global config (required by PGN processor)
         let model_config = ModelConfig::default();
         let mut config = Config::default();
-        // Disable sampling so all moves are included
         config.enable_ply_sampling = Some(false);
         config.enable_elo_sampling = Some(false);
         let _ = set_global_config(config);
 
-        // Create a mock PGN file with the required format
         let pgn_content = r#"[Event "Test Game"]
 [Site "Test"]
 [Date "2024.01.01"]
@@ -42,14 +35,10 @@ mod tests {
 1. e4 { [%clk 1:30:00] } 1-0
 "#;
 
-        // Write to temporary file
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         fs::write(temp_file.path(), pgn_content).expect("Failed to write PGN content");
 
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
 
         // Load dataset from PGN
         let dataset =
@@ -83,6 +72,7 @@ mod tests {
             increment: chess_item.global_features.increment,
             move_count: chess_item.global_features.move_count,
             elo_self: chess_item.elo_self,
+            is_puzzle: chess_item.is_puzzle,
         };
 
         // Create inference engine to use the extracted method
@@ -174,25 +164,18 @@ mod tests {
     fn test_board_encoding_consistency() {
         use crate::encoding::encode_position;
 
-        // Test that the board encoding logic is the same
         let starting_position = Chess::default();
         let previous_positions: Vec<Chess> = vec![];
 
-        // Encode using the encoding module directly
         let encoded_board = encode_position(&starting_position, &previous_positions, &[]);
 
-        // Verify the encoding has the right shape
         assert_eq!(
             encoded_board.len(),
             64 * FEATURES_PER_TOKEN,
             "Encoded board should have 64 * FEATURES_PER_TOKEN elements"
         );
 
-        // Test that reshaping works as expected
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
         let board_tensor = Tensor::<TestBackend, 1>::from_floats(encoded_board.as_slice(), &device)
             .reshape([1, 64, FEATURES_PER_TOKEN]);
 

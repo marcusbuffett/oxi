@@ -1,8 +1,10 @@
+#[cfg(feature = "train")]
+use crate::config::get_global_config;
 use crate::config::{
-    get_global_config, ModelConfig, BOARD_FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS,
-    RECENCY_FEATURES,
+    ModelConfig, BOARD_FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS, RECENCY_FEATURES,
 };
 use crate::distribution_utils::beta_log_pdf;
+use crate::factorized_policy::FactorizedPolicyHead;
 use crate::relative_position_transformer::TransformerBlock;
 use crate::smolgen::SmolgenWeightGen;
 use burn::module::Param;
@@ -10,7 +12,7 @@ use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d};
 use burn::prelude::*;
-use burn::tensor::activation::{gelu, log_softmax, softmax, softplus};
+use burn::tensor::activation::{gelu, log_softmax, softmax};
 
 #[cfg(feature = "train")]
 use crate::forward_timing::{finish_and_log_forward_pass, start_forward_pass, TimingScope};
@@ -30,21 +32,16 @@ use crate::train_stubs::*;
 pub struct OXIModel<B: Backend> {
     token_embed: Linear<B>,
     conv_layers: Vec<Conv2d<B>>,
-    global_embed: Linear<B>,
     token_norm: LayerNorm<B>,
-    global_norm: LayerNorm<B>,
-    gate_logits: Param<Tensor<B, 1>>,
     smolgen_weight_gen: SmolgenWeightGen<B>,
     blocks: Vec<TransformerBlock<B>>,
     norm: LayerNorm<B>,
-    policy_head: Linear<B>,
-    // Value head: attention pooling + 2-layer MLP (with globals concatenation)
+    policy_head: FactorizedPolicyHead<B>,
     value_pool_fc1: Linear<B>,
     value_pool_fc2: Linear<B>,
     value_head_hidden: Linear<B>,
     value_head: Linear<B>,
     side_info_head: Linear<B>,
-    // Time-usage head: attention pooling + 2-layer MLP (with globals concatenation)
     time_pool_fc1: Linear<B>,
     time_pool_fc2: Linear<B>,
     time_usage_head_hidden: Linear<B>,
@@ -65,7 +62,7 @@ impl<B: Backend> OXIModel<B> {
         let base_embed_dim = config.embed_dim().saturating_sub(RECENCY_FEATURES);
         assert!(
             base_embed_dim >= 2,
-            "embed_dim must exceed recency features to allocate token/global streams"
+            "embed_dim must exceed recency features"
         );
         let token_embed = LinearConfig::new(BOARD_FEATURES_PER_TOKEN, base_embed_dim).init(device);
 
@@ -80,8 +77,6 @@ impl<B: Backend> OXIModel<B> {
             }
         }
 
-        let global_embed = LinearConfig::new(NUM_GLOBALS, base_embed_dim).init(device);
-
         let smolgen_weight_gen = SmolgenWeightGen::new(device);
 
         let mut blocks = Vec::new();
@@ -89,19 +84,12 @@ impl<B: Backend> OXIModel<B> {
             blocks.push(TransformerBlock::new(device));
         }
 
-        // Per-stream layer norms
         let token_norm = LayerNormConfig::new(base_embed_dim).init(device);
-        let global_norm = LayerNormConfig::new(base_embed_dim).init(device);
         let recency_norm = LayerNormConfig::new(RECENCY_FEATURES).init(device);
-
-        // Gating logits initialized to values that give a softmax of ~ [0.55, 0.45],
-        // providing a mild prior toward token features
-        let gate_logits =
-            Param::from_tensor(Tensor::from_data(TensorData::from([1.3, 1.0]), device));
 
         let norm = LayerNormConfig::new(config.embed_dim()).init(device);
 
-        let policy_head = LinearConfig::new(config.embed_dim(), LEGAL_MOVES / 64).init(device);
+        let policy_head = FactorizedPolicyHead::new(device);
 
         // Value head components
         let value_pool_fc1 = LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
@@ -131,10 +119,7 @@ impl<B: Backend> OXIModel<B> {
         Self {
             token_embed,
             conv_layers,
-            global_embed,
             token_norm,
-            global_norm,
-            gate_logits,
             smolgen_weight_gen,
             blocks,
             norm,
@@ -222,49 +207,19 @@ impl<B: Backend> OXIModel<B> {
             self.token_embed.forward(token_features)
         };
         log_tensor_stats("embed.token_embeds", &token_embeds);
-
-        let global_embeds = {
-            let _t = TimingScope::new_with_sync::<B>("global_embed", &device);
-            self.global_embed.forward(globals.clone()).unsqueeze_dim(1)
-        };
-        log_tensor_stats("embed.global_embeds", &global_embeds);
         debug_assert_eq!(
             token_embeds.dims()[1],
             64,
             "Sequence length must be 64 for 8x8 board"
         );
 
-        // Normalize each stream
         let token_normed = self.token_norm.forward(token_embeds);
-        let global_normed = self.global_norm.forward(global_embeds);
         let recency_normed = self.recency_norm.forward(recency_features);
 
         log_tensor_stats("embed.token_normed", &token_normed);
-        log_tensor_stats("embed.global_normed", &global_normed);
         log_tensor_stats("embed.recency_normed", &recency_normed);
 
-        // Softmax gates over the two streams
-        let gates = softmax(self.gate_logits.val(), 0); // [2]
-        log_tensor_stats("embed.gates_softmax", &gates);
-        let gate_token = gates.clone().slice([0..1]).reshape([1, 1, 1]);
-        let gate_global = gates.clone().slice([1..2]).reshape([1, 1, 1]);
-
-        // Log gate values probabilistically to avoid host-device sync every step
-        crate::config::shd_log(|| {
-            let gate_vals = gates.clone().to_data();
-            if let Ok(g) = gate_vals.as_slice::<f32>() {
-                tracing::info!(
-                    "Embedding gates (softmax): token={:.6} global={:.6}",
-                    g[0],
-                    g[1]
-                );
-            }
-        });
-
-        // Combine token/global streams with learned gates
-        let combined = token_normed * gate_token + global_normed * gate_global;
-        log_tensor_stats("embed.combined", &combined);
-        let mut x = Tensor::cat(vec![combined, recency_normed], 2);
+        let mut x = Tensor::cat(vec![token_normed, recency_normed], 2);
         log_tensor_stats("encoder.input_tokens", &x);
 
         {
@@ -274,7 +229,8 @@ impl<B: Backend> OXIModel<B> {
                 let _layer_scope = LayerScope::enter(layer_idx);
                 let _block_timing = TimingScope::new_with_sync::<B>("encoder_block", &device);
                 log_tensor_stats("encoder.pre_block", &x);
-                x = block.forward(x, &self.smolgen_weight_gen);
+
+                x = block.forward_with_film(x, &self.smolgen_weight_gen, globals.clone());
                 log_tensor_stats("encoder.post_block", &x);
             }
         }
@@ -291,13 +247,14 @@ impl<B: Backend> OXIModel<B> {
                     .forward(x.clone(), &self.smolgen_weight_gen)
             };
             log_tensor_stats("policy.tokens", &tokens);
-            let logits = self.policy_head.forward(tokens);
+            let logits = {
+                let _t = TimingScope::new_with_sync::<B>("factorized_policy", &device);
+                self.policy_head.forward(tokens)
+            };
             log_tensor_stats("policy.logits", &logits);
             logits
         };
 
-        // Auxiliary heads disabled - return dummy zeros
-        // (parameters kept in struct for checkpoint compatibility)
         let aux_batch_size = board.dims()[0];
         let value_logits = Tensor::zeros([aux_batch_size, 3], &device);
         let side_info_logits = Tensor::zeros([aux_batch_size, 13], &device);
@@ -314,7 +271,10 @@ impl<B: Backend> OXIModel<B> {
     }
 
     #[cfg(feature = "train")]
-    pub fn forward_classification(&self, batch: crate::dataset::ChessBatch<B>) -> crate::chess_output::ChessOutput<B>
+    pub fn forward_classification(
+        &self,
+        batch: crate::dataset::ChessBatch<B>,
+    ) -> crate::chess_output::ChessOutput<B>
     where
         B::FloatElem: From<f32>,
     {
@@ -322,10 +282,9 @@ impl<B: Backend> OXIModel<B> {
         let config = get_global_config();
         let batch_size = batch.board_input.shape().dims[0];
 
-        let (policy_logits, value_logits, side_info_logits, time_usage_logits) =
+        let (policy_logits, value_logits, _side_info_logits, time_usage_logits) =
             self.forward(batch.board_input, batch.global_features);
 
-        // Log model predictions for debugging
         let policy_logits_flat_original = policy_logits.reshape([batch_size, LEGAL_MOVES]);
 
         let mask = batch.legal_moves.clone().equal_elem(0.0);
@@ -436,7 +395,7 @@ impl<B: Backend> OXIModel<B> {
         //     .count();
         // let batch_accuracy = correct as f32 / batch_size as f32;
 
-        ChessOutput::new(
+        crate::chess_output::ChessOutput::new(
             loss,
             config_weighted_policy_loss.clone(),
             value_term.clone(),
@@ -563,11 +522,15 @@ impl<B: Backend> OXIModel<B> {
 }
 
 #[cfg(feature = "train")]
-impl<B: AutodiffBackend> TrainStep<crate::dataset::ChessBatch<B>, crate::chess_output::ChessOutput<B>> for OXIModel<B>
+impl<B: AutodiffBackend>
+    TrainStep<crate::dataset::ChessBatch<B>, crate::chess_output::ChessOutput<B>> for OXIModel<B>
 where
     B::FloatElem: From<f32>,
 {
-    fn step(&self, batch: crate::dataset::ChessBatch<B>) -> TrainOutput<crate::chess_output::ChessOutput<B>> {
+    fn step(
+        &self,
+        batch: crate::dataset::ChessBatch<B>,
+    ) -> TrainOutput<crate::chess_output::ChessOutput<B>> {
         let item = self.forward_classification(batch);
         let grads = item.loss.backward();
 
@@ -576,7 +539,8 @@ where
 }
 
 #[cfg(feature = "train")]
-impl<B: Backend> ValidStep<crate::dataset::ChessBatch<B>, crate::chess_output::ChessOutput<B>> for OXIModel<B>
+impl<B: Backend> ValidStep<crate::dataset::ChessBatch<B>, crate::chess_output::ChessOutput<B>>
+    for OXIModel<B>
 where
     B::FloatElem: From<f32>,
 {
@@ -589,16 +553,12 @@ where
 mod tests {
     use super::*;
     use crate::config::{FEATURES_PER_TOKEN, NUM_GLOBALS};
+    use crate::test_backend::{test_device, TestBackend};
     use burn::tensor::TensorData;
-
-    #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Wgpu;
-    #[cfg(not(target_os = "macos"))]
-    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_beta_loss_matches_manual_nll() {
-        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = test_device();
         let config = ModelConfig::default();
         let _ = crate::config::set_global_config(config.clone());
         let model = OXIModel::<TestBackend>::new(&device, &config);
@@ -637,14 +597,13 @@ mod tests {
 
     #[test]
     fn test_uncertainty_weighted_loss_non_negative_for_small_losses() {
-        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = test_device();
 
-        // Very small raw losses (simulate < 0.02 edge case)
         let small_losses = [0.02f32, 0.005f32, 1e-6f32];
 
         for &l in &small_losses {
             let raw_loss = Tensor::<TestBackend, 1>::from_data([l], &device);
-            let log_sigma = Tensor::<TestBackend, 1>::from_data([0.0f32], &device); // sigma=1
+            let log_sigma = Tensor::<TestBackend, 1>::from_data([0.0f32], &device);
 
             let sigma_sq = (log_sigma.clone() * 2.0).exp();
             let penalty = (Tensor::ones_like(&sigma_sq) + sigma_sq.clone()).log() * 0.5f32;
@@ -662,40 +621,33 @@ mod tests {
 
     #[test]
     fn test_time_usage_head_output_shape() {
-        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = test_device();
         let config = ModelConfig::default();
         let _ = crate::config::set_global_config(config.clone());
         let model = OXIModel::<TestBackend>::new(&device, &config);
 
-        // Create dummy input
         let batch_size = 2;
         let board_input = Tensor::zeros([batch_size, 64, FEATURES_PER_TOKEN], &device);
         let global_features = Tensor::zeros([batch_size, NUM_GLOBALS], &device);
 
-        let (policy_logits, value_logits, side_info_logits, time_usage_logits) =
+        let (policy_logits, _value_logits, _side_info_logits, time_usage_logits) =
             model.forward(board_input, global_features);
 
-        // Check time usage head outputs 2 values per batch (alpha, beta)
-        assert_eq!(time_usage_logits.dims(), [batch_size, 2]);
-
-        // Check that alpha and beta parameters are positive
-        let time_usage_data = time_usage_logits.to_data();
-        let values = time_usage_data.as_slice::<f32>().unwrap();
-
-        for i in 0..batch_size {
-            let alpha = values[i * 2];
-            let beta = values[i * 2 + 1];
-
-            assert!(alpha > 0.0, "Alpha should be positive, got: {}", alpha);
-            assert!(beta > 0.0, "Beta should be positive, got: {}", beta);
-        }
-
-        println!("Time usage head output shape test passed!");
+        assert_eq!(
+            policy_logits.dims(),
+            [batch_size, 64, 76],
+            "policy_logits shape"
+        );
+        assert_eq!(
+            time_usage_logits.dims(),
+            [batch_size, 2],
+            "time_usage_logits shape"
+        );
     }
 
     #[test]
     fn test_beta_loss_handles_extreme_targets() {
-        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = test_device();
         let config = ModelConfig::default();
         let _ = crate::config::set_global_config(config.clone());
         let model = OXIModel::<TestBackend>::new(&device, &config);

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, task};
 
-use oxi::config::{set_global_config, Config};
-use oxi::constants::TCEC_DOWNLOAD_URL;
+use oxi::config::{set_global_config, Config, ConfigOverrides};
+use oxi::constants::{LICHESS_PUZZLE_URL, TCEC_DOWNLOAD_URL};
 use oxi::custom_training::train_custom;
 use oxi::inference::InferenceEngine;
 
@@ -46,7 +46,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Train a new Oxi model
-    Train(Config),
+    Train(ConfigOverrides),
 
     /// Run inference on chess positions
     Inference(InferenceConfig),
@@ -91,7 +91,12 @@ enum Commands {
 
     /// Download TCEC (Top Chess Engine Championship) games for pretraining
     DownloadTcec {
-        /// Data directory (TCEC files will be downloaded to <data-path>/tcec)
+        #[arg(long, default_value = "/lambda/nfs/chessbook")]
+        data_path: PathBuf,
+    },
+
+    /// Download Lichess puzzle database
+    DownloadPuzzles {
         #[arg(long, default_value = "/lambda/nfs/chessbook")]
         data_path: PathBuf,
     },
@@ -181,7 +186,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Train(config) => {
+        Commands::Train(overrides) => {
+            let config = Config::with_overrides(overrides);
             let _guard = oxi::custom_training::init_train_logging(config.log_dir.as_deref());
             tracing::info!("Starting training with config: {:?}", config);
             set_global_config(config.clone()).unwrap();
@@ -412,6 +418,13 @@ async fn main() -> Result<()> {
             download_tcec_games(&tcec_dir).await?;
             Ok(())
         }
+
+        Commands::DownloadPuzzles { data_path } => {
+            let puzzles_dir = data_path.join("puzzles");
+            tracing::info!("Downloading Lichess puzzles to {:?}", puzzles_dir);
+            download_puzzles(&puzzles_dir).await?;
+            Ok(())
+        }
     }
 }
 
@@ -612,6 +625,60 @@ async fn download_tcec_games(output_dir: &PathBuf) -> Result<()> {
 
     println!("\nTCEC games ready at: {}", output_dir.display());
     println!("Use --pretrain-samples N with train command to pretrain on these games");
+    Ok(())
+}
+
+async fn download_puzzles(output_dir: &PathBuf) -> Result<()> {
+    std::fs::create_dir_all(output_dir)?;
+
+    let zst_filename = "lichess_db_puzzle.csv.zst";
+    let zst_path = output_dir.join(zst_filename);
+
+    if zst_path.exists() {
+        println!("Puzzle database already downloaded: {}", zst_path.display());
+    } else {
+        println!("Downloading Lichess puzzles from {}", LICHESS_PUZZLE_URL);
+
+        let client = reqwest::Client::new();
+        let response = client.get(LICHESS_PUZZLE_URL).send().await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "Failed to download puzzle database: HTTP {}",
+                response.status()
+            );
+        }
+
+        let total_size = response.content_length().unwrap_or(0);
+        println!("File size: {} MB", total_size / 1_048_576);
+
+        let mut file = tokio::fs::File::create(&zst_path).await?;
+        let mut downloaded = 0u64;
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+
+            if total_size > 0 && downloaded % (10 * 1_048_576) == 0 {
+                let progress = (downloaded as f64 / total_size as f64 * 100.0).min(100.0);
+                println!(
+                    "Progress: {:.1}% ({} / {} MB)",
+                    progress,
+                    downloaded / 1_048_576,
+                    total_size / 1_048_576
+                );
+            }
+        }
+
+        println!("Download complete: {}", zst_path.display());
+    }
+
+    println!("\nPuzzle database ready at: {}", zst_path.display());
+    println!(
+        "File is kept compressed (.csv.zst) - puzzle_processor handles decompression on the fly"
+    );
     Ok(())
 }
 

@@ -293,6 +293,7 @@ fn build_debug_position(dataset: &OXIDataset, spec: &DebugPositionSpec) -> Resul
         original_time_control: (base_time, increment),
         move_count,
         material_imbalance_history: material_history,
+        is_puzzle: false,
     };
 
     let item = dataset

@@ -77,19 +77,12 @@ impl<B: Backend> Numeric for LegalMoveProbabilityMetric<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_backend::{test_device, TestBackend};
     use burn::data::dataloader::Progress;
-
-    #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Wgpu;
-    #[cfg(not(target_os = "macos"))]
-    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_legal_move_probability_perfect() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
         let mut metric = LegalMoveProbabilityMetric::<TestBackend>::new();
 
         // Create test data: 2 positions with different numbers of legal moves
@@ -146,10 +139,7 @@ mod tests {
 
     #[test]
     fn test_legal_move_probability_batch() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
         let mut metric = LegalMoveProbabilityMetric::<TestBackend>::new();
 
         // Test batch with mixed legal move counts

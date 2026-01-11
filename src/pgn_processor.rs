@@ -224,6 +224,7 @@ impl Visitor for PgnVisitor {
                                     move_count,
                                     material_imbalance_history: pending_example
                                         .material_imbalance_history,
+                                    is_puzzle: false,
                                 });
                             }
                         };
@@ -470,6 +471,7 @@ impl Visitor for PgnVisitor {
                         original_time_control: self.time_control.expect("time control"),
                         move_count,
                         material_imbalance_history,
+                        is_puzzle: false,
                     });
                 }
             } else {
@@ -1597,6 +1599,7 @@ mod tests {
             original_time_control: (300, 0),
             move_count: 5,
             material_imbalance_history: vec![0, 0, 0], // Starting position material imbalance is 0
+            is_puzzle: false,
         };
 
         // Verify the structure

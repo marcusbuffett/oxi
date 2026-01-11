@@ -1,11 +1,11 @@
-use clap::Parser;
+use clap::{Args, Parser};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
 
-pub const NUM_GLOBALS: usize = 7;
+pub const NUM_GLOBALS: usize = 8;
 pub const LEGAL_MOVES: usize = 64 * 76;
 // Per-square features (current position only):
 // - 12 piece one-hots (white/black 6 each)
@@ -41,7 +41,7 @@ static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 /// Minimum Elo rating for both players to include games
 pub const MIN_ELO: i32 = 1000;
 pub const MIN_PLY: usize = 0;
-pub const MAX_ELO: i32 = 2500;
+pub const MAX_ELO: i32 = 3000;
 pub const MAX_ELO_DIFF: i32 = 200;
 pub const MIN_TIME_CONTROL: u32 = 61;
 
@@ -208,10 +208,6 @@ pub struct Config {
     #[arg(long, default_value = "8")]
     pub num_heads: usize,
 
-    /// MLP hidden dimension ratio
-    #[arg(long, default_value = "4.0")]
-    pub mlp_ratio: f32,
-
     /// Number of convolutional layers applied over the 8x8 board grid before token embedding
     #[arg(long, default_value = "0")]
     #[serde(default)]
@@ -295,6 +291,455 @@ pub struct Config {
     /// 2.0 = 3x boost, 3.0 = 4x boost. Set to 0.0 to disable.
     #[arg(long, default_value = "3.0")]
     pub elo_priority_boost: f64,
+
+    /// Ratio of puzzle examples to mix into training (0.0 to 1.0). Default 0.2 = 20% puzzles.
+    #[arg(long, default_value = "0.2")]
+    pub puzzle_sampling_ratio: f64,
+
+    /// Path to puzzle CSV file (defaults to <data-path>/puzzles/lichess_db_puzzle.csv.zst)
+    #[arg(long)]
+    pub puzzle_path: Option<std::path::PathBuf>,
+}
+
+/// Command-line overrides for Config. All fields are optional.
+/// Use `Config::with_overrides()` to merge with defaults.
+#[derive(Debug, Clone, Args, Default)]
+pub struct ConfigOverrides {
+    /// Path to data (PGN directory, PGN file, or CSV file)
+    #[arg(long)]
+    pub data_path: Option<std::path::PathBuf>,
+
+    /// Directory for training logs (train.log, metrics_logs/)
+    #[arg(long)]
+    pub log_dir: Option<std::path::PathBuf>,
+
+    #[arg(long)]
+    pub max_samples: Option<usize>,
+
+    /// Number of initial samples to skip during PGN processing
+    #[arg(long)]
+    pub skip: Option<usize>,
+
+    #[arg(long)]
+    pub timeout: Option<u64>,
+
+    /// Resume training from the last saved model checkpoint
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub resume: Option<bool>,
+
+    /// Ratio of data used for training (vs validation)
+    #[arg(long)]
+    pub train_ratio: Option<f32>,
+
+    /// Batch size for training
+    #[arg(long)]
+    pub batch_size: Option<usize>,
+
+    /// Physical batch size (for gradient accumulation)
+    #[arg(long)]
+    pub physical_batch_size: Option<usize>,
+
+    /// Random seed for reproducibility
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Number of data loader workers
+    #[arg(long)]
+    pub num_workers: Option<usize>,
+
+    /// Minimum learning rate (end of training)
+    #[arg(long)]
+    pub lr_min: Option<f64>,
+
+    /// Window size for plateau detection (number of iterations to compare)
+    #[arg(long)]
+    pub lr_window_size: Option<usize>,
+
+    /// Minimum relative improvement threshold for plateau detection
+    #[arg(long)]
+    pub lr_improvement_threshold: Option<f64>,
+
+    /// Factor to reduce learning rate by when plateau is detected
+    #[arg(long)]
+    pub lr_reduction_factor: Option<f64>,
+
+    /// Multiplier applied to the learning rate calculated from batch size
+    #[arg(long)]
+    pub lr_multiplier: Option<f64>,
+
+    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size samples
+    #[arg(long)]
+    pub warmup_multiplier: Option<f64>,
+
+    /// Weight for policy loss
+    #[arg(long)]
+    pub policy_loss_weight: Option<f32>,
+
+    /// Label smoothing applied to the policy targets
+    #[arg(long)]
+    pub policy_label_smoothing: Option<f32>,
+
+    /// Weight for value loss
+    #[arg(long)]
+    pub value_loss_weight: Option<f32>,
+
+    /// Entropy regularization weight for value predictions
+    #[arg(long)]
+    pub value_entropy_weight: Option<f32>,
+
+    /// Weight for time usage loss
+    #[arg(long)]
+    pub time_usage_loss_weight: Option<f32>,
+
+    /// Weight decay for optimizer
+    #[arg(long)]
+    pub weight_decay: Option<f64>,
+
+    /// Gradient clipping norm (0 to disable)
+    #[arg(long)]
+    pub gradient_clip: Option<f64>,
+
+    /// Enable verbose gradient norm breakdown logging
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub log_gradient_breakdown: Option<bool>,
+
+    /// Number of attention heads to include when logging gradient breakdowns
+    #[arg(long)]
+    pub gradient_head_limit: Option<usize>,
+
+    /// Number of layers/modules to include when logging gradient breakdowns
+    #[arg(long)]
+    pub gradient_layer_limit: Option<usize>,
+
+    /// Enable adaptive GradNorm reweighting across heads
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub enable_gradnorm: Option<bool>,
+
+    /// Optimizer steps between GradNorm weight updates
+    #[arg(long)]
+    pub gradnorm_interval: Option<usize>,
+
+    /// Alpha hyperparameter for GradNorm target scaling
+    #[arg(long)]
+    pub gradnorm_alpha: Option<f32>,
+
+    /// Multiplicative learning rate used when adjusting GradNorm weights
+    #[arg(long)]
+    pub gradnorm_learning_rate: Option<f32>,
+
+    /// Priority multiplier applied to policy GradNorm target
+    #[arg(long)]
+    pub gradnorm_policy_priority: Option<f32>,
+
+    /// Priority multiplier applied to value GradNorm target
+    #[arg(long)]
+    pub gradnorm_value_priority: Option<f32>,
+
+    /// Priority multiplier applied to time-usage GradNorm target
+    #[arg(long)]
+    pub gradnorm_time_priority: Option<f32>,
+
+    /// Number of samples to materialize on the lead device when probing GradNorm weights
+    #[arg(long)]
+    pub gradnorm_probe_size: Option<usize>,
+
+    /// Embedding dimension for tokens
+    #[arg(long)]
+    pub embed_dim: Option<usize>,
+
+    /// Number of transformer layers
+    #[arg(long)]
+    pub num_layers: Option<usize>,
+
+    /// Number of attention heads
+    #[arg(long)]
+    pub num_heads: Option<usize>,
+
+    /// Number of convolutional layers applied over the 8x8 board grid
+    #[arg(long)]
+    pub conv_layers: Option<usize>,
+
+    /// Only include positions with a single legal move
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub single_legal_move_only: Option<bool>,
+
+    /// Disable terminal UI
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub disable_tui: Option<bool>,
+
+    /// Only include positions that are checkmate
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub checkmate_only: Option<bool>,
+
+    /// Probability of logging individual items for debugging
+    #[arg(long)]
+    pub item_log_probability: Option<f32>,
+
+    /// Enable detailed tensor norm logging during forward passes
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub log_tensor_norms: Option<bool>,
+
+    /// Maximum number of tensor elements to print when previewing small tensors
+    #[arg(long)]
+    pub norm_preview_limit: Option<usize>,
+
+    /// Focal loss gamma parameter for policy head
+    #[arg(long)]
+    pub focal_loss_gamma: Option<f32>,
+
+    /// Smolgen hidden dimension
+    #[arg(long)]
+    pub smolgen_hidden: Option<usize>,
+
+    /// Smolgen global dimension
+    #[arg(long)]
+    pub smolgen_global_dim: Option<usize>,
+
+    /// Smolgen generator size
+    #[arg(long)]
+    pub smolgen_gen_size: Option<usize>,
+
+    /// Enable forward pass timing instrumentation
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub enable_forward_timing: Option<bool>,
+
+    /// Sample interval for forward timing
+    #[arg(long)]
+    pub forward_timing_interval: Option<u64>,
+
+    /// Number of devices to use
+    #[arg(long)]
+    pub num_devices: Option<usize>,
+
+    /// Enable ply-based position sampling
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub enable_ply_sampling: Option<bool>,
+
+    /// Enable Elo-based game sampling
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub enable_elo_sampling: Option<bool>,
+
+    /// Number of iterations between checkpoints
+    #[arg(long)]
+    pub checkpoint_interval: Option<usize>,
+
+    /// Number of TCEC samples to use for pretraining
+    #[arg(long)]
+    pub pretrain_samples: Option<usize>,
+
+    /// Size of shuffle buffer for streaming data loading
+    #[arg(long)]
+    pub shuffle_buffer_size: Option<usize>,
+
+    /// Interval for computing expensive metrics
+    #[arg(long)]
+    pub full_metrics_interval: Option<usize>,
+
+    /// Priority boost for advanced/expert ELO games
+    #[arg(long)]
+    pub elo_priority_boost: Option<f64>,
+
+    /// Ratio of puzzle examples to mix into training (0.0 to 1.0)
+    #[arg(long)]
+    pub puzzle_sampling_ratio: Option<f64>,
+
+    /// Path to puzzle CSV file
+    #[arg(long)]
+    pub puzzle_path: Option<std::path::PathBuf>,
+}
+
+impl Config {
+    /// Create a Config from defaults, applying any overrides that are Some
+    pub fn with_overrides(overrides: ConfigOverrides) -> Self {
+        let mut config = Config::default();
+
+        if let Some(v) = overrides.data_path {
+            config.data_path = Some(v);
+        }
+        if let Some(v) = overrides.log_dir {
+            config.log_dir = Some(v);
+        }
+        if let Some(v) = overrides.max_samples {
+            config.max_samples = Some(v);
+        }
+        if let Some(v) = overrides.skip {
+            config.skip = Some(v);
+        }
+        if let Some(v) = overrides.timeout {
+            config.timeout = Some(v);
+        }
+        if let Some(v) = overrides.resume {
+            config.resume = Some(v);
+        }
+        if let Some(v) = overrides.train_ratio {
+            config.train_ratio = v;
+        }
+        if let Some(v) = overrides.batch_size {
+            config.batch_size = Some(v);
+        }
+        if let Some(v) = overrides.physical_batch_size {
+            config.physical_batch_size = v;
+        }
+        if let Some(v) = overrides.seed {
+            config.seed = v;
+        }
+        if let Some(v) = overrides.num_workers {
+            config.num_workers = v;
+        }
+        if let Some(v) = overrides.lr_min {
+            config.lr_min = v;
+        }
+        if let Some(v) = overrides.lr_window_size {
+            config.lr_window_size = v;
+        }
+        if let Some(v) = overrides.lr_improvement_threshold {
+            config.lr_improvement_threshold = v;
+        }
+        if let Some(v) = overrides.lr_reduction_factor {
+            config.lr_reduction_factor = v;
+        }
+        if let Some(v) = overrides.lr_multiplier {
+            config.lr_multiplier = v;
+        }
+        if let Some(v) = overrides.warmup_multiplier {
+            config.warmup_multiplier = v;
+        }
+        if let Some(v) = overrides.policy_loss_weight {
+            config.policy_loss_weight = v;
+        }
+        if let Some(v) = overrides.policy_label_smoothing {
+            config.policy_label_smoothing = v;
+        }
+        if let Some(v) = overrides.value_loss_weight {
+            config.value_loss_weight = v;
+        }
+        if let Some(v) = overrides.value_entropy_weight {
+            config.value_entropy_weight = v;
+        }
+        if let Some(v) = overrides.time_usage_loss_weight {
+            config.time_usage_loss_weight = v;
+        }
+        if let Some(v) = overrides.weight_decay {
+            config.weight_decay = v;
+        }
+        if let Some(v) = overrides.gradient_clip {
+            config.gradient_clip = v;
+        }
+        if let Some(v) = overrides.log_gradient_breakdown {
+            config.log_gradient_breakdown = Some(v);
+        }
+        if let Some(v) = overrides.gradient_head_limit {
+            config.gradient_head_limit = v;
+        }
+        if let Some(v) = overrides.gradient_layer_limit {
+            config.gradient_layer_limit = v;
+        }
+        if let Some(v) = overrides.enable_gradnorm {
+            config.enable_gradnorm = Some(v);
+        }
+        if let Some(v) = overrides.gradnorm_interval {
+            config.gradnorm_interval = v;
+        }
+        if let Some(v) = overrides.gradnorm_alpha {
+            config.gradnorm_alpha = v;
+        }
+        if let Some(v) = overrides.gradnorm_learning_rate {
+            config.gradnorm_learning_rate = v;
+        }
+        if let Some(v) = overrides.gradnorm_policy_priority {
+            config.gradnorm_policy_priority = v;
+        }
+        if let Some(v) = overrides.gradnorm_value_priority {
+            config.gradnorm_value_priority = v;
+        }
+        if let Some(v) = overrides.gradnorm_time_priority {
+            config.gradnorm_time_priority = v;
+        }
+        if let Some(v) = overrides.gradnorm_probe_size {
+            config.gradnorm_probe_size = v;
+        }
+        if let Some(v) = overrides.embed_dim {
+            config.embed_dim = v;
+        }
+        if let Some(v) = overrides.num_layers {
+            config.num_layers = v;
+        }
+        if let Some(v) = overrides.num_heads {
+            config.num_heads = v;
+        }
+
+        if let Some(v) = overrides.conv_layers {
+            config.conv_layers = v;
+        }
+        if let Some(v) = overrides.single_legal_move_only {
+            config.single_legal_move_only = Some(v);
+        }
+        if let Some(v) = overrides.disable_tui {
+            config.disable_tui = Some(v);
+        }
+        if let Some(v) = overrides.checkmate_only {
+            config.checkmate_only = Some(v);
+        }
+        if let Some(v) = overrides.item_log_probability {
+            config.item_log_probability = v;
+        }
+        if let Some(v) = overrides.log_tensor_norms {
+            config.log_tensor_norms = Some(v);
+        }
+        if let Some(v) = overrides.norm_preview_limit {
+            config.norm_preview_limit = v;
+        }
+        if let Some(v) = overrides.focal_loss_gamma {
+            config.focal_loss_gamma = v;
+        }
+        if let Some(v) = overrides.smolgen_hidden {
+            config.smolgen_hidden = v;
+        }
+        if let Some(v) = overrides.smolgen_global_dim {
+            config.smolgen_global_dim = v;
+        }
+        if let Some(v) = overrides.smolgen_gen_size {
+            config.smolgen_gen_size = v;
+        }
+        if let Some(v) = overrides.enable_forward_timing {
+            config.enable_forward_timing = Some(v);
+        }
+        if let Some(v) = overrides.forward_timing_interval {
+            config.forward_timing_interval = v;
+        }
+        if let Some(v) = overrides.num_devices {
+            config.num_devices = v;
+        }
+        if let Some(v) = overrides.enable_ply_sampling {
+            config.enable_ply_sampling = Some(v);
+        }
+        if let Some(v) = overrides.enable_elo_sampling {
+            config.enable_elo_sampling = Some(v);
+        }
+        if let Some(v) = overrides.checkpoint_interval {
+            config.checkpoint_interval = v;
+        }
+        if let Some(v) = overrides.pretrain_samples {
+            config.pretrain_samples = v;
+        }
+        if let Some(v) = overrides.shuffle_buffer_size {
+            config.shuffle_buffer_size = v;
+        }
+        if let Some(v) = overrides.full_metrics_interval {
+            config.full_metrics_interval = v;
+        }
+        if let Some(v) = overrides.elo_priority_boost {
+            config.elo_priority_boost = v;
+        }
+        if let Some(v) = overrides.puzzle_sampling_ratio {
+            config.puzzle_sampling_ratio = v;
+        }
+        if let Some(v) = overrides.puzzle_path {
+            config.puzzle_path = Some(v);
+        }
+
+        config
+    }
 }
 
 impl Config {
@@ -338,9 +783,6 @@ impl Config {
     }
     pub fn seq_len(&self) -> usize {
         64
-    }
-    pub fn mlp_ratio(&self) -> f32 {
-        self.mlp_ratio
     }
 
     pub fn log_tensor_norms(&self) -> bool {
@@ -460,10 +902,10 @@ impl Default for Config {
             policy_label_smoothing: 0.03,
             value_loss_weight: 0.0001,
             value_entropy_weight: 0.05,
-            embed_dim: 512,
-            num_layers: 14,
+            embed_dim: 384,
+            num_layers: 24,
             num_heads: 8,
-            mlp_ratio: 4.0,
+
             conv_layers: 0,
             max_samples: None,
             skip: None,
@@ -482,7 +924,7 @@ impl Default for Config {
             enable_forward_timing: Some(false),
             forward_timing_interval: 100,
             num_devices: 1,
-            focal_loss_gamma: 1.0,
+            focal_loss_gamma: 0.0,
             enable_ply_sampling: Some(true),
             enable_elo_sampling: Some(true),
             checkpoint_interval: 100,
@@ -490,6 +932,8 @@ impl Default for Config {
             shuffle_buffer_size: 100000,
             full_metrics_interval: 50,
             elo_priority_boost: 3.0,
+            puzzle_sampling_ratio: 0.2,
+            puzzle_path: None,
         }
     }
 }

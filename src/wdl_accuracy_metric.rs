@@ -100,19 +100,12 @@ impl<B: Backend> Numeric for WdlAccuracyMetric<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_backend::{test_device, TestBackend};
     use burn::data::dataloader::Progress;
-
-    #[cfg(target_os = "macos")]
-    type TestBackend = burn::backend::Wgpu;
-    #[cfg(not(target_os = "macos"))]
-    type TestBackend = burn::backend::LibTorch<f32>;
 
     #[test]
     fn test_wdl_accuracy_perfect() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
         let mut metric = WdlAccuracyMetric::<TestBackend>::new();
 
         // Create test data: 3 examples with perfect predictions
@@ -159,10 +152,7 @@ mod tests {
 
     #[test]
     fn test_wdl_accuracy_partial() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
         let mut metric = WdlAccuracyMetric::<TestBackend>::new();
 
         // Create test data: 4 examples, 2 correct, 2 incorrect
@@ -208,10 +198,7 @@ mod tests {
 
     #[test]
     fn test_wdl_accuracy_batch_update() {
-        #[cfg(target_os = "macos")]
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        #[cfg(not(target_os = "macos"))]
-        let device = burn_tch::LibTorchDevice::Cpu;
+        let device = test_device();
         let mut metric = WdlAccuracyMetric::<TestBackend>::new();
 
         // First batch: 2/3 correct
