@@ -3755,6 +3755,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "shakmaty",
  "statrs",

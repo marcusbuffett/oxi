@@ -18,6 +18,7 @@ burn-candle = { git = "https://github.com/tracel-ai/burn", branch = "main", opti
 
 clap = { version = "*", features = ["derive"] }
 serde = { version = "*", features = ["derive"] }
+serde_json = "*"
 serde_yaml = "*"
 shakmaty = "*"
 pgn-reader = { git = "https://github.com/marcusbuffett/rust-pgn-reader", branch = "master" }

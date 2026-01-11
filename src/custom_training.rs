@@ -45,6 +45,7 @@ use crate::move_accuracy_metric::MoveTopKAccuracyMetric;
 use crate::pgn_processor::process_pgn_directory_iter;
 use crate::pgn_processor::process_tcec_directory_iter;
 use crate::policy_loss_metric::{PolicyLossInput, PolicyLossMetric};
+use crate::puzzle_processor::{process_puzzle_file_iter, MixedExampleIterator};
 use crate::reduce_on_plateau_scheduler::ReduceOnPlateauScheduler;
 use crate::time_usage_loss_metric::{TimeUsageLossInput, TimeUsageLossMetric};
 use crate::training_stage_metric::{TrainingStage, TrainingStageInput, TrainingStageMetric};
@@ -207,6 +208,7 @@ const SCORE_WINDOW: usize = 100;
 
 const MODEL_DIR_NAME: &str = "model";
 const MODEL_FILE_NAME: &str = "model.mpk";
+const PARAMS_FILE_NAME: &str = "params.json";
 const OPT_DECAY_NORMAL_FILE_NAME: &str = "optimizer_decay_normal.mpk";
 const OPT_DECAY_HIGH_FILE_NAME: &str = "optimizer_decay_high.mpk";
 const OPT_NO_DECAY_NORMAL_FILE_NAME: &str = "optimizer_no_decay_normal.mpk";
@@ -244,6 +246,7 @@ where
 
 fn save_training_state<B, O1, O2, O3, O4>(
     model: &OXIModel<B>,
+    config: &Config,
     gradnorm_state: &GradNormState,
     optim_decay_normal: &O1,
     optim_decay_high: &O2,
@@ -266,6 +269,11 @@ where
         .valid()
         .save_file(directory.join(MODEL_FILE_NAME), &recorder)
         .map_err(|err| anyhow::anyhow!(err))?;
+
+    let params_path = directory.join(PARAMS_FILE_NAME);
+    let params_json = serde_json::to_string_pretty(config)
+        .map_err(|err| anyhow::anyhow!("Failed to serialize config: {}", err))?;
+    std::fs::write(&params_path, params_json)?;
 
     save_optimizer_state::<B, O1>(
         optim_decay_normal,
@@ -1089,7 +1097,7 @@ Model & Data Configuration\n\
 - Embed dim: {embed_dim}\n\
 - Num heads: {num_heads}\n\
 - Num layers: {num_layers}\n\
-- MLP ratio: {mlp_ratio}\n\
+- MLP hidden multiplier: 2.5 (SwiGLU)\n\
 - Policy loss weight: {policy_loss_weight}\n\
 - Value loss weight: {value_loss_weight}\n\
 - Value entropy weight: {value_entropy_weight}\n\
@@ -1120,7 +1128,6 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         embed_dim = config.embed_dim(),
         num_heads = config.num_heads(),
         num_layers = config.num_layers(),
-        mlp_ratio = config.mlp_ratio(),
         policy_loss_weight = config.policy_loss_weight,
         value_loss_weight = config.value_loss_weight,
         value_entropy_weight = config.value_entropy_weight,
@@ -1369,7 +1376,7 @@ where
     }
 
     // Set up streaming iterator for human games
-    let examples_iter: Box<dyn Iterator<Item = ChessExample>> = if data_path.is_dir() {
+    let pgn_iter: Box<dyn Iterator<Item = ChessExample>> = if data_path.is_dir() {
         tracing::info!("Setting up streaming from PGN directory: {:?}", data_path);
         println!(
             "Streaming data from PGN directory: {:?} (shuffle buffer: {})",
@@ -1381,6 +1388,46 @@ where
             "Streaming mode requires a directory path, got file: {:?}",
             data_path
         );
+    };
+
+    // Set up puzzle iterator if puzzle sampling is enabled
+    let puzzle_ratio = config.puzzle_sampling_ratio;
+    let examples_iter: Box<dyn Iterator<Item = ChessExample>> = if puzzle_ratio > 0.0 {
+        let puzzle_path = config
+            .puzzle_path
+            .clone()
+            .unwrap_or_else(|| data_path.join("puzzles/lichess_db_puzzle.csv.zst"));
+
+        if puzzle_path.exists() {
+            println!(
+                "Mixing puzzles from {:?} at {:.0}% ratio",
+                puzzle_path,
+                puzzle_ratio * 100.0
+            );
+            tracing::info!(
+                "Mixing puzzles from {:?} at {:.1}% ratio",
+                puzzle_path,
+                puzzle_ratio * 100.0
+            );
+
+            let puzzle_iter = process_puzzle_file_iter(&puzzle_path)?;
+            let mixed_rng = rand::rngs::StdRng::seed_from_u64(config.seed + 1);
+            Box::new(MixedExampleIterator::new(
+                pgn_iter,
+                puzzle_iter,
+                puzzle_ratio,
+                mixed_rng,
+            ))
+        } else {
+            println!(
+                "Warning: Puzzle file not found at {:?}, proceeding without puzzles",
+                puzzle_path
+            );
+            tracing::warn!("Puzzle file not found at {:?}", puzzle_path);
+            pgn_iter
+        }
+    } else {
+        pgn_iter
     };
 
     let mut shuffle_buffer = ShuffleBuffer::new(examples_iter, config.shuffle_buffer_size);
@@ -2088,17 +2135,7 @@ where
         let time_usage_metric_time = t_time_usage.elapsed();
 
         let t_top1 = Instant::now();
-        let move_top1_entry = move_top1_metric.update(&output.adapt(), &metadata);
-        let move_top1_value = Numeric::value(&move_top1_metric);
-        if let Some(value) = numeric_entry_value(&move_top1_value) {
-            top1_history.push(value);
-            metric_logger.log("top1_accuracy", iteration, value);
-        }
-        renderer.update_train(MetricState::Numeric {
-            name: move_top1_metric.name().to_string(),
-            entry: move_top1_entry,
-            value: move_top1_value,
-        });
+        let _move_top1_entry = move_top1_metric.update(&output.adapt(), &metadata);
         let top1_metric_time = t_top1.elapsed();
 
         let t_elo_breakdown = Instant::now();
@@ -2123,17 +2160,63 @@ where
             {
                 let mut elo_counters: HashMap<EloBucket, AccuracyCounter> = HashMap::new();
                 let mut stage_counters: HashMap<GameStageBucket, AccuracyCounter> = HashMap::new();
+                let mut puzzle_counter = AccuracyCounter::default();
+                let mut human_games_counter = AccuracyCounter::default();
 
                 for (idx, item) in items_all.iter().enumerate() {
                     let correct = predicted_indices[idx] == target_indices[idx];
-                    if let Some(bucket) = categorize_elo(item.elo_self) {
-                        elo_counters.entry(bucket).or_default().update(correct);
+                    if item.is_puzzle {
+                        puzzle_counter.update(correct);
+                    } else {
+                        human_games_counter.update(correct);
+                        if let Some(bucket) = categorize_elo(item.elo_self) {
+                            elo_counters.entry(bucket).or_default().update(correct);
+                        }
                     }
                     let stage_bucket = categorize_stage(item.global_features.move_count);
                     stage_counters
                         .entry(stage_bucket)
                         .or_default()
                         .update(correct);
+                }
+
+                if let Some(accuracy) = human_games_counter.accuracy() {
+                    let metric_name = "Move Top-1 Accuracy".to_string();
+                    let entry = SerializedEntry::new(
+                        format!(
+                            "Top-1: {:.1}% ({}/{})",
+                            accuracy * 100.0,
+                            human_games_counter.correct,
+                            human_games_counter.total
+                        ),
+                        format!("{accuracy:.4}"),
+                    );
+                    renderer.update_train(MetricState::Numeric {
+                        name: metric_name.clone(),
+                        entry,
+                        value: NumericEntry::Value(accuracy),
+                    });
+                    top1_history.push(accuracy);
+                    metric_logger.log("top1_accuracy", iteration, accuracy);
+                }
+
+                if let Some(accuracy) = puzzle_counter.accuracy() {
+                    let metric_name = "Puzzle Solve Rate".to_string();
+                    let entry = SerializedEntry::new(
+                        format!(
+                            "Puzzle: {:.1}% ({}/{})",
+                            accuracy * 100.0,
+                            puzzle_counter.correct,
+                            puzzle_counter.total
+                        ),
+                        format!("{accuracy:.4}"),
+                    );
+                    renderer.update_train(MetricState::Numeric {
+                        name: metric_name,
+                        entry,
+                        value: NumericEntry::Value(accuracy),
+                    });
+                    metric_logger.log("puzzle_solve_rate", iteration, accuracy);
                 }
 
                 for bucket in ELO_BUCKETS {
@@ -2326,6 +2409,7 @@ where
 
             save_training_state(
                 &model,
+                &config,
                 &gradnorm_state,
                 &optim_decay_normal,
                 &optim_decay_high,
@@ -2402,6 +2486,7 @@ where
 
     save_training_state(
         &model,
+        &config,
         &gradnorm_state,
         &optim_decay_normal,
         &optim_decay_high,
