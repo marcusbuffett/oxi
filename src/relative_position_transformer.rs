@@ -1,5 +1,5 @@
 use burn::module::Module;
-use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::nn::{Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::tensor::activation::silu;
 use burn::tensor::Device;
 use burn::tensor::{backend::Backend, Tensor};
@@ -25,10 +25,20 @@ pub struct FiLMLayerNorm<B: Backend> {
 
 impl<B: Backend> FiLMLayerNorm<B> {
     pub fn new(device: &Device<B>, embed_dim: usize, global_dim: usize) -> Self {
+        // Standard initialization: Normal(0, 0.02)
+        let std_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
         Self {
             layer_norm: LayerNormConfig::new(embed_dim).init(device),
-            gamma_proj: LinearConfig::new(global_dim, embed_dim).init(device),
-            beta_proj: LinearConfig::new(global_dim, embed_dim).init(device),
+            gamma_proj: LinearConfig::new(global_dim, embed_dim)
+                .with_initializer(std_init.clone())
+                .init(device),
+            beta_proj: LinearConfig::new(global_dim, embed_dim)
+                .with_initializer(std_init.clone())
+                .init(device),
         }
     }
 
@@ -176,9 +186,27 @@ impl<B: Backend> MLP<B> {
     pub fn new(device: &Device<B>) -> Self {
         let config = get_global_config();
         let hidden_dim = (config.embed_dim() as f32 * 2.5) as usize;
+
+        // Standard initialization: Normal(0, 0.02)
+        let std_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
+        // Residual scaling: 1/sqrt(2*num_layers) for residual projections
+        let residual_std = 0.02 / (2.0 * config.num_layers() as f64).sqrt();
+        let residual_init = Initializer::Normal {
+            mean: 0.0,
+            std: residual_std,
+        };
+
         // Fused projection outputs 2*hidden_dim, which we split into gate and up
-        let fused_gate_up = LinearConfig::new(config.embed_dim(), 2 * hidden_dim).init(device);
-        let down_proj = LinearConfig::new(hidden_dim, config.embed_dim()).init(device);
+        let fused_gate_up = LinearConfig::new(config.embed_dim(), 2 * hidden_dim)
+            .with_initializer(std_init)
+            .init(device);
+        let down_proj = LinearConfig::new(hidden_dim, config.embed_dim())
+            .with_initializer(residual_init)
+            .init(device);
         Self {
             fused_gate_up,
             down_proj,

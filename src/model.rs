@@ -10,7 +10,7 @@ use crate::smolgen::SmolgenWeightGen;
 use burn::module::Param;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig};
-use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d};
+use burn::nn::{Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d};
 use burn::prelude::*;
 use burn::tensor::activation::{gelu, log_softmax, softmax};
 
@@ -64,7 +64,16 @@ impl<B: Backend> OXIModel<B> {
             base_embed_dim >= 2,
             "embed_dim must exceed recency features"
         );
-        let token_embed = LinearConfig::new(BOARD_FEATURES_PER_TOKEN, base_embed_dim).init(device);
+
+        // Standard initialization: Normal(0, 0.02)
+        let std_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
+        let token_embed = LinearConfig::new(BOARD_FEATURES_PER_TOKEN, base_embed_dim)
+            .with_initializer(std_init.clone())
+            .init(device);
 
         let mut conv_layers = Vec::new();
         if config.conv_layers() > 0 {
@@ -72,6 +81,7 @@ impl<B: Backend> OXIModel<B> {
                 let conv =
                     Conv2dConfig::new([BOARD_FEATURES_PER_TOKEN, BOARD_FEATURES_PER_TOKEN], [3, 3])
                         .with_padding(PaddingConfig2d::Same)
+                        .with_initializer(std_init.clone())
                         .init(device);
                 conv_layers.push(conv);
             }
@@ -91,19 +101,37 @@ impl<B: Backend> OXIModel<B> {
 
         let policy_head = FactorizedPolicyHead::new(device);
 
-        // Value head components
-        let value_pool_fc1 = LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-        let value_pool_fc2 = LinearConfig::new(config.embed_dim(), 1).init(device);
+        // Value head components - standard initialization
+        let value_pool_fc1 = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
+        let value_pool_fc2 = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
         let value_head_hidden =
-            LinearConfig::new(config.embed_dim() + NUM_GLOBALS, config.embed_dim()).init(device);
-        let value_head = LinearConfig::new(config.embed_dim(), 3).init(device);
-        let side_info_head = LinearConfig::new(config.embed_dim(), 13).init(device);
-        // Time-usage head components
-        let time_pool_fc1 = LinearConfig::new(config.embed_dim(), config.embed_dim()).init(device);
-        let time_pool_fc2 = LinearConfig::new(config.embed_dim(), 1).init(device);
+            LinearConfig::new(config.embed_dim() + NUM_GLOBALS, config.embed_dim())
+                .with_initializer(std_init.clone())
+                .init(device);
+        let value_head = LinearConfig::new(config.embed_dim(), 3)
+            .with_initializer(std_init.clone())
+            .init(device);
+        let side_info_head = LinearConfig::new(config.embed_dim(), 13)
+            .with_initializer(std_init.clone())
+            .init(device);
+        // Time-usage head components - standard initialization
+        let time_pool_fc1 = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
+        let time_pool_fc2 = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
         let time_usage_head_hidden =
-            LinearConfig::new(config.embed_dim() + NUM_GLOBALS, config.embed_dim()).init(device);
-        let time_usage_head = LinearConfig::new(config.embed_dim(), 2).init(device);
+            LinearConfig::new(config.embed_dim() + NUM_GLOBALS, config.embed_dim())
+                .with_initializer(std_init.clone())
+                .init(device);
+        let time_usage_head = LinearConfig::new(config.embed_dim(), 2)
+            .with_initializer(std_init.clone())
+            .init(device);
         let bce_config = BinaryCrossEntropyLossConfig::new().with_logits(true);
         let side_info_bce = bce_config.init(device);
 

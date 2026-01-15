@@ -1,5 +1,5 @@
 use burn::module::Module;
-use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::nn::{Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::tensor::activation::{sigmoid, softmax};
 use burn::tensor::{backend::Backend, Device, Tensor};
 
@@ -50,17 +50,26 @@ impl<B: Backend> Smolgen<B> {
         let global_dim = config.smolgen_global_dim();
         let gen_size = config.smolgen_gen_size();
 
+        // Standard initialization: Normal(0, 0.02)
+        let std_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
         let compress = LinearConfig::new(embed_dim, smolgen_hidden)
             .with_bias(true)
+            .with_initializer(std_init.clone())
             .init(device);
 
         let dense1 = LinearConfig::new(64 * smolgen_hidden, global_dim)
             .with_bias(true)
+            .with_initializer(std_init.clone())
             .init(device);
         let ln1 = LayerNormConfig::new(global_dim).init(device);
 
         let dense2 = LinearConfig::new(global_dim, num_heads * gen_size)
             .with_bias(true)
+            .with_initializer(std_init.clone())
             .init(device);
         let ln2 = LayerNormConfig::new(gen_size).init(device);
 
@@ -119,8 +128,15 @@ impl<B: Backend> SmolgenWeightGen<B> {
         let config = get_global_config();
         let gen_size = config.smolgen_gen_size();
 
+        // Tame initialization for smolgen weight generator to keep initial biases small
+        let smolgen_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.01,
+        };
+
         let weight_gen = LinearConfig::new(gen_size, 64 * 64)
             .with_bias(false)
+            .with_initializer(smolgen_init)
             .init(device);
 
         Self { weight_gen }
@@ -158,8 +174,25 @@ impl<B: Backend> SmolgenAttention<B> {
         let config = get_global_config();
         let embed_dim = config.embed_dim();
 
-        let qkv_proj = LinearConfig::new(embed_dim, 3 * embed_dim).init(device);
-        let o_proj = LinearConfig::new(embed_dim, embed_dim).init(device);
+        // Standard initialization: Normal(0, 0.02)
+        let std_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
+        // Residual scaling: 1/sqrt(2*num_layers) for residual projections
+        let residual_std = 0.02 / (2.0 * config.num_layers() as f64).sqrt();
+        let residual_init = Initializer::Normal {
+            mean: 0.0,
+            std: residual_std,
+        };
+
+        let qkv_proj = LinearConfig::new(embed_dim, 3 * embed_dim)
+            .with_initializer(std_init)
+            .init(device);
+        let o_proj = LinearConfig::new(embed_dim, embed_dim)
+            .with_initializer(residual_init)
+            .init(device);
 
         let smolgen = Smolgen::new(device);
 

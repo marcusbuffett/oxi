@@ -1,5 +1,5 @@
 use burn::module::Module;
-use burn::nn::{Linear, LinearConfig};
+use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::backend::Backend;
 
@@ -21,11 +21,25 @@ impl<B: Backend> FactorizedPolicyHead<B> {
         let config = get_global_config();
         let embed_dim = config.embed_dim();
 
+        // Standard initialization: Normal(0, 0.02)
+        let std_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
         Self {
-            source_proj: LinearConfig::new(embed_dim, POLICY_RANK).init(device),
-            target_proj: LinearConfig::new(embed_dim, POLICY_RANK).init(device),
-            promo_from_proj: LinearConfig::new(embed_dim, NUM_PROMO_PIECES).init(device),
-            promo_to_proj: LinearConfig::new(embed_dim, NUM_PROMO_PIECES).init(device),
+            source_proj: LinearConfig::new(embed_dim, POLICY_RANK)
+                .with_initializer(std_init.clone())
+                .init(device),
+            target_proj: LinearConfig::new(embed_dim, POLICY_RANK)
+                .with_initializer(std_init.clone())
+                .init(device),
+            promo_from_proj: LinearConfig::new(embed_dim, NUM_PROMO_PIECES)
+                .with_initializer(std_init.clone())
+                .init(device),
+            promo_to_proj: LinearConfig::new(embed_dim, NUM_PROMO_PIECES)
+                .with_initializer(std_init.clone())
+                .init(device),
         }
     }
 
