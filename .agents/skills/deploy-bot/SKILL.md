@@ -81,21 +81,21 @@ scp ubuntu@$(mise exec -- printenv REMOTE_IP):/home/ubuntu/oxi/model/params.json
 Authenticate with GCS:
 
 ```bash
-export GOOGLE_APPLICATION_CREDENTIALS="../secrets/chessbook-svc-key"
+gcloud auth activate-service-account --key-file="../secrets/chessbook-svc-key"
 ```
 
 Upload to GCS bucket with the model directory name:
 
 ```bash
 MODEL_NAME="model-{embed_dim}-{num_layers}L"  # Replace with actual values
-gsutil -o "Credentials:gs_service_key_file=$GOOGLE_APPLICATION_CREDENTIALS" cp /tmp/oxi-model-deploy/model.mpk gs://chessbook-models/oxi/${MODEL_NAME}/
-gsutil -o "Credentials:gs_service_key_file=$GOOGLE_APPLICATION_CREDENTIALS" cp /tmp/oxi-model-deploy/params.json gs://chessbook-models/oxi/${MODEL_NAME}/
+gcloud storage cp /tmp/oxi-model-deploy/model.mpk gs://chessbook-models/oxi/${MODEL_NAME}/
+gcloud storage cp /tmp/oxi-model-deploy/params.json gs://chessbook-models/oxi/${MODEL_NAME}/
 ```
 
 Verify upload:
 
 ```bash
-gsutil -o "Credentials:gs_service_key_file=$GOOGLE_APPLICATION_CREDENTIALS" ls -la gs://chessbook-models/oxi/${MODEL_NAME}/
+gcloud storage ls gs://chessbook-models/oxi/${MODEL_NAME}/
 ```
 
 ### Step 6: Update Bot Deployment Config
@@ -112,35 +112,72 @@ Update to:
 gcloud storage cp -r gs://chessbook-models/oxi/${MODEL_NAME}/* /models/
 ```
 
-### Step 7: Push Code Changes
+### Step 7: Verify Bot Builds Locally
+
+**IMPORTANT**: Before pushing, verify the bot compiles:
+
+```bash
+cd ../server/bot && cargo build
+```
+
+This catches any API changes between oxi and bot (e.g., new fields in structs, removed config options).
+
+Fix any compilation errors before proceeding.
+
+### Step 8: Download Model for Local Testing
+
+To test locally, download the model to the bot directory:
+
+```bash
+mkdir -p ../server/bot/model
+scp ubuntu@$(mise exec -- printenv REMOTE_IP):/home/ubuntu/oxi/model/model.mpk ../server/bot/model/
+cp /tmp/oxi-model-deploy/params.json ../server/bot/model/
+```
+
+Then run locally with:
+```bash
+cd ../server/bot
+MODEL_PATH=./model cargo run -- server --bind 0.0.0.0:8402
+```
+
+### Step 9: Push Code Changes
 
 Push changes to both repositories:
 
-**Oxi repo** (this repo):
+**Oxi repo** (if any changes):
 ```bash
-cd /Users/marcusbuffett/projects/chessbook/oxi
 git add -A
-git commit -m "Add params.json saving to training checkpoints"
+git commit -m "..."
 git push origin main
 ```
 
 **Server repo** (bot deployment):
 ```bash
-cd /Users/marcusbuffett/projects/chessbook/server
-git add bot/deploy.yml
+cd ../server
+git add bot/
 git commit -m "Update bot to use ${MODEL_NAME}"
 git push origin main
 ```
 
-### Step 8: Trigger Deployment
+### Step 10: Wait for Cloud Build
 
 The Cloud Build trigger will automatically deploy when changes are pushed to `bot/**` in the server repo.
 
-Monitor deployment:
+**Note**: The service account at `../secrets/chessbook-svc-key` does not have Cloud Build viewer permissions. Monitor builds via:
 
-```bash
-gcloud builds list --region=us-central1 --project=chessbook-404210 --limit=5
-```
+1. **GCP Console** (preferred): https://console.cloud.google.com/cloud-build/builds?project=chessbook-404210
+
+2. **Or authenticate personally**:
+   ```bash
+   gcloud auth login
+   gcloud builds list --project=chessbook-404210 --limit=5
+   ```
+
+3. **Wait for build completion** - typically takes 5-10 minutes. Check status until it shows SUCCESS.
+
+4. **If build fails**, check the logs in GCP Console for the specific error and fix it locally before pushing again.
+
+### Step 11: Verify Deployment
 
 Check pod status:
 
@@ -184,6 +221,14 @@ rm -rf /tmp/oxi-model-deploy
 ### GCS upload fails
 - Verify credentials file exists at `../secrets/chessbook-svc-key`
 - Check bucket permissions
+- If you get macOS Gatekeeper errors about `gcloud-crc32c`, use scp from remote instead
+
+### Bot compilation fails
+- Check for oxi API changes (new struct fields, removed config options)
+- Common issues:
+  - `GlobalFeatures` struct changes - add/remove fields
+  - `Config` struct changes - remove deprecated fields like `mlp_ratio`
+- Always run `cargo build` in `../server/bot` before pushing
 
 ### Bot fails to start
 - Check init container logs: `kubectl logs -l app=chess-bot -c download-model`

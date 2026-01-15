@@ -1493,23 +1493,31 @@ where
         None
     };
 
+    let cautious = config.cautious_weight_decay.unwrap_or(true);
+
     let mut optim_decay_normal = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
+        .with_epsilon(config.adam_epsilon)
+        .with_cautious_weight_decay(cautious)
         .with_grad_clipping(grad_clipping.clone())
         .init();
 
     let mut optim_decay_high = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
+        .with_epsilon(config.adam_epsilon)
+        .with_cautious_weight_decay(cautious)
         .with_grad_clipping(grad_clipping.clone())
         .init();
 
     let mut optim_no_decay_normal = AdamWConfig::new()
         .with_weight_decay(0.0)
+        .with_epsilon(config.adam_epsilon)
         .with_grad_clipping(grad_clipping.clone())
         .init();
 
     let mut optim_no_decay_high = AdamWConfig::new()
         .with_weight_decay(0.0)
+        .with_epsilon(config.adam_epsilon)
         .with_grad_clipping(grad_clipping)
         .init();
 

@@ -139,8 +139,17 @@ pub struct Config {
     pub time_usage_loss_weight: f32,
 
     /// Weight decay for optimizer
-    #[arg(long, default_value = "0.00001")]
+    #[arg(long, default_value = "0.01")]
     pub weight_decay: f64,
+
+    /// Enable cautious weight decay (only applies decay when gradient and update align)
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    #[serde(default)]
+    pub cautious_weight_decay: Option<bool>,
+
+    /// Adam epsilon for numerical stability
+    #[arg(long, default_value = "1e-8")]
+    pub adam_epsilon: f32,
 
     /// Gradient clipping norm (0 to disable)
     #[arg(long, default_value = "3.0")]
@@ -292,8 +301,8 @@ pub struct Config {
     #[arg(long, default_value = "3.0")]
     pub elo_priority_boost: f64,
 
-    /// Ratio of puzzle examples to mix into training (0.0 to 1.0). Default 0.2 = 20% puzzles.
-    #[arg(long, default_value = "0.2")]
+    /// Ratio of puzzle examples to mix into training (0.0 to 1.0). Default 0.05 = 5% puzzles.
+    #[arg(long, default_value = "0.05")]
     pub puzzle_sampling_ratio: f64,
 
     /// Path to puzzle CSV file (defaults to <data-path>/puzzles/lichess_db_puzzle.csv.zst)
@@ -394,6 +403,10 @@ pub struct ConfigOverrides {
     /// Weight decay for optimizer
     #[arg(long)]
     pub weight_decay: Option<f64>,
+
+    /// Enable cautious weight decay
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub cautious_weight_decay: Option<bool>,
 
     /// Gradient clipping norm (0 to disable)
     #[arg(long)]
@@ -879,7 +892,9 @@ impl Default for Config {
             physical_batch_size: 16000,
             seed: 42,
             num_workers: 4,
-            weight_decay: 0.00001,
+            weight_decay: 0.01,
+            cautious_weight_decay: Some(true),
+            adam_epsilon: 1e-8,
             gradient_clip: 3.0,
             log_gradient_breakdown: Some(false),
             gradient_head_limit: 128,
@@ -932,7 +947,7 @@ impl Default for Config {
             shuffle_buffer_size: 100000,
             full_metrics_interval: 50,
             elo_priority_boost: 3.0,
-            puzzle_sampling_ratio: 0.2,
+            puzzle_sampling_ratio: 0.05,
             puzzle_path: None,
         }
     }
