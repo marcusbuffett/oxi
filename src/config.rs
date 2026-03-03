@@ -100,6 +100,21 @@ pub struct Config {
     /// Multiplier applied to the learning rate calculated from batch size
     pub lr_multiplier: f64,
 
+    /// Base learning rate for Muon optimizer (at d=256, before batch-size scaling)
+    /// Scales as sqrt(256 / embed_dim) when embed_dim changes.
+    #[serde(default = "default_muon_base_lr")]
+    pub muon_base_lr: f64,
+
+    /// Base learning rate for AdamW optimizer (at d=256, before batch-size scaling)
+    /// Scales as 256 / embed_dim when embed_dim changes.
+    #[serde(default = "default_adamw_base_lr")]
+    pub adamw_base_lr: f64,
+
+    /// Base learning rate for embedding parameters (width-independent per μP)
+    /// Does NOT scale with embed_dim — set once and it transfers across widths.
+    #[serde(default = "default_embedding_base_lr")]
+    pub embedding_base_lr: f64,
+
     /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size samples
     pub warmup_multiplier: f64,
 
@@ -273,6 +288,18 @@ pub struct Config {
     /// and sets policy loss weight to zero.
     #[serde(default)]
     pub skip_policy_loss: Option<bool>,
+
+    /// Run LR range finder instead of training
+    #[serde(default)]
+    pub lr_range_finder: Option<bool>,
+
+    /// Use Muon optimizer for 2D+ weight matrices (false = use AdamW for everything)
+    #[serde(default = "default_use_muon")]
+    pub use_muon: Option<bool>,
+
+    /// Muon LR adjustment function: "original" or "match_rms_adamw"
+    #[serde(default)]
+    pub muon_lr_adjust: Option<String>,
 }
 
 // Serde default functions for backwards compatibility with older params.json files
@@ -284,6 +311,18 @@ fn default_value_ply_ramp_start() -> usize {
 }
 fn default_value_ply_ramp_full() -> usize {
     30
+}
+fn default_use_muon() -> Option<bool> {
+    Some(true)
+}
+fn default_muon_base_lr() -> f64 {
+    0.02
+}
+fn default_adamw_base_lr() -> f64 {
+    3e-4
+}
+fn default_embedding_base_lr() -> f64 {
+    0.1 // Width-independent per μP; embeddings need much higher LR than hidden layers
 }
 
 /// Command-line overrides for Config. All fields are optional.
@@ -351,6 +390,22 @@ pub struct ConfigOverrides {
     /// Multiplier applied to the learning rate calculated from batch size
     #[arg(long)]
     pub lr_multiplier: Option<f64>,
+
+    /// Base learning rate for Muon optimizer (at d=256, before batch-size scaling)
+    #[arg(long)]
+    pub muon_base_lr: Option<f64>,
+
+    /// Base learning rate for AdamW optimizer (at d=256, before batch-size scaling)
+    #[arg(long)]
+    pub adamw_base_lr: Option<f64>,
+
+    /// Base learning rate for embedding parameters (width-independent, no d-scaling)
+    #[arg(long)]
+    pub embedding_base_lr: Option<f64>,
+
+    /// Run LR range finder test instead of training
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub lr_range_finder: Option<bool>,
 
     /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size samples
     #[arg(long)]
@@ -559,6 +614,14 @@ pub struct ConfigOverrides {
     /// Skip the policy training stage and go directly to value tower only training
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub skip_policy_loss: Option<bool>,
+
+    /// Use Muon optimizer for 2D+ weight matrices (false = AdamW for everything)
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub use_muon: Option<bool>,
+
+    /// Muon LR adjustment function: "original" or "match_rms_adamw"
+    #[arg(long)]
+    pub muon_lr_adjust: Option<String>,
 }
 
 impl Config {
@@ -613,6 +676,15 @@ impl Config {
         }
         if let Some(v) = overrides.lr_multiplier {
             config.lr_multiplier = v;
+        }
+        if let Some(v) = overrides.muon_base_lr {
+            config.muon_base_lr = v;
+        }
+        if let Some(v) = overrides.adamw_base_lr {
+            config.adamw_base_lr = v;
+        }
+        if let Some(v) = overrides.embedding_base_lr {
+            config.embedding_base_lr = v;
         }
         if let Some(v) = overrides.warmup_multiplier {
             config.warmup_multiplier = v;
@@ -768,6 +840,15 @@ impl Config {
         if let Some(v) = overrides.skip_policy_loss {
             config.skip_policy_loss = Some(v);
         }
+        if let Some(v) = overrides.lr_range_finder {
+            config.lr_range_finder = Some(v);
+        }
+        if let Some(v) = overrides.use_muon {
+            config.use_muon = Some(v);
+        }
+        if let Some(v) = overrides.muon_lr_adjust {
+            config.muon_lr_adjust = Some(v);
+        }
 
         config
     }
@@ -872,6 +953,14 @@ impl Config {
         self.enable_forward_timing.unwrap_or(false)
     }
 
+    pub fn use_muon(&self) -> bool {
+        self.use_muon.unwrap_or(true)
+    }
+
+    pub fn muon_lr_adjust(&self) -> &str {
+        self.muon_lr_adjust.as_deref().unwrap_or("original")
+    }
+
     pub fn forward_timing_interval(&self) -> u64 {
         self.forward_timing_interval.max(1)
     }
@@ -969,6 +1058,9 @@ impl Default for Config {
             lr_improvement_threshold: 0.0005,
             lr_reduction_factor: 0.5,
             lr_multiplier: 1.0,
+            muon_base_lr: default_muon_base_lr(),
+            adamw_base_lr: default_adamw_base_lr(),
+            embedding_base_lr: default_embedding_base_lr(),
             warmup_multiplier: 2.0,
             policy_loss_weight: 0.15,
             policy_label_smoothing: 0.03,
@@ -1012,6 +1104,10 @@ impl Default for Config {
             value_ply_ramp_full: 30,
             value_train_on_puzzles: Some(false),
             skip_policy_loss: Some(false),
+            lr_range_finder: Some(false),
+
+            use_muon: Some(true),
+            muon_lr_adjust: None,
         }
     }
 }

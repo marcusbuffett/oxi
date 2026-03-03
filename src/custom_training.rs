@@ -206,6 +206,14 @@ fn categorize_stage(move_count: usize) -> GameStageBucket {
 
 const SCORE_WINDOW: usize = 100;
 
+/// Reference dimension for μP-informed LR scaling.
+/// Base LRs (adamw_base_lr, muon_base_lr) are defined at this width.
+/// When embed_dim differs, they are automatically adjusted:
+///   - AdamW: scales as d_ref / d (decreases with width)
+///   - Muon: scales as sqrt(d_ref / d) (decreases slower)
+///   - Embedding: width-independent (no scaling)
+const LR_REFERENCE_DIM: f64 = 256.0;
+
 const MODEL_DIR_NAME: &str = "model";
 const MODEL_FILE_NAME: &str = "model.mpk";
 const PARAMS_FILE_NAME: &str = "params.json";
@@ -1058,10 +1066,35 @@ fn write_scoresheet(
         .unwrap_or_else(|| "N/A".to_string());
 
     let effective_batch_size = grad_accumulation_steps * config.physical_batch_size;
-    let base_lr = 3e-4;
     let base_batch_size = 1024.0;
-    let initial_lr =
-        base_lr * (effective_batch_size as f64 / base_batch_size) * config.lr_multiplier;
+    let batch_scale = effective_batch_size as f64 / base_batch_size;
+
+    // μP-informed dimension scaling: base LRs are defined at LR_REFERENCE_DIM (256)
+    //   - AdamW hidden LR: scales as d_ref/d (decreases with width)
+    //   - Muon LR: scales as sqrt(d_ref/d) (decreases slower with width)
+    //   - Embedding LR: width-independent (no d-scaling)
+    let d = config.embed_dim() as f64;
+    let adamw_dim_scale = LR_REFERENCE_DIM / d;
+    let muon_dim_scale = (LR_REFERENCE_DIM / d).sqrt();
+
+    let initial_adamw_lr =
+        config.adamw_base_lr * adamw_dim_scale * batch_scale * config.lr_multiplier;
+    let initial_muon_lr = config.muon_base_lr * muon_dim_scale * batch_scale * config.lr_multiplier;
+    let initial_embedding_lr = config.embedding_base_lr * batch_scale * config.lr_multiplier;
+    // Use AdamW LR as the scheduler's LR (the "base" for plateau reduction)
+    let initial_lr = initial_adamw_lr;
+    let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
+    let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
+    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
+
+    let initial_adamw_lr =
+        config.adamw_base_lr * adamw_dim_scale * batch_scale * config.lr_multiplier;
+    let initial_muon_lr = config.muon_base_lr * muon_dim_scale * batch_scale * config.lr_multiplier;
+    let initial_embedding_lr = config.embedding_base_lr * batch_scale * config.lr_multiplier;
+    // Use AdamW LR as the scheduler's LR (the "base" for plateau reduction)
+    let initial_lr = initial_adamw_lr;
+    let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
+    let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
     let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
 
     let train_size_display = if train_size == usize::MAX {
@@ -1117,7 +1150,14 @@ Model & Data Configuration\n\
 - Time usage loss weight: {time_usage_loss_weight}\n\
 - Weight decay: {weight_decay}\n\
 - Gradient clip: {gradient_clip}\n\
-- Initial LR: {initial_lr:.6}\n\
+- AdamW base LR: {adamw_base_lr:.6} (at d_ref=256)\n\
+- Muon base LR: {muon_base_lr:.6} (at d_ref=256)\n\
+- Embedding base LR: {embedding_base_lr:.6} (width-independent)\n\
+- Initial AdamW LR: {initial_adamw_lr:.6}\n\
+- Initial Muon LR: {initial_muon_lr:.6}\n\
+- Initial Embedding LR: {initial_embedding_lr:.6}\n\
+- Muon/AdamW LR ratio: {muon_to_adamw_lr_ratio:.2}x\n\
+- Embedding/AdamW LR ratio: {embedding_to_adamw_lr_ratio:.2}x\n\
 - LR min: {lr_min}\n\
 - LR multiplier: {lr_multiplier}\n\
 - Warmup iterations: {warmup_iterations}\n\
@@ -1147,7 +1187,14 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         time_usage_loss_weight = config.time_usage_loss_weight,
         weight_decay = config.weight_decay,
         gradient_clip = config.gradient_clip,
-        initial_lr = initial_lr,
+        adamw_base_lr = config.adamw_base_lr,
+        muon_base_lr = config.muon_base_lr,
+        embedding_base_lr = config.embedding_base_lr,
+        initial_adamw_lr = initial_adamw_lr,
+        initial_muon_lr = initial_muon_lr,
+        initial_embedding_lr = initial_embedding_lr,
+        muon_to_adamw_lr_ratio = muon_to_adamw_lr_ratio,
+        embedding_to_adamw_lr_ratio = embedding_to_adamw_lr_ratio,
         lr_min = config.lr_min,
         lr_multiplier = config.lr_multiplier,
         warmup_iterations = warmup_iterations,
@@ -1296,8 +1343,13 @@ where
     let value_tower_filter = ValueTowerGradientFilter::new::<B, _>(&model);
     let value_tower_param_count = value_tower_filter.count();
 
-    // Calculate LR multiplier for embeddings and scale parameters
-    let lr_multiplier = (config.embed_dim() as f64).sqrt();
+    // Embedding LR ratio: embedding_lr / adamw_lr (computed from initial LRs)
+    // This replaces the old sqrt(embed_dim) multiplier with μP-informed separate embedding LR
+    let d = config.embed_dim() as f64;
+    let adamw_dim_scale = LR_REFERENCE_DIM / d;
+    // lr_multiplier is now the ratio of embedding LR to AdamW LR at this d
+    // (used in the optimizer step for the high-LR group)
+    let lr_multiplier = (config.embedding_base_lr) / (config.adamw_base_lr * adamw_dim_scale);
 
     println!("\nParameter grouping summary:");
     println!(
@@ -1305,7 +1357,7 @@ where
         decay_params, no_decay_params
     );
     println!(
-        "  Learning rate: {} normal LR, {} high LR (embeddings + scale params)",
+        "  Learning rate: {} normal LR, {} high LR (embeddings)",
         normal_lr_params, high_lr_params
     );
     println!(
@@ -1317,16 +1369,16 @@ where
         value_tower_param_count
     );
     println!(
-        "  LR multiplier for high LR params: {:.4}x (sqrt({}) = {:.4})",
+        "  Embedding LR: {:.6} (base), ratio to AdamW: {:.2}x (μP: d/d_ref={:.2}x)",
+        config.embedding_base_lr,
         lr_multiplier,
-        config.embed_dim(),
-        lr_multiplier
+        d / LR_REFERENCE_DIM,
     );
     println!("  Min LR: {:.6}", config.lr_min);
-    println!("  High LR min: {:.6}\n", config.lr_min * lr_multiplier);
+    println!("  Embedding min LR: {:.6}\n", config.lr_min * lr_multiplier);
 
     tracing::info!(
-        "Parameter grouping: {} decay, {} no_decay; {} normal_lr, {} high_lr; {} muon, {} adamw; lr_multiplier={:.4}",
+        "Parameter grouping: {} decay, {} no_decay; {} normal_lr, {} high_lr; {} muon, {} adamw; embedding_lr_ratio={:.4}",
         decay_params,
         no_decay_params,
         normal_lr_params,
@@ -1336,7 +1388,7 @@ where
         lr_multiplier
     );
     tracing::info!(
-        "Min LR: {:.6}; High LR min: {:.6}",
+        "Min LR: {:.6}; Embedding min LR: {:.6}",
         config.lr_min,
         config.lr_min * lr_multiplier
     );
@@ -1513,16 +1565,40 @@ where
     };
 
     // Calculate effective batch size and initial learning rate
-    // LR scales linearly with batch size, anchored at 3e-4 for batch_size=1024
+    // μP-informed dimension scaling: base LRs are defined at LR_REFERENCE_DIM (256)
     let effective_batch_size = grad_accumulation_steps * config.physical_batch_size;
-    let base_lr = 3e-4;
     let base_batch_size = 1024.0;
-    let initial_lr =
-        base_lr * (effective_batch_size as f64 / base_batch_size) * config.lr_multiplier;
+    let batch_scale = effective_batch_size as f64 / base_batch_size;
+
+    let d = config.embed_dim() as f64;
+    let adamw_dim_scale = LR_REFERENCE_DIM / d;
+    let muon_dim_scale = (LR_REFERENCE_DIM / d).sqrt();
+
+    let initial_adamw_lr =
+        config.adamw_base_lr * adamw_dim_scale * batch_scale * config.lr_multiplier;
+    let initial_muon_lr = config.muon_base_lr * muon_dim_scale * batch_scale * config.lr_multiplier;
+    let initial_embedding_lr = config.embedding_base_lr * batch_scale * config.lr_multiplier;
+    let initial_lr = initial_adamw_lr;
+    let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
+    let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
     let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
     println!(
-        "Effective batch size: {}, Initial LR: {:.6} (multiplier: {}), Warmup iterations: {}",
-        effective_batch_size, initial_lr, config.lr_multiplier, warmup_iterations
+        "Effective batch size: {}, d_ref: {}, d: {}, adamw_dim_scale: {:.4}, muon_dim_scale: {:.4}",
+        effective_batch_size,
+        LR_REFERENCE_DIM as usize,
+        config.embed_dim(),
+        adamw_dim_scale,
+        muon_dim_scale
+    );
+    println!(
+        "AdamW LR: {:.6}, Muon LR: {:.6} (ratio: {:.2}x), Embedding LR: {:.6} (ratio: {:.2}x), Warmup: {}",
+        initial_adamw_lr, initial_muon_lr, muon_to_adamw_lr_ratio,
+        initial_embedding_lr, embedding_to_adamw_lr_ratio, warmup_iterations
+    );
+    println!(
+        "AdamW LR: {:.6}, Muon LR: {:.6} (ratio: {:.2}x), Embedding LR: {:.6} (ratio: {:.2}x), Warmup: {}",
+        initial_adamw_lr, initial_muon_lr, muon_to_adamw_lr_ratio,
+        initial_embedding_lr, embedding_to_adamw_lr_ratio, warmup_iterations
     );
 
     // Create optimizers (5 groups: muon, adamw_decay+normal_lr, adamw_decay+high_lr, adamw_no_decay+normal_lr, adamw_no_decay+high_lr)
@@ -1542,9 +1618,20 @@ where
     } else {
         None
     };
+    let muon_lr_adjust = match config.muon_lr_adjust() {
+        "match_rms_adamw" => burn::optim::AdjustLrFn::MatchRmsAdamW,
+        _ => burn::optim::AdjustLrFn::Original,
+    };
     let mut optim_muon = MuonConfig::new()
         .with_weight_decay(muon_weight_decay)
+        .with_adjust_lr_fn(muon_lr_adjust)
         .init();
+    println!(
+        "  Muon optimizer: enabled={}, lr_adjust={}, weight_decay={}",
+        config.use_muon(),
+        config.muon_lr_adjust(),
+        config.weight_decay
+    );
 
     // AdamW optimizers for everything else
     let mut optim_decay_normal = AdamWConfig::new()
@@ -1716,13 +1803,222 @@ where
             total_batches, total_optimizer_steps
         );
     }
-    println!("Initial LR: {:.6}, Min LR: {}", initial_lr, config.lr_min);
+    println!(
+        "AdamW LR: {:.6}, Muon LR: {:.6}, Min LR: {}",
+        initial_adamw_lr, initial_muon_lr, config.lr_min
+    );
     println!(
         "LR window: {}, LR improvement threshold: {:.2}%, LR reduction factor: {}",
         config.lr_window_size,
         config.lr_improvement_threshold * 100.0,
         config.lr_reduction_factor
     );
+
+    // ==================== LR RANGE FINDER MODE ====================
+    if config.lr_range_finder.unwrap_or(false) {
+        let accum_steps = grad_accumulation_steps;
+        let eff_batch = accum_steps * config.physical_batch_size;
+
+        // Sweep a single multiplier applied to all configured LRs.
+        // The ratios between AdamW/Muon/Embedding are fixed by config + μP d-scaling.
+        // We just find the right overall magnitude.
+        println!("\n=== LR RANGE FINDER MODE ===");
+        println!(
+            "Configured LRs: AdamW={:.2e}, Muon={:.2e}, Embedding={:.2e}",
+            initial_adamw_lr, initial_muon_lr, initial_embedding_lr
+        );
+        println!("Sweeping a multiplier from 0.01x to 100x of configured LRs");
+
+        let mult_min = 0.01_f64;
+        let mult_max = 100.0_f64;
+        let num_steps = 200;
+        let log_factor = (mult_max / mult_min).ln() / num_steps as f64;
+        println!(
+            "Physical batch: {}, Accumulation steps: {}, Effective batch: {}",
+            config.physical_batch_size, accum_steps, eff_batch
+        );
+
+        let log_dir = config
+            .log_dir
+            .as_deref()
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(log_dir)?;
+        let tsv_path = log_dir.join("lr_range_finder.tsv");
+        let mut tsv_file =
+            std::fs::File::create(&tsv_path).expect("Failed to create lr_range_finder.tsv");
+        use std::io::Write;
+        writeln!(
+            tsv_file,
+            "step\tadamw_lr\tmuon_lr\tembedding_lr\tpolicy_loss\ttotal_loss\tgrad_norm"
+        )
+        .unwrap();
+
+        let dataset_for_processing = OXIDataset::new(Vec::new(), config.clone());
+        let main_device = devices[0].clone();
+        let device_workers = DeviceWorkers::<B>::new(&model, &devices, &main_device);
+
+        let mut best_loss = f64::MAX;
+        let mut diverged = false;
+
+        for step in 0..num_steps {
+            if diverged {
+                break;
+            }
+
+            let mult = mult_min * (log_factor * step as f64).exp();
+            let adamw_sweep_lr = initial_adamw_lr * mult;
+            let muon_sweep_lr = initial_muon_lr * mult;
+            let embedding_sweep_lr = initial_embedding_lr * mult;
+
+            // Accumulate gradients over multiple micro-batches
+            let mut grad_accumulator_rf = GradientsAccumulator::new();
+            let mut total_policy_loss = 0.0_f64;
+            let mut total_total_loss = 0.0_f64;
+            let mut micro_batches_done = 0usize;
+            let mut data_exhausted = false;
+
+            for _micro in 0..accum_steps {
+                let batch_examples =
+                    shuffle_buffer.sample_batch(config.physical_batch_size, &mut rng);
+                if batch_examples.is_empty() {
+                    data_exhausted = true;
+                    break;
+                }
+
+                let items: Vec<_> = batch_examples
+                    .par_iter()
+                    .filter_map(|ex| dataset_for_processing.process_example(ex).ok())
+                    .collect();
+
+                if items.is_empty() {
+                    continue;
+                }
+
+                // Dispatch to workers
+                let device_splits = split_items_across_devices(&items, devices.len());
+                let gradnorm_weights = GradNormWeights::from_state(&gradnorm_state);
+                let mut active_workers_rf = Vec::new();
+
+                for (device_index, device_items) in device_splits.into_iter().enumerate() {
+                    if device_items.is_empty() {
+                        continue;
+                    }
+                    device_workers
+                        .get(device_index)
+                        .send(WorkerCommand::Run(WorkerRequest {
+                            items: device_items,
+                            weights: gradnorm_weights,
+                        }));
+                    active_workers_rf.push(device_index);
+                }
+
+                // Collect grads and outputs for this micro-batch
+                let mut outputs: Vec<ChessOutput<B>> = Vec::new();
+                for device_index in active_workers_rf {
+                    if let Some(response) = device_workers.get(device_index).recv() {
+                        match response {
+                            WorkerResponse::Training { grads, output } => {
+                                let grads_main = grads.to_device(&devices[0], &model);
+                                grad_accumulator_rf.accumulate(&model, grads_main);
+                                outputs.push(output);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if !outputs.is_empty() {
+                    let combined = combine_outputs(&outputs, &devices[0]);
+                    total_policy_loss += combined
+                        .base_policy_loss
+                        .clone()
+                        .into_scalar()
+                        .elem::<f32>() as f64;
+                    total_total_loss += combined.loss.clone().into_scalar().elem::<f32>() as f64;
+                    micro_batches_done += 1;
+                }
+            }
+
+            if data_exhausted && micro_batches_done == 0 {
+                println!("LR range finder: data exhausted at step {}", step);
+                break;
+            }
+
+            if micro_batches_done == 0 {
+                continue;
+            }
+
+            // Average losses over micro-batches
+            let policy_loss = (total_policy_loss / micro_batches_done as f64) as f32;
+            let total_loss = (total_total_loss / micro_batches_done as f64) as f32;
+
+            let grads = grad_accumulator_rf.grads();
+            let grad_breakdown = compute_gradient_norm_with_breakdown(&grads, &model, false);
+            let grad_norm = grad_breakdown.total();
+
+            // Split and step
+            let split = weight_decay_groups.split_grads::<B, _>(&model, grads);
+            model = optim_muon.step(muon_sweep_lr, model, split.muon);
+            model = optim_decay_normal.step(adamw_sweep_lr, model, split.adamw_decay_normal);
+            model = optim_decay_high.step(embedding_sweep_lr, model, split.adamw_decay_high);
+            model = optim_no_decay_normal.step(adamw_sweep_lr, model, split.adamw_no_decay_normal);
+            model = optim_no_decay_high.step(embedding_sweep_lr, model, split.adamw_no_decay_high);
+            device_workers.broadcast_model(&model);
+
+            writeln!(
+                tsv_file,
+                "{}\t{:.8}\t{:.8}\t{:.8}\t{:.6}\t{:.6}\t{:.6}",
+                step,
+                adamw_sweep_lr,
+                muon_sweep_lr,
+                embedding_sweep_lr,
+                policy_loss,
+                total_loss,
+                grad_norm
+            )
+            .unwrap();
+
+            if step % 20 == 0 {
+                println!(
+                    "  step={:>3} adamw={:.2e} muon={:.2e} embed={:.2e} policy={:.4} total={:.4} grad={:.4} ({}x{})",
+                    step, adamw_sweep_lr, muon_sweep_lr, embedding_sweep_lr, policy_loss, total_loss, grad_norm,
+                    micro_batches_done, config.physical_batch_size
+                );
+            }
+
+            // Track divergence
+            if (total_loss as f64) < best_loss {
+                best_loss = total_loss as f64;
+            }
+            if total_loss > 4.0 * best_loss as f32
+                || total_loss.is_nan()
+                || total_loss.is_infinite()
+            {
+                println!(
+                    "  DIVERGED at step={} adamw_lr={:.2e} muon_lr={:.2e} loss={:.4} (best was {:.4})",
+                    step, adamw_sweep_lr, muon_sweep_lr, total_loss, best_loss
+                );
+                diverged = true;
+            }
+        }
+
+        println!(
+            "\nLR range finder complete. Results saved to: {}",
+            tsv_path.display()
+        );
+        println!(
+            "Effective batch size: {} ({}x{})",
+            eff_batch, accum_steps, config.physical_batch_size
+        );
+        println!("Best loss seen: {:.4}", best_loss);
+        println!("Look for the LR region with steepest loss decrease (just before divergence).");
+
+        // Shut down workers
+        device_workers.shutdown();
+
+        return Ok(());
+    }
+    // ==================== END LR RANGE FINDER ====================
 
     let mut lr_scheduler = ReduceOnPlateauScheduler::new(
         initial_lr,
@@ -2125,6 +2421,19 @@ where
 
             let split = weight_decay_groups.split_grads::<B, _>(&model, grads_to_split);
 
+            // Log per-optimizer-group gradient counts every 50 iterations
+            if next_step % 50 == 0 {
+                tracing::info!(
+                    "optimizer_groups: step={} muon_grads={} adamw_decay_normal={} adamw_decay_high={} adamw_no_decay_normal={} adamw_no_decay_high={}",
+                    next_step,
+                    split.muon.len(),
+                    split.adamw_decay_normal.len(),
+                    split.adamw_decay_high.len(),
+                    split.adamw_no_decay_normal.len(),
+                    split.adamw_no_decay_high.len()
+                );
+            }
+
             let grad_norm_input = GradientNormInput::new(gradient_norm_value);
             let grad_norm_entry = gradient_norm_metric.update(&grad_norm_input, &metadata);
             let grad_norm_numeric = Numeric::value(&gradient_norm_metric);
@@ -2158,25 +2467,28 @@ where
                 }
             }
 
-            // Apply different learning rates: normal LR for normal params, lr_multiplier * LR for high LR params
+            // Apply different learning rates per optimizer group
+            let adamw_lr = current_lr;
+            let muon_lr = current_lr * muon_to_adamw_lr_ratio;
             let high_lr = current_lr * lr_multiplier;
 
             // Log learning rates periodically
             if next_step % 100 == 0 {
                 tracing::info!(
-                    "step={} base_lr={:.6} high_lr={:.6} (multiplier={:.4})",
+                    "step={} adamw_lr={:.6} muon_lr={:.6} high_lr={:.6} (embed_mult={:.4})",
                     next_step,
-                    current_lr,
+                    adamw_lr,
+                    muon_lr,
                     high_lr,
                     lr_multiplier
                 );
             }
 
             let t_optim_step = Instant::now();
-            model = optim_muon.step(current_lr, model, split.muon);
-            model = optim_decay_normal.step(current_lr, model, split.adamw_decay_normal);
+            model = optim_muon.step(muon_lr, model, split.muon);
+            model = optim_decay_normal.step(adamw_lr, model, split.adamw_decay_normal);
             model = optim_decay_high.step(high_lr, model, split.adamw_decay_high);
-            model = optim_no_decay_normal.step(current_lr, model, split.adamw_no_decay_normal);
+            model = optim_no_decay_normal.step(adamw_lr, model, split.adamw_no_decay_normal);
             model = optim_no_decay_high.step(high_lr, model, split.adamw_no_decay_high);
             optim_step_time = t_optim_step.elapsed();
 
