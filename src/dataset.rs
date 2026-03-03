@@ -7,7 +7,7 @@ use shakmaty::uci::UciMove;
 use shakmaty::{fen::Fen, Chess, Move, Position, Square};
 use std::path::Path;
 
-use crate::config::{ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
+use crate::config::{get_global_config, ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
 use crate::encoding::encode_position;
 use crate::inference::{compute_material_imbalance, GlobalFeatures};
 use crate::move_encoding::encode_move;
@@ -261,6 +261,7 @@ pub struct ChessBatch<B: Backend> {
     pub values: Tensor<B, 2>,      // [batch, 3] - win, draw, loss probabilities
     pub fens: Vec<String>,         // FENs for each position in the batch
     pub global_features: Tensor<B, 2, Float>,
+    pub value_weights: Tensor<B, 1>, // [batch] - per-sample weights for value loss (ply ramp + puzzle mask)
     // TODO: Remove these for less memory usage
     pub items: Vec<ChessItem>, // Original ChessItems for debugging/logging
 }
@@ -276,6 +277,7 @@ impl<B: Backend> ChessBatch<B> {
             values: self.values.to_device(device),
             fens: self.fens,
             global_features: self.global_features.to_device(device),
+            value_weights: self.value_weights.to_device(device),
             items: self.items,
         }
     }
@@ -314,7 +316,9 @@ where
         let mut values_data = vec![0.0f32; batch_size * 3];
         let mut time_usages_data = vec![0.0f32; batch_size];
         let mut global_features_data = vec![0.0f32; batch_size * NUM_GLOBALS];
+        let mut value_weights_data = vec![0.0f32; batch_size];
         let mut fens = Vec::with_capacity(batch_size);
+        let config = get_global_config();
 
         for (i, item) in items.iter().enumerate() {
             let board_offset = i * board_elem_count;
@@ -349,6 +353,16 @@ where
             global_features_data[global_offset..global_offset + NUM_GLOBALS]
                 .copy_from_slice(&features);
 
+            // Compute value weight: ply ramp * puzzle mask
+            let ply = item.global_features.move_count;
+            let ply_weight = config.value_ply_weight(ply);
+            let puzzle_mask = if item.is_puzzle && !config.value_train_on_puzzles() {
+                0.0
+            } else {
+                1.0
+            };
+            value_weights_data[i] = ply_weight * puzzle_mask;
+
             fens.push(item.fen.clone());
         }
         let board_input =
@@ -381,6 +395,9 @@ where
             Tensor::<B, 1>::from_data(TensorData::from(global_features_data.as_slice()), device)
                 .reshape([batch_size, NUM_GLOBALS]);
 
+        let value_weights =
+            Tensor::<B, 1>::from_data(TensorData::from(value_weights_data.as_slice()), device);
+
         ChessBatch {
             board_input,
             move_distributions,
@@ -391,6 +408,7 @@ where
             fens,
             items,
             global_features,
+            value_weights,
         }
     }
 }

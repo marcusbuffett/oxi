@@ -1,4 +1,4 @@
-use clap::{Args, Parser};
+use clap::Args;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -48,266 +48,242 @@ pub const MIN_TIME_CONTROL: u32 = 61;
 /// Minimum clock time (in seconds) to include moves
 pub const MIN_CLOCK_TIME: u32 = 30;
 
-/// Unified configuration for OXI chess engine training and inference
-#[derive(Debug, Clone, Serialize, Deserialize, Parser)]
+/// Unified configuration for OXI chess engine training and inference.
+/// Defaults are defined in the `Default` impl. Use `ConfigOverrides` for CLI parsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     // === DATA AND RUNTIME ===
     /// Path to data (PGN directory, PGN file, or CSV file)
-    #[arg(long, default_value = "/lambda/nfs/chessbook")]
     pub data_path: Option<std::path::PathBuf>,
 
     /// Directory for training logs (train.log, metrics_logs/)
-    #[arg(long)]
     pub log_dir: Option<std::path::PathBuf>,
 
-    #[arg(long)]
     pub max_samples: Option<usize>,
 
     /// Number of initial samples to skip during PGN processing
-    #[arg(long)]
     pub skip: Option<usize>,
 
-    #[arg(long)]
     pub timeout: Option<u64>,
 
     /// Resume training from the last saved model checkpoint
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
     pub resume: Option<bool>,
 
     // We only do one pass through the data, so this is mostly unused
-    #[arg(long, default_value = "1.0")]
     pub train_ratio: f32,
 
     /// Batch size for training
-    #[arg(long)]
     pub batch_size: Option<usize>,
 
     /// Physical batch size (for gradient accumulation)
-    #[arg(long, default_value = "16000")]
     pub physical_batch_size: usize,
 
     /// Random seed for reproducibility
-    #[arg(long, default_value = "42")]
     pub seed: u64,
 
     /// Number of data loader workers
-    #[arg(long, default_value = "4")]
     pub num_workers: usize,
 
     /// Minimum learning rate (end of training)
-    #[arg(long, default_value = "1e-6")]
     pub lr_min: f64,
 
     /// Window size for plateau detection (number of iterations to compare)
-    #[arg(long, default_value = "1000")]
     pub lr_window_size: usize,
 
     /// Minimum relative improvement threshold for plateau detection (e.g., 0.0005 = 0.05% improvement required)
-    #[arg(long, default_value = "0.0005")]
     pub lr_improvement_threshold: f64,
 
     /// Factor to reduce learning rate by when plateau is detected (e.g., 0.5 means halve the LR)
-    #[arg(long, default_value = "0.5")]
     pub lr_reduction_factor: f64,
 
     /// Multiplier applied to the learning rate calculated from batch size
-    #[arg(long, default_value = "1.0")]
     pub lr_multiplier: f64,
 
     /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size samples
-    #[arg(long, default_value = "2.0")]
     pub warmup_multiplier: f64,
 
     /// Weight for policy loss
-    #[arg(long, default_value = "0.15")]
     pub policy_loss_weight: f32,
 
     /// Label smoothing applied to the policy targets (smoothed over legal moves only)
-    #[arg(long, default_value = "0.00")]
     pub policy_label_smoothing: f32,
 
     /// Weight for value loss
-    #[arg(long, default_value = "0.0001")]
     pub value_loss_weight: f32,
 
-    /// Entropy regularization weight for value predictions
-    #[arg(long, default_value = "0.05")]
+    /// Entropy regularization weight for value predictions (0.0 recommended for decoupled value tower)
     pub value_entropy_weight: f32,
 
-    #[arg(long, default_value = "0.0")]
     pub time_usage_loss_weight: f32,
 
     /// Weight decay for optimizer
-    #[arg(long, default_value = "0.01")]
     pub weight_decay: f64,
 
     /// Enable cautious weight decay (only applies decay when gradient and update align)
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
     pub cautious_weight_decay: Option<bool>,
 
     /// Adam epsilon for numerical stability
-    #[arg(long, default_value = "1e-8")]
     pub adam_epsilon: f32,
 
     /// Gradient clipping norm (0 to disable)
-    #[arg(long, default_value = "3.0")]
     pub gradient_clip: f64,
 
     /// Enable verbose gradient norm breakdown logging
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
     pub log_gradient_breakdown: Option<bool>,
 
     /// Number of attention heads to include when logging gradient breakdowns
-    #[arg(long, default_value = "128")]
     #[serde(default)]
     pub gradient_head_limit: usize,
 
     /// Number of layers/modules to include when logging gradient breakdowns
-    #[arg(long, default_value = "128")]
     #[serde(default)]
     pub gradient_layer_limit: usize,
 
     /// Enable adaptive GradNorm reweighting across heads
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
     pub enable_gradnorm: Option<bool>,
 
     /// Optimizer steps between GradNorm weight updates
-    #[arg(long, default_value = "20")]
     #[serde(default)]
     pub gradnorm_interval: usize,
 
     /// Alpha hyperparameter for GradNorm target scaling
-    #[arg(long, default_value = "0.5")]
     pub gradnorm_alpha: f32,
 
     /// Multiplicative learning rate used when adjusting GradNorm weights
-    #[arg(long, default_value = "0.5")]
     pub gradnorm_learning_rate: f32,
 
     /// Priority multiplier applied to policy GradNorm target (1.0 = neutral)
-    #[arg(long, default_value = "20.0")]
     pub gradnorm_policy_priority: f32,
 
     /// Priority multiplier applied to value GradNorm target (1.0 = neutral)
-    #[arg(long, default_value = "1.0")]
     pub gradnorm_value_priority: f32,
 
     /// Priority multiplier applied to time-usage GradNorm target (1.0 = neutral)
-    #[arg(long, default_value = "1.0")]
     pub gradnorm_time_priority: f32,
 
     /// Number of samples to materialize on the lead device when probing GradNorm weights
-    #[arg(long, default_value = "256")]
     #[serde(default)]
     pub gradnorm_probe_size: usize,
 
     /// Embedding dimension for tokens
-    #[arg(long, default_value = "512")]
     pub embed_dim: usize,
 
     /// Number of transformer layers
-    #[arg(long, default_value = "14")]
     pub num_layers: usize,
 
     /// Number of attention heads (head_dim = embed_dim / num_heads)
-    #[arg(long, default_value = "8")]
     pub num_heads: usize,
 
     /// Number of convolutional layers applied over the 8x8 board grid before token embedding
-    #[arg(long, default_value = "0")]
     #[serde(default)]
     pub conv_layers: usize,
 
     /// Only include positions with a single legal move
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub single_legal_move_only: Option<bool>,
 
     /// Disable terminal UI
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub disable_tui: Option<bool>,
 
     /// Only include positions that are checkmate
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub checkmate_only: Option<bool>,
 
     /// Probability of logging individual items for debugging (0.0 to 1.0)
-    #[arg(long, default_value = "1.0")]
     pub item_log_probability: f32,
 
     /// Enable detailed tensor norm logging during forward passes
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     #[serde(default)]
     pub log_tensor_norms: Option<bool>,
 
     /// Maximum number of tensor elements to print when previewing small tensors
-    #[arg(long, default_value = "6")]
     #[serde(default)]
     pub norm_preview_limit: usize,
 
     /// Focal loss gamma parameter for policy head (0.0 disables focal loss)
-    #[arg(long, default_value = "2.0")]
     pub focal_loss_gamma: f32,
 
-    #[arg(long, default_value = "24")]
     pub smolgen_hidden: usize,
 
-    #[arg(long, default_value = "128")]
     pub smolgen_global_dim: usize,
 
-    #[arg(long, default_value = "128")]
     pub smolgen_gen_size: usize,
 
     /// Enable forward pass timing instrumentation for profiling
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub enable_forward_timing: Option<bool>,
 
     /// Sample interval for forward timing (time every Nth forward pass)
-    #[arg(long, default_value = "100")]
     pub forward_timing_interval: u64,
 
-    #[arg(long, default_value = "1")]
     pub num_devices: usize,
 
     /// Probability of dropping positions based on ply (80% at ply 0, 0% at ply 10+)
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub enable_ply_sampling: Option<bool>,
 
     /// Probability of dropping games based on Elo (75% at 1000 Elo, 0% at 2000+ Elo)
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub enable_elo_sampling: Option<bool>,
 
     /// Number of iterations between checkpoints
-    #[arg(long, default_value = "100")]
     pub checkpoint_interval: usize,
 
     /// Number of TCEC (computer engine) samples to use for pretraining (0 to disable)
-    #[arg(long, default_value = "0")]
     pub pretrain_samples: usize,
 
     /// Size of shuffle buffer for streaming data loading (number of examples to buffer before sampling)
-    #[arg(long, default_value = "100000")]
     pub shuffle_buffer_size: usize,
 
     /// Interval for computing expensive metrics (top-5 accuracy, debug predictions, gradient breakdown, L2 penalty, tensor norms). 0 = never, 1 = every iteration.
-    #[arg(long, default_value = "50")]
     pub full_metrics_interval: usize,
 
     /// Priority boost for advanced/expert ELO games (2000+). Value of 1.0 = 2x boost at 2500 ELO,
     /// 2.0 = 3x boost, 3.0 = 4x boost. Set to 0.0 to disable.
-    #[arg(long, default_value = "3.0")]
     pub elo_priority_boost: f64,
 
     /// Ratio of puzzle examples to mix into training (0.0 to 1.0). Default 0.05 = 5% puzzles.
-    #[arg(long, default_value = "0.05")]
     pub puzzle_sampling_ratio: f64,
 
     /// Path to puzzle CSV file (defaults to <data-path>/puzzles/lichess_db_puzzle.csv.zst)
-    #[arg(long)]
     pub puzzle_path: Option<std::path::PathBuf>,
+
+    // === VALUE TOWER CONFIGURATION ===
+    /// Number of transformer layers in the value tower (separate from trunk)
+    #[serde(default = "default_value_tower_layers")]
+    pub value_tower_layers: usize,
+
+    /// Whether to backpropagate value gradients to trunk (false = stop_grad)
+    #[serde(default)]
+    pub value_backprop_to_trunk: Option<bool>,
+
+    /// Starting ply for value example weighting ramp (positions before this get 0 weight)
+    #[serde(default = "default_value_ply_ramp_start")]
+    pub value_ply_ramp_start: usize,
+
+    /// Ending ply for value example weighting ramp (positions at or after this get full weight)
+    #[serde(default = "default_value_ply_ramp_full")]
+    pub value_ply_ramp_full: usize,
+
+    /// Whether to train value head on puzzle positions
+    #[serde(default)]
+    pub value_train_on_puzzles: Option<bool>,
+
+    /// Skip the policy training stage and go directly to value tower only training.
+    /// This freezes all params except value tower, resets LR to initial, disables puzzles,
+    /// and sets policy loss weight to zero.
+    #[serde(default)]
+    pub skip_policy_loss: Option<bool>,
+}
+
+// Serde default functions for backwards compatibility with older params.json files
+fn default_value_tower_layers() -> usize {
+    2
+}
+fn default_value_ply_ramp_start() -> usize {
+    10
+}
+fn default_value_ply_ramp_full() -> usize {
+    30
 }
 
 /// Command-line overrides for Config. All fields are optional.
@@ -559,6 +535,30 @@ pub struct ConfigOverrides {
     /// Path to puzzle CSV file
     #[arg(long)]
     pub puzzle_path: Option<std::path::PathBuf>,
+
+    /// Number of transformer layers in the value tower
+    #[arg(long)]
+    pub value_tower_layers: Option<usize>,
+
+    /// Whether to backpropagate value gradients to trunk
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub value_backprop_to_trunk: Option<bool>,
+
+    /// Starting ply for value example weighting ramp
+    #[arg(long)]
+    pub value_ply_ramp_start: Option<usize>,
+
+    /// Ending ply for value example weighting ramp
+    #[arg(long)]
+    pub value_ply_ramp_full: Option<usize>,
+
+    /// Whether to train value head on puzzle positions
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub value_train_on_puzzles: Option<bool>,
+
+    /// Skip the policy training stage and go directly to value tower only training
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub skip_policy_loss: Option<bool>,
 }
 
 impl Config {
@@ -750,6 +750,24 @@ impl Config {
         if let Some(v) = overrides.puzzle_path {
             config.puzzle_path = Some(v);
         }
+        if let Some(v) = overrides.value_tower_layers {
+            config.value_tower_layers = v;
+        }
+        if let Some(v) = overrides.value_backprop_to_trunk {
+            config.value_backprop_to_trunk = Some(v);
+        }
+        if let Some(v) = overrides.value_ply_ramp_start {
+            config.value_ply_ramp_start = v;
+        }
+        if let Some(v) = overrides.value_ply_ramp_full {
+            config.value_ply_ramp_full = v;
+        }
+        if let Some(v) = overrides.value_train_on_puzzles {
+            config.value_train_on_puzzles = Some(v);
+        }
+        if let Some(v) = overrides.skip_policy_loss {
+            config.skip_policy_loss = Some(v);
+        }
 
         config
     }
@@ -869,6 +887,45 @@ impl Config {
     pub fn smolgen_gen_size(&self) -> usize {
         self.smolgen_gen_size
     }
+
+    // === VALUE TOWER ACCESSORS ===
+
+    pub fn value_tower_layers(&self) -> usize {
+        self.value_tower_layers
+    }
+
+    pub fn value_backprop_to_trunk(&self) -> bool {
+        self.value_backprop_to_trunk.unwrap_or(false)
+    }
+
+    pub fn value_ply_ramp_start(&self) -> usize {
+        self.value_ply_ramp_start
+    }
+
+    pub fn value_ply_ramp_full(&self) -> usize {
+        self.value_ply_ramp_full
+    }
+
+    pub fn value_train_on_puzzles(&self) -> bool {
+        self.value_train_on_puzzles.unwrap_or(false)
+    }
+
+    pub fn skip_policy_loss(&self) -> bool {
+        self.skip_policy_loss.unwrap_or(false)
+    }
+
+    /// Calculate value example weight based on ply (0 before start, ramps to 1 at full)
+    pub fn value_ply_weight(&self, ply: usize) -> f32 {
+        if ply < self.value_ply_ramp_start {
+            0.0
+        } else if ply >= self.value_ply_ramp_full {
+            1.0
+        } else {
+            let range = (self.value_ply_ramp_full - self.value_ply_ramp_start) as f32;
+            let progress = (ply - self.value_ply_ramp_start) as f32;
+            progress / range
+        }
+    }
 }
 
 /// Set the global config (should be called once at startup)
@@ -916,7 +973,7 @@ impl Default for Config {
             policy_loss_weight: 0.15,
             policy_label_smoothing: 0.03,
             value_loss_weight: 0.0001,
-            value_entropy_weight: 0.05,
+            value_entropy_weight: 0.0,
             embed_dim: 384,
             num_layers: 24,
             num_heads: 8,
@@ -949,6 +1006,12 @@ impl Default for Config {
             elo_priority_boost: 3.0,
             puzzle_sampling_ratio: 0.05,
             puzzle_path: None,
+            value_tower_layers: 2,
+            value_backprop_to_trunk: Some(false),
+            value_ply_ramp_start: 10,
+            value_ply_ramp_full: 30,
+            value_train_on_puzzles: Some(false),
+            skip_policy_loss: Some(false),
         }
     }
 }

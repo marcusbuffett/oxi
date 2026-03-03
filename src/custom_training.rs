@@ -7,7 +7,7 @@ use burn::data::dataloader::Progress;
 use burn::grad_clipping::GradientClippingConfig;
 use burn::lr_scheduler::LrScheduler;
 use burn::module::{AutodiffModule, Module};
-use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
+use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, MuonConfig, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -52,7 +52,7 @@ use crate::training_stage_metric::{TrainingStage, TrainingStageInput, TrainingSt
 use crate::tui::OxiTuiRenderer;
 use crate::value_loss_metric::{ValueLossInput, ValueLossMetric};
 use crate::wdl_accuracy_metric::WdlAccuracyMetric;
-use crate::weight_decay::WeightDecayGroups;
+use crate::weight_decay::{ValueTowerGradientFilter, WeightDecayGroups};
 
 /// Simple CLI renderer for when TUI is disabled
 struct SimpleCliRenderer;
@@ -209,6 +209,7 @@ const SCORE_WINDOW: usize = 100;
 const MODEL_DIR_NAME: &str = "model";
 const MODEL_FILE_NAME: &str = "model.mpk";
 const PARAMS_FILE_NAME: &str = "params.json";
+const OPT_MUON_FILE_NAME: &str = "optimizer_muon.mpk";
 const OPT_DECAY_NORMAL_FILE_NAME: &str = "optimizer_decay_normal.mpk";
 const OPT_DECAY_HIGH_FILE_NAME: &str = "optimizer_decay_high.mpk";
 const OPT_NO_DECAY_NORMAL_FILE_NAME: &str = "optimizer_no_decay_normal.mpk";
@@ -244,10 +245,11 @@ where
     Ok(optimizer.load_record(record))
 }
 
-fn save_training_state<B, O1, O2, O3, O4>(
+fn save_training_state<B, OM, O1, O2, O3, O4>(
     model: &OXIModel<B>,
     config: &Config,
     gradnorm_state: &GradNormState,
+    optim_muon: &OM,
     optim_decay_normal: &O1,
     optim_decay_high: &O2,
     optim_no_decay_normal: &O3,
@@ -256,6 +258,7 @@ fn save_training_state<B, O1, O2, O3, O4>(
 ) -> anyhow::Result<()>
 where
     B: AutodiffBackend,
+    OM: Optimizer<OXIModel<B>, B>,
     O1: Optimizer<OXIModel<B>, B>,
     O2: Optimizer<OXIModel<B>, B>,
     O3: Optimizer<OXIModel<B>, B>,
@@ -275,6 +278,7 @@ where
         .map_err(|err| anyhow::anyhow!("Failed to serialize config: {}", err))?;
     std::fs::write(&params_path, params_json)?;
 
+    save_optimizer_state::<B, OM>(optim_muon, &recorder, directory.join(OPT_MUON_FILE_NAME))?;
     save_optimizer_state::<B, O1>(
         optim_decay_normal,
         &recorder,
@@ -417,6 +421,15 @@ impl GradNormWeights {
             policy: state.weight_for(GradNormTask::Policy),
             value: state.weight_for(GradNormTask::Value),
             time: state.weight_for(GradNormTask::TimeUsage),
+        }
+    }
+
+    /// Create weights for value tower only training: policy=0, time=0
+    fn for_value_tower_only(state: &GradNormState) -> Self {
+        Self {
+            policy: 0.0,
+            value: state.weight_for(GradNormTask::Value),
+            time: 0.0,
         }
     }
 }
@@ -1270,8 +1283,18 @@ where
     }
 
     let weight_decay_groups = WeightDecayGroups::new::<B, _>(&model);
-    let (decay_params, no_decay_params, normal_lr_params, high_lr_params) =
-        weight_decay_groups.counts();
+    let (
+        decay_params,
+        no_decay_params,
+        normal_lr_params,
+        high_lr_params,
+        muon_params,
+        adamw_params,
+    ) = weight_decay_groups.counts();
+
+    // Create value tower gradient filter for potential value tower only training
+    let value_tower_filter = ValueTowerGradientFilter::new::<B, _>(&model);
+    let value_tower_param_count = value_tower_filter.count();
 
     // Calculate LR multiplier for embeddings and scale parameters
     let lr_multiplier = (config.embed_dim() as f64).sqrt();
@@ -1286,6 +1309,14 @@ where
         normal_lr_params, high_lr_params
     );
     println!(
+        "  Optimizer: {} Muon (2D+ weights), {} AdamW (biases/embeds/norms/heads)",
+        muon_params, adamw_params
+    );
+    println!(
+        "  Value tower params: {} (for value tower only training)",
+        value_tower_param_count
+    );
+    println!(
         "  LR multiplier for high LR params: {:.4}x (sqrt({}) = {:.4})",
         lr_multiplier,
         config.embed_dim(),
@@ -1295,11 +1326,13 @@ where
     println!("  High LR min: {:.6}\n", config.lr_min * lr_multiplier);
 
     tracing::info!(
-        "Parameter grouping: {} decay, {} no_decay; {} normal_lr, {} high_lr; lr_multiplier={:.4}",
+        "Parameter grouping: {} decay, {} no_decay; {} normal_lr, {} high_lr; {} muon, {} adamw; lr_multiplier={:.4}",
         decay_params,
         no_decay_params,
         normal_lr_params,
         high_lr_params,
+        muon_params,
+        adamw_params,
         lr_multiplier
     );
     tracing::info!(
@@ -1391,7 +1424,13 @@ where
     };
 
     // Set up puzzle iterator if puzzle sampling is enabled
-    let puzzle_ratio = config.puzzle_sampling_ratio;
+    // In value tower only mode, skip puzzles entirely
+    let puzzle_ratio = if config.skip_policy_loss() {
+        println!("Skipping puzzle mixing (value tower only mode)");
+        0.0
+    } else {
+        config.puzzle_sampling_ratio
+    };
     let examples_iter: Box<dyn Iterator<Item = ChessExample>> = if puzzle_ratio > 0.0 {
         let puzzle_path = config
             .puzzle_path
@@ -1486,7 +1525,7 @@ where
         effective_batch_size, initial_lr, config.lr_multiplier, warmup_iterations
     );
 
-    // Create optimizers (4 groups: decay+normal_lr, decay+high_lr, no_decay+normal_lr, no_decay+high_lr)
+    // Create optimizers (5 groups: muon, adamw_decay+normal_lr, adamw_decay+high_lr, adamw_no_decay+normal_lr, adamw_no_decay+high_lr)
     let grad_clipping = if config.gradient_clip > 0.0 {
         Some(GradientClippingConfig::Norm(config.gradient_clip as f32))
     } else {
@@ -1495,6 +1534,19 @@ where
 
     let cautious = config.cautious_weight_decay.unwrap_or(true);
 
+    // Muon optimizer for 2D+ hidden layer weight matrices
+    let muon_weight_decay = if config.weight_decay > 0.0 {
+        Some(burn::optim::decay::WeightDecayConfig::new(
+            config.weight_decay as f32,
+        ))
+    } else {
+        None
+    };
+    let mut optim_muon = MuonConfig::new()
+        .with_weight_decay(muon_weight_decay)
+        .init();
+
+    // AdamW optimizers for everything else
     let mut optim_decay_normal = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
         .with_epsilon(config.adam_epsilon)
@@ -1526,6 +1578,16 @@ where
     if let Some(resume_dir) = resume_optimizer_dir.clone() {
         let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
         let device = &devices[0];
+
+        let muon_path = resume_dir.join(OPT_MUON_FILE_NAME);
+        if muon_path.exists() {
+            optim_muon = load_optimizer_state(optim_muon, &recorder, muon_path, device)?;
+        } else {
+            println!(
+                "Optimizer state {} not found; continuing with fresh state",
+                OPT_MUON_FILE_NAME
+            );
+        }
 
         let decay_normal_path = resume_dir.join(OPT_DECAY_NORMAL_FILE_NAME);
         if decay_normal_path.exists() {
@@ -1734,6 +1796,21 @@ where
     let mut pretrain_batch_iter = pretrain_batches.into_iter();
     let max_samples = config.max_samples.unwrap_or(usize::MAX);
 
+    // Track if we're in value tower only mode (skip_policy_loss or after main training completes)
+    let mut value_tower_only_mode = config.skip_policy_loss();
+    if value_tower_only_mode {
+        println!("VALUE TOWER ONLY MODE: Enabled via skip_policy_loss flag");
+        println!("  - Only value tower parameters will be updated");
+        println!("  - Policy loss weight set to 0");
+        println!("  - Puzzles disabled");
+        println!("  - LR reset to initial value");
+        tracing::info!(
+            "Value tower only mode enabled: skip_policy_loss={}, value_tower_params={}",
+            config.skip_policy_loss(),
+            value_tower_param_count
+        );
+    }
+
     println!(
         "Starting training loop: {} pretrain batches, shuffle buffer: {} examples",
         pretrain_batch_count,
@@ -1765,15 +1842,42 @@ where
         }
 
         if lr_scheduler.should_stop() {
-            println!(
-                "Training stopped: reached min LR with <{:.2}% improvement",
-                config.lr_improvement_threshold * 100.0
-            );
-            tracing::info!(
-                "EXIT_CONDITION: lr_min_reached at iteration {} (current_lr={:.2e}, min_lr={:.2e}, improvement_threshold={:.2}%, is_warming_up={})",
-                loop_iteration, lr_scheduler.get_lr(), config.lr_min, config.lr_improvement_threshold * 100.0, lr_scheduler.is_warming_up()
-            );
-            break;
+            if value_tower_only_mode {
+                // Already in value tower only mode, stop training
+                println!(
+                    "Training stopped: reached min LR in value tower only mode with <{:.2}% improvement",
+                    config.lr_improvement_threshold * 100.0
+                );
+                tracing::info!(
+                    "EXIT_CONDITION: lr_min_reached_value_tower at iteration {} (current_lr={:.2e}, min_lr={:.2e})",
+                    loop_iteration, lr_scheduler.get_lr(), config.lr_min
+                );
+                break;
+            } else {
+                // Transition from main training to value tower only mode
+                tracing::info!("========================================");
+                tracing::info!("TRANSITIONING TO VALUE TOWER ONLY MODE");
+                tracing::info!("========================================");
+                tracing::info!(
+                    "Main training reached min LR with <{:.2}% improvement",
+                    config.lr_improvement_threshold * 100.0
+                );
+                tracing::info!("Now training only value tower parameters");
+                tracing::info!("  - Resetting LR to initial value");
+                tracing::info!("  - Setting policy loss weight to 0");
+                tracing::info!("  - Only updating value tower params");
+                tracing::info!("========================================");
+                tracing::info!(
+                    "STAGE_TRANSITION: main_to_value_tower at iteration {} (lr was {:.2e}, resetting to {:.2e})",
+                    loop_iteration, lr_scheduler.get_lr(), initial_lr
+                );
+
+                value_tower_only_mode = true;
+                lr_scheduler.reset_to_initial();
+
+                // Continue training instead of breaking
+                continue;
+            }
         }
 
         if items_processed >= max_samples {
@@ -1846,7 +1950,11 @@ where
 
         // Split batch across devices for parallel execution
         let device_splits = split_items_across_devices(&items_all, devices.len());
-        let gradnorm_weights = GradNormWeights::from_state(&gradnorm_state);
+        let gradnorm_weights = if value_tower_only_mode {
+            GradNormWeights::for_value_tower_only(&gradnorm_state)
+        } else {
+            GradNormWeights::from_state(&gradnorm_state)
+        };
         let mut active_workers = Vec::new();
 
         for (device_index, device_items) in device_splits.into_iter().enumerate() {
@@ -1914,15 +2022,29 @@ where
         let t_post_main_loop = Instant::now();
         gradnorm_state.record_batch_losses(iteration, &output);
 
-        // Record batch in ReduceOnPlateau scheduler using raw policy loss so GradNorm weighting
-        // on other heads cannot prematurely trigger LR reductions.
-        let policy_loss_tensor = output
-            .raw_policy_loss
-            .clone()
-            .unwrap_or_else(|| output.base_policy_loss.clone());
-        let batch_policy_loss = policy_loss_tensor.into_scalar().elem::<f32>() as f64;
-        metric_logger.log("plateau_policy_loss", iteration, batch_policy_loss);
-        let _measurement_recorded = lr_scheduler.record_batch(batch_policy_loss);
+        // Record batch in ReduceOnPlateau scheduler:
+        // - Main training: use raw policy loss (so GradNorm weighting on other heads cannot prematurely trigger LR reductions)
+        // - Value tower only: use value loss (since policy loss is 0)
+        let plateau_loss = if value_tower_only_mode {
+            let value_loss_tensor = output.base_value_loss.clone();
+            let loss = value_loss_tensor.into_scalar().elem::<f32>() as f64;
+            if iteration % 100 == 0 {
+                tracing::info!(
+                    "Value tower plateau tracking: iteration={}, value_loss={:.6}",
+                    iteration,
+                    loss
+                );
+            }
+            loss
+        } else {
+            let policy_loss_tensor = output
+                .raw_policy_loss
+                .clone()
+                .unwrap_or_else(|| output.base_policy_loss.clone());
+            policy_loss_tensor.into_scalar().elem::<f32>() as f64
+        };
+        metric_logger.log("plateau_loss", iteration, plateau_loss);
+        let _measurement_recorded = lr_scheduler.record_batch(plateau_loss);
 
         // Get current learning rate from scheduler
         current_lr = lr_scheduler.get_lr();
@@ -1951,14 +2073,38 @@ where
         let mut optim_step_time = std::time::Duration::ZERO;
         if should_update {
             let grads = grad_accumulator.grads();
-
-            let t_grad_norm = Instant::now();
             let next_step = optimizer_step + 1;
+
+            let t_split = Instant::now();
+            // In value tower only mode, filter gradients to only value tower params
+            let grads_to_split = if value_tower_only_mode {
+                let filtered = value_tower_filter.filter_grads::<B, _>(&model, grads);
+                tracing::debug!(
+                    "Value tower only: filtered grads count = {}",
+                    filtered.len()
+                );
+                filtered
+            } else {
+                grads
+            };
+            split_grads_time = t_split.elapsed();
+
+            // Compute gradient norm on the gradients we're actually using
+            let t_grad_norm = Instant::now();
             let need_breakdown = config.log_gradient_breakdown() && should_compute_full_metrics;
             let gradient_breakdown =
-                compute_gradient_norm_with_breakdown(&grads, &model, need_breakdown);
+                compute_gradient_norm_with_breakdown(&grads_to_split, &model, need_breakdown);
             grad_norm_compute_time = t_grad_norm.elapsed();
             let gradient_norm_value = gradient_breakdown.total();
+
+            if value_tower_only_mode && next_step % 100 == 0 {
+                tracing::info!(
+                    "Value tower only step {}: grad_norm={:.6e}, grads_count={}",
+                    next_step,
+                    gradient_norm_value,
+                    grads_to_split.len()
+                );
+            }
 
             if need_breakdown {
                 log_gradient_breakdown(&gradient_breakdown, &config, next_step);
@@ -1977,10 +2123,7 @@ where
                 );
             }
 
-            let t_split = Instant::now();
-            let (grads_decay_normal, grads_decay_high, grads_no_decay_normal, grads_no_decay_high) =
-                weight_decay_groups.split_grads::<B, _>(&model, grads);
-            split_grads_time = t_split.elapsed();
+            let split = weight_decay_groups.split_grads::<B, _>(&model, grads_to_split);
 
             let grad_norm_input = GradientNormInput::new(gradient_norm_value);
             let grad_norm_entry = gradient_norm_metric.update(&grad_norm_input, &metadata);
@@ -1994,7 +2137,8 @@ where
                 value: grad_norm_numeric,
             });
 
-            if gradnorm_state.should_update_weights(next_step) {
+            // Skip GradNorm probing in value tower only mode (only one loss is active)
+            if !value_tower_only_mode && gradnorm_state.should_update_weights(next_step) {
                 let probe_items = sample_gradnorm_items(&items_all, config.gradnorm_probe_size());
                 if !probe_items.is_empty() {
                     let probe_device_index = if devices.len() > 1 { 1 } else { 0 };
@@ -2029,10 +2173,11 @@ where
             }
 
             let t_optim_step = Instant::now();
-            model = optim_decay_normal.step(current_lr, model, grads_decay_normal);
-            model = optim_decay_high.step(high_lr, model, grads_decay_high);
-            model = optim_no_decay_normal.step(current_lr, model, grads_no_decay_normal);
-            model = optim_no_decay_high.step(high_lr, model, grads_no_decay_high);
+            model = optim_muon.step(current_lr, model, split.muon);
+            model = optim_decay_normal.step(current_lr, model, split.adamw_decay_normal);
+            model = optim_decay_high.step(high_lr, model, split.adamw_decay_high);
+            model = optim_no_decay_normal.step(current_lr, model, split.adamw_no_decay_normal);
+            model = optim_no_decay_high.step(high_lr, model, split.adamw_no_decay_high);
             optim_step_time = t_optim_step.elapsed();
 
             device_workers.broadcast_model(&model);
@@ -2331,10 +2476,12 @@ where
         });
 
         // Determine if we're in the pretrain phase (using mixed batches with easy examples)
-        let is_in_pretrain_phase = iteration <= num_pretrain_batches;
+        let is_in_pretrain_phase = iteration <= num_pretrain_batches && !value_tower_only_mode;
 
         let stage_input = TrainingStageInput {
-            stage: if is_in_pretrain_phase {
+            stage: if value_tower_only_mode {
+                TrainingStage::ValueTowerOnly
+            } else if is_in_pretrain_phase {
                 let progress =
                     ((iteration - 1) as f64 / (num_pretrain_batches - 1).max(1) as f64).min(1.0);
                 let tcec_percentage = 1.0 - progress;
@@ -2419,6 +2566,7 @@ where
                 &model,
                 &config,
                 &gradnorm_state,
+                &optim_muon,
                 &optim_decay_normal,
                 &optim_decay_high,
                 &optim_no_decay_normal,
@@ -2496,6 +2644,7 @@ where
         &model,
         &config,
         &gradnorm_state,
+        &optim_muon,
         &optim_decay_normal,
         &optim_decay_high,
         &optim_no_decay_normal,

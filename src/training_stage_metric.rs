@@ -22,7 +22,7 @@ impl TrainingStageMetric {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrainingStage {
     Pretrain {
         iteration: usize,
@@ -30,6 +30,9 @@ pub enum TrainingStage {
         tcec_percentage: f64,
     },
     MainTraining,
+    /// Value tower only training: freeze all params except value tower,
+    /// reset LR to initial, disable puzzles, set policy loss weight to zero
+    ValueTowerOnly,
 }
 
 /// Input type for the training stage metric
@@ -55,6 +58,7 @@ impl Metric for TrainingStageMetric {
                 )
             }
             TrainingStage::MainTraining => "Main Training".to_string(),
+            TrainingStage::ValueTowerOnly => "Value Tower Only".to_string(),
         };
 
         SerializedEntry::new(self.stage.clone(), self.stage.clone())

@@ -1,5 +1,3 @@
-#[cfg(feature = "train")]
-use crate::config::get_global_config;
 use crate::config::{
     ModelConfig, BOARD_FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS, RECENCY_FEATURES,
 };
@@ -10,10 +8,12 @@ use crate::smolgen::SmolgenWeightGen;
 use burn::module::Param;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig};
-use burn::nn::{Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d};
+use burn::nn::{Initializer, Linear, LinearConfig, PaddingConfig2d, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
-use burn::tensor::activation::{gelu, log_softmax, softmax};
+use burn::tensor::activation::{log_softmax, silu, softmax};
 
+#[cfg(feature = "train")]
+use crate::config::get_global_config;
 #[cfg(feature = "train")]
 use crate::forward_timing::{finish_and_log_forward_pass, start_forward_pass, TimingScope};
 #[cfg(feature = "train")]
@@ -32,10 +32,10 @@ use crate::train_stubs::*;
 pub struct OXIModel<B: Backend> {
     token_embed: Linear<B>,
     conv_layers: Vec<Conv2d<B>>,
-    token_norm: LayerNorm<B>,
+    token_norm: RmsNorm<B>,
     smolgen_weight_gen: SmolgenWeightGen<B>,
     blocks: Vec<TransformerBlock<B>>,
-    norm: LayerNorm<B>,
+    norm: RmsNorm<B>,
     policy_head: FactorizedPolicyHead<B>,
     value_pool_fc1: Linear<B>,
     value_pool_fc2: Linear<B>,
@@ -51,7 +51,7 @@ pub struct OXIModel<B: Backend> {
     value_uncertainty: Param<Tensor<B, 1>>,
     side_info_uncertainty: Param<Tensor<B, 1>>,
     time_usage_uncertainty: Param<Tensor<B, 1>>,
-    recency_norm: LayerNorm<B>,
+    recency_norm: RmsNorm<B>,
     policy_block: TransformerBlock<B>,
     value_block: TransformerBlock<B>,
     time_block: TransformerBlock<B>,
@@ -94,10 +94,10 @@ impl<B: Backend> OXIModel<B> {
             blocks.push(TransformerBlock::new(device));
         }
 
-        let token_norm = LayerNormConfig::new(base_embed_dim).init(device);
-        let recency_norm = LayerNormConfig::new(RECENCY_FEATURES).init(device);
+        let token_norm = RmsNormConfig::new(base_embed_dim).init(device);
+        let recency_norm = RmsNormConfig::new(RECENCY_FEATURES).init(device);
 
-        let norm = LayerNormConfig::new(config.embed_dim()).init(device);
+        let norm = RmsNormConfig::new(config.embed_dim()).init(device);
 
         let policy_head = FactorizedPolicyHead::new(device);
 
@@ -221,8 +221,8 @@ impl<B: Backend> OXIModel<B> {
                 log_tensor_stats(&format!("embed.conv{layer_idx}.input"), &conv_activations);
                 conv_activations = conv.forward(conv_activations);
                 log_tensor_stats(&format!("embed.conv{layer_idx}.output"), &conv_activations);
-                conv_activations = gelu(conv_activations);
-                log_tensor_stats(&format!("embed.conv{layer_idx}.gelu"), &conv_activations);
+                conv_activations = silu(conv_activations);
+                log_tensor_stats(&format!("embed.conv{layer_idx}.silu"), &conv_activations);
             }
             token_features = conv_activations
                 .permute([0, 2, 3, 1])
@@ -346,7 +346,7 @@ impl<B: Backend> OXIModel<B> {
         let policy_probs = policy_probs.mask_fill(mask.clone(), 0.0);
 
         // Compute p_t for each target
-        let p_t = (targets_smoothed.clone() * policy_probs).sum_dim(1); // Sum over classes for each sample
+        let p_t = (targets_smoothed.clone() * policy_probs).sum_dim(1);
         let focal_weight = (Tensor::ones_like(&p_t) - p_t.clone()).powf_scalar(gamma);
 
         // Standard cross-entropy loss per sample
@@ -387,8 +387,6 @@ impl<B: Backend> OXIModel<B> {
             (zero.clone(), zero)
         };
 
-        // Side info loss removed from training hot path (kept zero)
-
         // Only compute time usage loss if weight is non-zero
         let (base_time_usage_loss, time_usage_term) = if config.time_usage_loss_weight > 0.0 {
             let time_usage_loss = self
@@ -400,7 +398,7 @@ impl<B: Backend> OXIModel<B> {
             (zero.clone(), zero)
         };
 
-        // Policy loss is always computed (always has non-zero weight in practice)
+        // Policy loss is always computed
         let base_policy_loss = policy_loss.clone();
         let config_weighted_policy_loss = base_policy_loss.clone() * config.policy_loss_weight;
 
@@ -412,16 +410,6 @@ impl<B: Backend> OXIModel<B> {
         let policy_logits_only_legals = policy_logits_flat_original
             .clone()
             .mask_fill(mask.clone(), 0.0);
-        // Removed unused predicted move argmax to avoid extra compute
-        // let correct = targets
-        //     .to_data()
-        //     .as_slice::<i32>()
-        //     .unwrap()
-        //     .iter()
-        //     .zip(predicted_moves.to_data().as_slice::<i32>().unwrap())
-        //     .filter(|(&t, &p)| t == p)
-        //     .count();
-        // let batch_accuracy = correct as f32 / batch_size as f32;
 
         crate::chess_output::ChessOutput::new(
             loss,
@@ -434,7 +422,6 @@ impl<B: Backend> OXIModel<B> {
             batch.values.clone(),
             batch.legal_moves.clone(),
         )
-        // .with_uncertainties((sigma_policy, sigma_value, sigma_time_usage))
         .with_raw_losses(
             base_policy_loss.clone(),
             base_value_loss.clone(),

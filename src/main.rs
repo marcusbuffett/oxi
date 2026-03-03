@@ -16,8 +16,10 @@ use tokio::{io::AsyncWriteExt, task};
 
 use oxi::config::{set_global_config, Config, ConfigOverrides};
 use oxi::constants::{LICHESS_PUZZLE_URL, TCEC_DOWNLOAD_URL};
+#[cfg(feature = "train")]
 use oxi::custom_training::train_custom;
-use oxi::inference::InferenceEngine;
+use oxi::eval_dataset::{sample_positions_from_pgn, EvalDataset};
+use oxi::inference::{GlobalFeatures, InferenceEngine};
 
 #[cfg(all(target_os = "linux", feature = "backend-cuda"))]
 use burn_cuda::{Cuda, CudaDevice};
@@ -30,9 +32,9 @@ use burn::backend::LibTorch;
 #[cfg(all(target_os = "linux", feature = "backend-tch"))]
 use burn_tch::LibTorchDevice;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "backend-tch"))]
 use burn::backend::LibTorch;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "backend-tch"))]
 use burn_tch::LibTorchDevice;
 
 #[derive(Parser, Debug)]
@@ -68,8 +70,8 @@ enum Commands {
         month: u32,
 
         /// Output directory for downloaded files
-        #[arg(long, default_value = "./data/pgn")]
-        output_dir: PathBuf,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
 
         /// Download only one file for testing
         #[arg(long)]
@@ -79,26 +81,32 @@ enum Commands {
     /// Download all Lichess PGN files since 2022
     DownloadAll {
         /// Output directory for downloaded files
-        #[arg(long, default_value = "/lambda/nfs/chessbook")]
-        output_dir: PathBuf,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
     },
 
     /// Process PGN files into training data
     ProcessPgn(ProcessPgnConfig),
 
-    /// Evaluate model performance
+    /// Evaluate model performance on an eval dataset (ECL, sharpness, blunder rate)
     Evaluate(EvaluateConfig),
+
+    /// Create an evaluation dataset by sampling positions from PGNs and running Stockfish
+    CreateEvalSet(CreateEvalSetCli),
+
+    /// Quick one-shot evaluation: sample positions, run Stockfish, evaluate model, print report
+    QuickEval(QuickEvalCli),
 
     /// Download TCEC (Top Chess Engine Championship) games for pretraining
     DownloadTcec {
-        #[arg(long, default_value = "/lambda/nfs/chessbook")]
-        data_path: PathBuf,
+        #[arg(long)]
+        data_path: Option<PathBuf>,
     },
 
     /// Download Lichess puzzle database
     DownloadPuzzles {
-        #[arg(long, default_value = "/lambda/nfs/chessbook")]
-        data_path: PathBuf,
+        #[arg(long)]
+        data_path: Option<PathBuf>,
     },
 }
 
@@ -117,20 +125,35 @@ struct InferenceConfig {
     fen_file: Option<PathBuf>,
 
     /// ELO rating for white player
-    #[arg(long, default_value = "1500")]
-    white_elo: i32,
+    #[arg(long)]
+    white_elo: Option<i32>,
 
     /// ELO rating for black player
-    #[arg(long, default_value = "1500")]
-    black_elo: i32,
+    #[arg(long)]
+    black_elo: Option<i32>,
 
     /// Temperature for move sampling
-    #[arg(long, default_value = "1.0")]
-    temperature: f32,
+    #[arg(long)]
+    temperature: Option<f32>,
 
     /// Number of top moves to show
-    #[arg(long, default_value = "5")]
-    top_k: usize,
+    #[arg(long)]
+    top_k: Option<usize>,
+}
+
+impl InferenceConfig {
+    fn white_elo(&self) -> i32 {
+        self.white_elo.unwrap_or(1500)
+    }
+    fn black_elo(&self) -> i32 {
+        self.black_elo.unwrap_or(1500)
+    }
+    fn temperature(&self) -> f32 {
+        self.temperature.unwrap_or(1.0)
+    }
+    fn top_k(&self) -> usize {
+        self.top_k.unwrap_or(5)
+    }
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
@@ -152,31 +175,150 @@ struct ProcessPgnConfig {
     max_elo: Option<i32>,
 
     /// Number of parallel processing threads
-    #[arg(long, default_value = "4")]
-    num_threads: usize,
+    #[arg(long)]
+    num_threads: Option<usize>,
 
     /// Chunk size for processing
-    #[arg(long, default_value = "10000")]
-    chunk_size: usize,
+    #[arg(long)]
+    chunk_size: Option<usize>,
+}
+
+impl ProcessPgnConfig {
+    fn num_threads(&self) -> usize {
+        self.num_threads.unwrap_or(4)
+    }
+    fn chunk_size(&self) -> usize {
+        self.chunk_size.unwrap_or(10000)
+    }
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 struct EvaluateConfig {
-    /// Path to model checkpoint
+    /// Model directory (containing model.mpk and params.json)
     #[arg(long)]
-    model_path: PathBuf,
+    model_dir: PathBuf,
 
-    /// Path to evaluation dataset
+    /// Path to evaluation dataset (created by create-eval-set)
     #[arg(long)]
     data_path: PathBuf,
 
     /// Batch size for evaluation
-    #[arg(long, default_value = "256")]
-    batch_size: usize,
+    #[arg(long)]
+    batch_size: Option<usize>,
 
     /// Device to use (cpu, cuda)
-    #[arg(long, default_value = "cpu")]
-    device: String,
+    #[arg(long)]
+    device: Option<String>,
+
+    /// Elo to condition the model on (if not set, uses each position's player Elo)
+    #[arg(long)]
+    model_elo: Option<i32>,
+}
+
+impl EvaluateConfig {
+    fn batch_size(&self) -> usize {
+        self.batch_size.unwrap_or(256)
+    }
+    fn device(&self) -> &str {
+        self.device.as_deref().unwrap_or("cpu")
+    }
+}
+
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
+struct CreateEvalSetCli {
+    /// Directory containing PGN files to sample from
+    #[arg(long)]
+    pgn_dir: PathBuf,
+
+    /// Output path for the eval dataset JSON
+    #[arg(long, default_value = "./data/eval_set.json")]
+    output: PathBuf,
+
+    /// Path to Stockfish binary (defaults to "stockfish" in PATH)
+    #[arg(long)]
+    stockfish_path: Option<String>,
+
+    /// Stockfish search depth (higher = more accurate but slower)
+    #[arg(long, default_value = "12")]
+    depth: u32,
+
+    /// Number of threads for Stockfish
+    #[arg(long, default_value = "1")]
+    threads: u32,
+
+    /// Total number of positions to include in the eval set
+    #[arg(long, default_value = "10000")]
+    num_positions: usize,
+}
+
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
+struct QuickEvalCli {
+    /// Model directory (containing model.mpk and params.json)
+    #[arg(long)]
+    model_dir: PathBuf,
+
+    /// PGN file or directory to sample positions from
+    #[arg(long)]
+    pgn: PathBuf,
+
+    /// Number of positions to evaluate
+    #[arg(long, default_value = "200")]
+    num_positions: usize,
+
+    /// Stockfish search depth (lower = faster)
+    #[arg(long, default_value = "10")]
+    depth: u32,
+
+    /// Elo to condition the model on (if not set, uses each position's player Elo)
+    #[arg(long)]
+    model_elo: Option<i32>,
+
+    /// Path to Stockfish binary
+    #[arg(long)]
+    stockfish_path: Option<String>,
+}
+
+/// Minimal model architecture params — mirrors what the production bot uses.
+/// Only reads the fields needed to construct the model, ignoring training-only config.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ModelParams {
+    pub embed_dim: usize,
+    pub num_heads: usize,
+    pub num_layers: usize,
+    #[serde(default = "default_smolgen_hidden")]
+    pub smolgen_hidden: usize,
+    #[serde(default = "default_smolgen_global_dim")]
+    pub smolgen_global_dim: usize,
+    #[serde(default = "default_smolgen_gen_size")]
+    pub smolgen_gen_size: usize,
+}
+
+fn default_smolgen_hidden() -> usize { 24 }
+fn default_smolgen_global_dim() -> usize { 128 }
+fn default_smolgen_gen_size() -> usize { 128 }
+
+/// Load a Config from a model directory's params.json file.
+/// Only reads architecture params, fills the rest with defaults — same approach as the production bot.
+fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
+    let params_path = model_dir.join("params.json");
+    if !params_path.exists() {
+        anyhow::bail!(
+            "No params.json found in {}. Expected model directory with model.mpk and params.json.",
+            model_dir.display()
+        );
+    }
+    let params_str = std::fs::read_to_string(&params_path)?;
+    let params: ModelParams = serde_json::from_str(&params_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", params_path.display(), e))?;
+    Ok(Config {
+        embed_dim: params.embed_dim,
+        num_heads: params.num_heads,
+        num_layers: params.num_layers,
+        smolgen_hidden: params.smolgen_hidden,
+        smolgen_global_dim: params.smolgen_global_dim,
+        smolgen_gen_size: params.smolgen_gen_size,
+        ..Default::default()
+    })
 }
 
 #[tokio::main]
@@ -187,53 +329,64 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Train(overrides) => {
-            let config = Config::with_overrides(overrides);
-            let _guard = oxi::custom_training::init_train_logging(config.log_dir.as_deref());
-            tracing::info!("Starting training with config: {:?}", config);
-            set_global_config(config.clone()).unwrap();
-
-            use burn::backend::Autodiff;
-
-            #[cfg(target_os = "macos")]
+            #[cfg(feature = "train")]
             {
-                type Backend = Autodiff<LibTorch<f32>>;
-                let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
-                    .num_devices)
-                    .map(|_| LibTorchDevice::Mps)
-                    .collect();
-                train_custom::<Backend>(config.clone(), devices)?;
+                let config = Config::with_overrides(overrides);
+                let _guard = oxi::custom_training::init_train_logging(config.log_dir.as_deref());
+                tracing::info!("Starting training with config: {:?}", config);
+                set_global_config(config.clone()).unwrap();
+
+                use burn::backend::Autodiff;
+
+                #[cfg(target_os = "macos")]
+                {
+                    type Backend = Autodiff<LibTorch<f32>>;
+                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                        (0..config.num_devices)
+                            .map(|_| LibTorchDevice::Mps)
+                            .collect();
+                    train_custom::<Backend>(config.clone(), devices)?;
+                }
+
+                #[cfg(all(target_os = "linux", feature = "backend-cuda"))]
+                {
+                    type Backend = Autodiff<Cuda>;
+                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                        (0..config.num_devices)
+                            .map(|i| CudaDevice::new(i))
+                            .collect();
+                    println!("Using burn-cuda backend with fusion + autotune");
+                    train_custom::<Backend>(config.clone(), devices)?;
+                }
+
+                #[cfg(all(target_os = "linux", feature = "backend-candle"))]
+                {
+                    type Backend = Autodiff<Candle<f32, i64>>;
+                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                        vec![CandleDevice::Cpu; config.num_devices];
+                    println!(
+                        "Using burn-candle backend (CPU for now - CUDA device construction TBD)"
+                    );
+                    train_custom::<Backend>(config.clone(), devices)?;
+                }
+
+                #[cfg(all(target_os = "linux", feature = "backend-tch"))]
+                {
+                    type Backend = Autodiff<LibTorch<f32>>;
+                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                        (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
+                    println!("Using burn-tch backend (LibTorch) - WARNING: No fusion support");
+                    train_custom::<Backend>(config.clone(), devices)?;
+                }
+
+                Ok(())
             }
 
-            #[cfg(all(target_os = "linux", feature = "backend-cuda"))]
+            #[cfg(not(feature = "train"))]
             {
-                type Backend = Autodiff<Cuda>;
-                let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0..config
-                    .num_devices)
-                    .map(|i| CudaDevice::new(i))
-                    .collect();
-                println!("Using burn-cuda backend with fusion + autotune");
-                train_custom::<Backend>(config.clone(), devices)?;
+                let _ = overrides;
+                anyhow::bail!("Training requires the 'train' feature. Run with: cargo run --features \"train,backend-tch\"")
             }
-
-            #[cfg(all(target_os = "linux", feature = "backend-candle"))]
-            {
-                type Backend = Autodiff<Candle<f32, i64>>;
-                let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-                    vec![CandleDevice::Cpu; config.num_devices];
-                println!("Using burn-candle backend (CPU for now - CUDA device construction TBD)");
-                train_custom::<Backend>(config.clone(), devices)?;
-            }
-
-            #[cfg(all(target_os = "linux", feature = "backend-tch"))]
-            {
-                type Backend = Autodiff<LibTorch<f32>>;
-                let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-                    (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
-                println!("Using burn-tch backend (LibTorch) - WARNING: No fusion support");
-                train_custom::<Backend>(config.clone(), devices)?;
-            }
-
-            Ok(())
         }
 
         Commands::Inference(config) => {
@@ -253,56 +406,24 @@ async fn main() -> Result<()> {
                 anyhow::bail!("No positions provided. Use --fen or --fen-file");
             }
 
-            #[cfg(any(target_os = "macos", feature = "backend-tch"))]
+            #[cfg(feature = "backend-ndarray")]
             {
-                #[cfg(target_os = "macos")]
-                let device = LibTorchDevice::Mps;
-                #[cfg(all(target_os = "linux", feature = "backend-tch"))]
-                let device = LibTorchDevice::Cuda(0);
+                use burn_ndarray::{NdArray, NdArrayDevice};
 
+                let device = NdArrayDevice::Cpu;
                 let model_config = Config::default();
-                let _engine = InferenceEngine::<LibTorch<f32>>::from_checkpoint(
+                let _engine = InferenceEngine::<NdArray<f32>>::from_checkpoint(
                     &config.model_path,
                     model_config,
                     device,
                 )?;
+
+                // TODO: Implement inference on positions using engine
+                Ok(())
             }
 
-            #[cfg(all(target_os = "linux", not(feature = "backend-tch")))]
-            {
-                anyhow::bail!("Inference currently only supported with backend-tch feature");
-            }
-
-            // Run inference on positions
-            // for position in &positions {
-            //     // Determine player colors from FEN
-            //     let parts: Vec<&str> = position.split(' ').collect();
-            //     let (elo_self, elo_oppo) = if parts.len() > 1 && parts[1] == "w" {
-            //         (config.white_elo, config.black_elo)
-            //     } else {
-            //         (config.black_elo, config.white_elo)
-            //     };
-            //
-            //     let predictions = engine.predict(
-            //         position,
-            //         elo_self,
-            //         elo_oppo,
-            //         config.temperature,
-            //         config.top_k,
-            //     )?;
-            //
-            //     println!("\nPosition: {}", position);
-            //     println!("Top {} moves:", config.top_k);
-            //     for (i, pred) in predictions.iter().enumerate() {
-            //         println!(
-            //             "{}. {} ({:.2}%)",
-            //             i + 1,
-            //             pred.uci_move,
-            //             pred.probability * 100.0,
-            //         );
-            //     }
-            // }
-            Ok(())
+            #[cfg(not(feature = "backend-ndarray"))]
+            anyhow::bail!("Inference requires backend-ndarray feature. Run with: cargo run --features backend-ndarray")
         }
 
         Commands::Download { model } => {
@@ -330,10 +451,316 @@ async fn main() -> Result<()> {
 
         Commands::Evaluate(config) => {
             tracing::info!("Evaluating model with config: {:?}", config);
-            // TODO: Implement full evaluation on test set
-            println!("Evaluation not yet fully implemented");
-            println!("This will calculate accuracy and loss metrics on the test dataset");
+
+            // Load eval dataset
+            println!("Loading eval dataset from {}...", config.data_path.display());
+            let eval_dataset = EvalDataset::load(&config.data_path)?;
+            println!(
+                "Loaded {} positions (depth {}, Elo range {}-{})",
+                eval_dataset.metadata.num_positions,
+                eval_dataset.metadata.stockfish_depth,
+                eval_dataset.metadata.elo_range.0,
+                eval_dataset.metadata.elo_range.1,
+            );
+
+            // Load model and run inference using NdArray backend (CPU, same as production bot)
+            #[cfg(feature = "backend-ndarray")]
+            {
+                use burn_ndarray::{NdArray, NdArrayDevice};
+
+                let device = NdArrayDevice::Cpu;
+                let model_config = load_config_from_model_dir(&config.model_dir)?;
+                let _ = set_global_config(model_config.clone());
+                println!(
+                    "Model: embed_dim={}, num_layers={}, num_heads={}",
+                    model_config.embed_dim, model_config.num_layers, model_config.num_heads
+                );
+                let model_mpk = config.model_dir.join("model");
+                let engine = InferenceEngine::<NdArray<f32>>::from_checkpoint(
+                    &model_mpk,
+                    model_config,
+                    device,
+                )?;
+
+                println!("Model loaded. Running inference on {} positions...", eval_dataset.positions.len());
+
+                let mut model_policies =
+                    std::collections::HashMap::new();
+                let total = eval_dataset.positions.len();
+
+                for (i, pos) in eval_dataset.positions.iter().enumerate() {
+                    if (i + 1) % 100 == 0 || i + 1 == total {
+                        println!("  [{}/{}] positions", i + 1, total);
+                    }
+
+                    let parsed_fen: shakmaty::fen::Fen = match pos.fen.parse() {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("Skipping invalid FEN {}: {}", pos.fen, e);
+                            continue;
+                        }
+                    };
+                    let chess_pos: shakmaty::Chess = match parsed_fen
+                        .into_position(shakmaty::CastlingMode::Standard)
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Skipping invalid position {}: {}", pos.fen, e);
+                            continue;
+                        }
+                    };
+
+                    // Use default global features for eval (no time pressure)
+                    let elo = config.model_elo.unwrap_or(pos.player_elo);
+                    let globals = GlobalFeatures {
+                        time_remaining_self: 300,
+                        time_remaining_oppo: 300,
+                        base_time: 300,
+                        increment: 3,
+                        move_count: pos.ply as usize,
+                        elo_self: elo,
+                        is_puzzle: false,
+                    };
+
+                    match engine.predict_full_policy(&[chess_pos], &globals, 1.0) {
+                        Ok(policy) => {
+                            model_policies.insert(pos.fen.clone(), policy);
+                        }
+                        Err(e) => {
+                            eprintln!("Inference failed for {}: {}", pos.fen, e);
+                        }
+                    }
+                }
+
+                println!("\nComputing metrics...\n");
+                let results = eval_dataset.evaluate_model(&model_policies);
+
+                // Print report
+                EvalDataset::print_report(&results);
+
+                // Save results to JSON
+                let results_path = config.data_path.with_extension("results.json");
+                let results_json = serde_json::to_string_pretty(&results)?;
+                std::fs::write(&results_path, results_json)?;
+                println!("Results saved to {}", results_path.display());
+                Ok(())
+            }
+
+            #[cfg(not(feature = "backend-ndarray"))]
+            anyhow::bail!("Evaluation requires backend-ndarray feature. Run with: cargo run --features backend-ndarray")
+        }
+
+        Commands::CreateEvalSet(config) => {
+            println!("Creating evaluation dataset...");
+            println!("  PGN directory: {}", config.pgn_dir.display());
+            println!("  Output: {}", config.output.display());
+            println!("  Stockfish depth: {}", config.depth);
+            println!("  Target positions: {}", config.num_positions);
+
+            // Default Elo buckets
+            let elo_buckets = vec![
+                (1000, 1200),
+                (1200, 1400),
+                (1400, 1600),
+                (1600, 1800),
+                (1800, 2000),
+                (2000, 2200),
+                (2200, 2400),
+                (2400, 2700),
+            ];
+
+            // Need global config for PGN processing
+            let global_config = Config::default();
+            let _ = set_global_config(global_config);
+
+            // Step 1: Sample positions from PGN files
+            let sampled = sample_positions_from_pgn(
+                &config.pgn_dir,
+                config.num_positions,
+                &elo_buckets,
+            )?;
+
+            if sampled.is_empty() {
+                anyhow::bail!("No positions were sampled. Check PGN directory and filters.");
+            }
+
+            // Step 2: Evaluate with Stockfish and build dataset
+            let dataset = EvalDataset::from_sampled_positions(
+                sampled,
+                config.stockfish_path.as_deref(),
+                config.depth,
+                config.threads,
+            )?;
+
+            // Step 3: Save
+            dataset.save(&config.output)?;
+            println!(
+                "\nEval dataset saved to {} ({} positions)",
+                config.output.display(),
+                dataset.positions.len()
+            );
+
+            // Print a quick summary of the human ECL baseline
+            println!("\nHuman ECL baseline by Elo (from the sampled games):");
+            let mut by_elo: std::collections::BTreeMap<i32, Vec<f32>> =
+                std::collections::BTreeMap::new();
+            for pos in &dataset.positions {
+                let bucket = (pos.player_elo / 200) * 200;
+                if !pos.human_ecl.is_nan() {
+                    by_elo.entry(bucket).or_default().push(pos.human_ecl);
+                }
+            }
+            println!(
+                "{:<12} {:>10} {:>10} {:>8}",
+                "Elo", "Mean ECL", "Median ECL", "Count"
+            );
+            println!("{}", "-".repeat(44));
+            for (elo, mut ecls) in by_elo {
+                ecls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mean = ecls.iter().sum::<f32>() / ecls.len() as f32;
+                let median = ecls[ecls.len() / 2];
+                println!(
+                    "{:<12} {:>10.1} {:>10.1} {:>8}",
+                    format!("{}-{}", elo, elo + 200),
+                    mean,
+                    median,
+                    ecls.len()
+                );
+            }
+
             Ok(())
+        }
+
+        Commands::QuickEval(config) => {
+            println!("Quick evaluation: {} positions, depth {}", config.num_positions, config.depth);
+
+            // Load model config from params.json
+            let model_config = load_config_from_model_dir(&config.model_dir)?;
+            let _ = set_global_config(model_config.clone());
+            println!(
+                "Model: embed_dim={}, num_layers={}, num_heads={}",
+                model_config.embed_dim, model_config.num_layers, model_config.num_heads
+            );
+
+            // Determine PGN source - file or directory
+            let pgn_path = &config.pgn;
+            let pgn_dir = if pgn_path.is_dir() {
+                pgn_path.clone()
+            } else {
+                // If it's a single file, use its parent directory
+                // but we need to handle this case - copy to a temp dir or handle directly
+                pgn_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+            };
+
+            // Step 1: Sample positions
+            let elo_buckets = vec![
+                (1000, 1400),
+                (1400, 1800),
+                (1800, 2200),
+                (2200, 2700),
+            ];
+            println!("\nStep 1: Sampling {} positions from PGN...", config.num_positions);
+            let sampled = sample_positions_from_pgn(
+                &pgn_dir,
+                config.num_positions,
+                &elo_buckets,
+            )?;
+
+            if sampled.is_empty() {
+                anyhow::bail!("No positions sampled. Check PGN path and filters.");
+            }
+            println!("Sampled {} positions", sampled.len());
+
+            // Step 2: Run Stockfish
+            println!("\nStep 2: Running Stockfish at depth {}...", config.depth);
+            let dataset = EvalDataset::from_sampled_positions(
+                sampled,
+                config.stockfish_path.as_deref(),
+                config.depth,
+                1, // single thread for simplicity
+            )?;
+            println!("Evaluated {} positions", dataset.positions.len());
+
+            // Print human baseline
+            println!("\nHuman ECL baseline:");
+            let mut elo_ecls: std::collections::BTreeMap<i32, Vec<f32>> =
+                std::collections::BTreeMap::new();
+            for pos in &dataset.positions {
+                let bucket = (pos.player_elo / 400) * 400;
+                if !pos.human_ecl.is_nan() {
+                    elo_ecls.entry(bucket).or_default().push(pos.human_ecl);
+                }
+            }
+            println!("{:<12} {:>10} {:>8}", "Elo", "Mean ECL", "Count");
+            println!("{}", "-".repeat(32));
+            for (elo, ecls) in &elo_ecls {
+                let mean = ecls.iter().sum::<f32>() / ecls.len() as f32;
+                println!("{:<12} {:>10.1} {:>8}", format!("{}-{}", elo, elo + 400), mean, ecls.len());
+            }
+
+            // Step 3: Run model inference using NdArray backend (CPU, same as production bot)
+            println!("\nStep 3: Running model inference...");
+
+            #[cfg(feature = "backend-ndarray")]
+            {
+                use burn_ndarray::{NdArray, NdArrayDevice};
+
+                let device = NdArrayDevice::Cpu;
+                let model_mpk = config.model_dir.join("model");
+                let engine = InferenceEngine::<NdArray<f32>>::from_checkpoint(
+                    &model_mpk,
+                    model_config,
+                    device,
+                )?;
+
+                let mut model_policies = std::collections::HashMap::new();
+                let total = dataset.positions.len();
+
+                for (i, pos) in dataset.positions.iter().enumerate() {
+                    if (i + 1) % 50 == 0 || i + 1 == total {
+                        println!("  [{}/{}]", i + 1, total);
+                    }
+
+                    let parsed_fen: shakmaty::fen::Fen = match pos.fen.parse() {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let chess_pos: shakmaty::Chess = match parsed_fen
+                        .into_position(shakmaty::CastlingMode::Standard)
+                    {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    let elo = config.model_elo.unwrap_or(pos.player_elo);
+                    let globals = GlobalFeatures {
+                        time_remaining_self: 300,
+                        time_remaining_oppo: 300,
+                        base_time: 300,
+                        increment: 3,
+                        move_count: pos.ply as usize,
+                        elo_self: elo,
+                        is_puzzle: false,
+                    };
+
+                    match engine.predict_full_policy(&[chess_pos], &globals, 1.0) {
+                        Ok(policy) => {
+                            model_policies.insert(pos.fen.clone(), policy);
+                        }
+                        Err(e) => {
+                            eprintln!("Inference failed for {}: {}", pos.fen, e);
+                        }
+                    }
+                }
+
+                println!("\nStep 4: Computing metrics...");
+                let results = dataset.evaluate_model(&model_policies);
+                EvalDataset::print_report(&results);
+                Ok(())
+            }
+
+            #[cfg(not(feature = "backend-ndarray"))]
+            anyhow::bail!("Quick eval requires backend-ndarray feature. Run with: cargo run --features backend-ndarray")
         }
 
         Commands::DownloadPgn {
@@ -342,6 +769,7 @@ async fn main() -> Result<()> {
             output_dir,
             local,
         } => {
+            let output_dir = output_dir.unwrap_or_else(|| PathBuf::from("./data/pgn"));
             tracing::info!("Downloading PGN files for {}-{:02}", year, month);
 
             // Create output directory if it doesn't exist
@@ -407,12 +835,14 @@ async fn main() -> Result<()> {
         }
 
         Commands::DownloadAll { output_dir } => {
+            let output_dir = output_dir.unwrap_or_else(|| PathBuf::from("/lambda/nfs/chessbook"));
             tracing::info!("Downloading all Lichess PGN files since 2022");
             download_all_lichess_files(&output_dir).await?;
             Ok(())
         }
 
         Commands::DownloadTcec { data_path } => {
+            let data_path = data_path.unwrap_or_else(|| PathBuf::from("/lambda/nfs/chessbook"));
             let tcec_dir = data_path.join("tcec");
             tracing::info!("Downloading TCEC games to {:?}", tcec_dir);
             download_tcec_games(&tcec_dir).await?;
@@ -420,6 +850,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::DownloadPuzzles { data_path } => {
+            let data_path = data_path.unwrap_or_else(|| PathBuf::from("/lambda/nfs/chessbook"));
             let puzzles_dir = data_path.join("puzzles");
             tracing::info!("Downloading Lichess puzzles to {:?}", puzzles_dir);
             download_puzzles(&puzzles_dir).await?;

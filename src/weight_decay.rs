@@ -20,9 +20,18 @@ enum LearningRateGroup {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptimizerType {
+    /// 2D+ weight matrices in hidden layers — eligible for Muon
+    Muon,
+    /// Everything else: biases, embeddings, layer norms, 1D params, output heads
+    AdamW,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ParameterGroup {
     decay: WeightDecayGroup,
     lr: LearningRateGroup,
+    optimizer: OptimizerType,
 }
 
 /// Represents a partition of model parameters into weight-decayed and non-decayed groups,
@@ -56,10 +65,11 @@ impl WeightDecayGroups {
             assignments: classifier.assignments,
         };
 
-        let (decay_count, no_decay_count, normal_lr_count, high_lr_count) = groups.counts();
+        let (decay_count, no_decay_count, normal_lr_count, high_lr_count, muon_count, adamw_count) =
+            groups.counts();
         info!(
-            "[WeightDecayGroups::new] Total assignments: {} decay, {} no_decay, {} normal_lr, {} high_lr",
-            decay_count, no_decay_count, normal_lr_count, high_lr_count
+            "[WeightDecayGroups::new] Total assignments: {} decay, {} no_decay, {} normal_lr, {} high_lr, {} muon, {} adamw",
+            decay_count, no_decay_count, normal_lr_count, high_lr_count, muon_count, adamw_count
         );
 
         // Log detailed parameter grouping
@@ -79,8 +89,8 @@ impl WeightDecayGroups {
             );
             for (path, group) in high_lr_params.iter() {
                 info!(
-                    "[WeightDecayGroups::new]   {} (decay={:?})",
-                    path, group.decay
+                    "[WeightDecayGroups::new]   {} (decay={:?}, optim={:?})",
+                    path, group.decay, group.optimizer
                 );
             }
         }
@@ -106,8 +116,8 @@ impl WeightDecayGroups {
             );
             for (path, group) in normal_lr_params.iter() {
                 info!(
-                    "[WeightDecayGroups::new]   {} (decay={:?})",
-                    path, group.decay
+                    "[WeightDecayGroups::new]   {} (decay={:?}, optim={:?})",
+                    path, group.decay, group.optimizer
                 );
             }
         }
@@ -128,17 +138,9 @@ impl WeightDecayGroups {
         0.5 * weight_decay * total_squared_norm
     }
 
-    /// Split gradients into 4 sets: (decay+normal_lr, decay+high_lr, no_decay+normal_lr, no_decay+high_lr)
-    pub fn split_grads<B, M>(
-        &self,
-        model: &M,
-        grads: GradientsParams,
-    ) -> (
-        GradientsParams,
-        GradientsParams,
-        GradientsParams,
-        GradientsParams,
-    )
+    /// Split gradients into 5 sets:
+    /// (muon, adamw_decay+normal_lr, adamw_decay+high_lr, adamw_no_decay+normal_lr, adamw_no_decay+high_lr)
+    pub fn split_grads<B, M>(&self, model: &M, grads: GradientsParams) -> SplitGradients
     where
         B: AutodiffBackend,
         M: AutodiffModule<B>,
@@ -149,20 +151,26 @@ impl WeightDecayGroups {
         );
         let mut splitter = GradientsSplitVisitor::<B>::new(&self.assignments, grads);
         model.visit(&mut splitter);
-        let (decay_normal, decay_high, no_decay_normal, no_decay_high) = splitter.finish();
+        let result = splitter.finish();
         info!(
-            "[split_grads] Result: {} decay+normal, {} decay+high, {} no_decay+normal, {} no_decay+high",
-            decay_normal.len(), decay_high.len(), no_decay_normal.len(), no_decay_high.len()
+            "[split_grads] Result: {} muon, {} adamw_decay+normal, {} adamw_decay+high, {} adamw_no_decay+normal, {} adamw_no_decay+high",
+            result.muon.len(),
+            result.adamw_decay_normal.len(),
+            result.adamw_decay_high.len(),
+            result.adamw_no_decay_normal.len(),
+            result.adamw_no_decay_high.len()
         );
-        (decay_normal, decay_high, no_decay_normal, no_decay_high)
+        result
     }
 
-    /// Return (decay_count, no_decay_count, normal_lr_count, high_lr_count) for logging/debugging.
-    pub fn counts(&self) -> (usize, usize, usize, usize) {
+    /// Return (decay_count, no_decay_count, normal_lr_count, high_lr_count, muon_count, adamw_count) for logging/debugging.
+    pub fn counts(&self) -> (usize, usize, usize, usize, usize, usize) {
         let mut decay = 0;
         let mut no_decay = 0;
         let mut normal_lr = 0;
         let mut high_lr = 0;
+        let mut muon = 0;
+        let mut adamw = 0;
 
         for group in self.assignments.values() {
             match group.decay {
@@ -173,9 +181,13 @@ impl WeightDecayGroups {
                 LearningRateGroup::Normal => normal_lr += 1,
                 LearningRateGroup::HighLR => high_lr += 1,
             }
+            match group.optimizer {
+                OptimizerType::Muon => muon += 1,
+                OptimizerType::AdamW => adamw += 1,
+            }
         }
 
-        (decay, no_decay, normal_lr, high_lr)
+        (decay, no_decay, normal_lr, high_lr, muon, adamw)
     }
 }
 
@@ -198,9 +210,7 @@ impl<B: AutodiffBackend> WeightDecayClassifier<B> {
         }
     }
 
-    fn classify_path(&self, path: &[String]) -> ParameterGroup {
-        let path_str = path.join(".");
-
+    fn classify_path(&self, path: &[String], dims: usize) -> ParameterGroup {
         // First determine weight decay group
         let decay = if path_contains(path, "bias") {
             WeightDecayGroup::NoDecay
@@ -230,7 +240,30 @@ impl<B: AutodiffBackend> WeightDecayClassifier<B> {
             LearningRateGroup::Normal
         };
 
-        ParameterGroup { decay, lr }
+        // Muon is for 2D+ weight matrices in hidden layers only.
+        // Exclude: embeddings, output/head layers, biases, layer norms, 1D params.
+        let is_embedding =
+            path_contains(path, "token_embed") || path_contains(path, "global_embed");
+        let is_output_head = path_contains(path, "policy_head")
+            || path_contains(path, "value_head")
+            || path_contains(path, "time_head")
+            || path_contains(path, "side_info_head");
+        let is_norm = path_contains(path, "gamma")
+            || path_contains(path, "beta")
+            || path_contains(path, "norm");
+        let is_bias = path_contains(path, "bias");
+
+        let optimizer = if dims >= 2 && !is_embedding && !is_output_head && !is_norm && !is_bias {
+            OptimizerType::Muon
+        } else {
+            OptimizerType::AdamW
+        };
+
+        ParameterGroup {
+            decay,
+            lr,
+            optimizer,
+        }
     }
 }
 
@@ -248,7 +281,7 @@ impl<B: AutodiffBackend> ModuleVisitor<B> for WeightDecayClassifier<B> {
         if self.assignments.contains_key(&id) {
             return;
         }
-        let assignment = self.classify_path(&self.path_stack);
+        let assignment = self.classify_path(&self.path_stack, D);
         let path_str = self.path_stack.join(".");
         self.param_paths.push((path_str, assignment));
         self.assignments.insert(id, assignment);
@@ -260,21 +293,36 @@ impl<B: AutodiffBackend> ModuleVisitor<B> for WeightDecayClassifier<B> {
         id: ParamId,
         _tensor: &Tensor<B, D>,
     ) {
-        let assignment = self.classify_path(path);
+        let assignment = self.classify_path(path, D);
         let path_str = path.join(".");
         self.param_paths.push((path_str, assignment));
         self.assignments.insert(id, assignment);
     }
 }
 
-/// Utility visitor that partitions gradients into 4 groups based on decay and LR.
+/// Result of splitting gradients into optimizer groups.
+pub struct SplitGradients {
+    /// Gradients for Muon-eligible 2D+ weight matrices
+    pub muon: GradientsParams,
+    /// Gradients for AdamW params with decay at normal LR
+    pub adamw_decay_normal: GradientsParams,
+    /// Gradients for AdamW params with decay at high LR (embeddings)
+    pub adamw_decay_high: GradientsParams,
+    /// Gradients for AdamW params without decay at normal LR
+    pub adamw_no_decay_normal: GradientsParams,
+    /// Gradients for AdamW params without decay at high LR
+    pub adamw_no_decay_high: GradientsParams,
+}
+
+/// Utility visitor that partitions gradients into 5 groups based on optimizer type, decay, and LR.
 struct GradientsSplitVisitor<'a, B: AutodiffBackend> {
     assignments: &'a HashMap<ParamId, ParameterGroup>,
     remaining: GradientsParams,
-    grads_decay_normal: GradientsParams,
-    grads_decay_high: GradientsParams,
-    grads_no_decay_normal: GradientsParams,
-    grads_no_decay_high: GradientsParams,
+    grads_muon: GradientsParams,
+    grads_adamw_decay_normal: GradientsParams,
+    grads_adamw_decay_high: GradientsParams,
+    grads_adamw_no_decay_normal: GradientsParams,
+    grads_adamw_no_decay_high: GradientsParams,
     backend: PhantomData<B>,
 }
 
@@ -283,33 +331,28 @@ impl<'a, B: AutodiffBackend> GradientsSplitVisitor<'a, B> {
         Self {
             assignments,
             remaining: grads,
-            grads_decay_normal: GradientsParams::new(),
-            grads_decay_high: GradientsParams::new(),
-            grads_no_decay_normal: GradientsParams::new(),
-            grads_no_decay_high: GradientsParams::new(),
+            grads_muon: GradientsParams::new(),
+            grads_adamw_decay_normal: GradientsParams::new(),
+            grads_adamw_decay_high: GradientsParams::new(),
+            grads_adamw_no_decay_normal: GradientsParams::new(),
+            grads_adamw_no_decay_high: GradientsParams::new(),
             backend: PhantomData,
         }
     }
 
-    fn finish(
-        self,
-    ) -> (
-        GradientsParams,
-        GradientsParams,
-        GradientsParams,
-        GradientsParams,
-    ) {
+    fn finish(self) -> SplitGradients {
         debug_assert!(
             self.remaining.is_empty(),
             "Unassigned gradients remain after gradient split ({} tensors)",
             self.remaining.len()
         );
-        (
-            self.grads_decay_normal,
-            self.grads_decay_high,
-            self.grads_no_decay_normal,
-            self.grads_no_decay_high,
-        )
+        SplitGradients {
+            muon: self.grads_muon,
+            adamw_decay_normal: self.grads_adamw_decay_normal,
+            adamw_decay_high: self.grads_adamw_decay_high,
+            adamw_no_decay_normal: self.grads_adamw_no_decay_normal,
+            adamw_no_decay_high: self.grads_adamw_no_decay_high,
+        }
     }
 }
 
@@ -327,23 +370,31 @@ impl<'a, B: AutodiffBackend> ModuleVisitor<B> for GradientsSplitVisitor<'a, B> {
             .unwrap_or(ParameterGroup {
                 decay: WeightDecayGroup::Decay,
                 lr: LearningRateGroup::Normal,
+                optimizer: OptimizerType::AdamW,
             });
 
+        // Muon params go to their own group regardless of decay/lr
+        if group.optimizer == OptimizerType::Muon {
+            self.grads_muon.register::<B::InnerBackend, D>(id, grad);
+            return;
+        }
+
+        // AdamW params split by decay × lr
         match (group.decay, group.lr) {
             (WeightDecayGroup::Decay, LearningRateGroup::Normal) => {
-                self.grads_decay_normal
+                self.grads_adamw_decay_normal
                     .register::<B::InnerBackend, D>(id, grad);
             }
             (WeightDecayGroup::Decay, LearningRateGroup::HighLR) => {
-                self.grads_decay_high
+                self.grads_adamw_decay_high
                     .register::<B::InnerBackend, D>(id, grad);
             }
             (WeightDecayGroup::NoDecay, LearningRateGroup::Normal) => {
-                self.grads_no_decay_normal
+                self.grads_adamw_no_decay_normal
                     .register::<B::InnerBackend, D>(id, grad);
             }
             (WeightDecayGroup::NoDecay, LearningRateGroup::HighLR) => {
-                self.grads_no_decay_high
+                self.grads_adamw_no_decay_high
                     .register::<B::InnerBackend, D>(id, grad);
             }
         }
@@ -378,6 +429,7 @@ impl<'a, B: AutodiffBackend> ModuleVisitor<B> for L2PenaltyVisitor<'a, B> {
             .unwrap_or(ParameterGroup {
                 decay: WeightDecayGroup::Decay,
                 lr: LearningRateGroup::Normal,
+                optimizer: OptimizerType::AdamW,
             });
 
         // Only accumulate norm for parameters in the decay group
@@ -413,4 +465,148 @@ fn normalize_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Filters gradients to only include those belonging to the value tower.
+/// This is used during value tower only training to prevent gradients from
+/// flowing to other parts of the model.
+pub struct ValueTowerGradientFilter {
+    value_tower_param_ids: HashSet<ParamId>,
+}
+
+impl ValueTowerGradientFilter {
+    /// Build the filter by identifying all value tower parameters.
+    pub fn new<B, M>(model: &M) -> Self
+    where
+        B: AutodiffBackend,
+        M: AutodiffModule<B>,
+    {
+        let mut classifier = ValueTowerClassifier::<B>::new();
+        model.visit(&mut classifier);
+
+        info!(
+            "[ValueTowerGradientFilter::new] Found {} value tower parameters",
+            classifier.value_tower_param_ids.len()
+        );
+
+        // Log the paths of value tower parameters for debugging
+        for path in &classifier.value_tower_paths {
+            info!(
+                "[ValueTowerGradientFilter::new] Value tower param: {}",
+                path
+            );
+        }
+
+        Self {
+            value_tower_param_ids: classifier.value_tower_param_ids,
+        }
+    }
+
+    /// Filter gradients to only include value tower parameters.
+    pub fn filter_grads<B, M>(&self, model: &M, grads: GradientsParams) -> GradientsParams
+    where
+        B: AutodiffBackend,
+        M: AutodiffModule<B>,
+    {
+        let mut filter_visitor =
+            ValueTowerGradFilterVisitor::<B>::new(&self.value_tower_param_ids, grads);
+        model.visit(&mut filter_visitor);
+        filter_visitor.finish()
+    }
+
+    /// Return the count of value tower parameters.
+    pub fn count(&self) -> usize {
+        self.value_tower_param_ids.len()
+    }
+}
+
+/// Classifies parameters to identify value tower params.
+struct ValueTowerClassifier<B: AutodiffBackend> {
+    value_tower_param_ids: HashSet<ParamId>,
+    value_tower_paths: Vec<String>,
+    path_stack: Vec<String>,
+    backend: PhantomData<B>,
+}
+
+impl<B: AutodiffBackend> ValueTowerClassifier<B> {
+    fn new() -> Self {
+        Self {
+            value_tower_param_ids: HashSet::new(),
+            value_tower_paths: Vec::new(),
+            path_stack: Vec::new(),
+            backend: PhantomData,
+        }
+    }
+
+    fn is_value_tower_path(&self, path: &[String]) -> bool {
+        path_contains(path, "value_tower")
+    }
+}
+
+impl<B: AutodiffBackend> ModuleVisitor<B> for ValueTowerClassifier<B> {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path_stack.push(name.to_string());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path_stack.pop();
+    }
+
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        if self.is_value_tower_path(&self.path_stack) {
+            self.value_tower_param_ids.insert(param.id);
+            self.value_tower_paths.push(self.path_stack.join("."));
+        }
+    }
+
+    fn visit_float_with_path<const D: usize>(
+        &mut self,
+        path: &[String],
+        id: ParamId,
+        _tensor: &Tensor<B, D>,
+    ) {
+        if self.is_value_tower_path(path) {
+            self.value_tower_param_ids.insert(id);
+            self.value_tower_paths.push(path.join("."));
+        }
+    }
+}
+
+/// Visitor that filters gradients to only value tower parameters.
+struct ValueTowerGradFilterVisitor<'a, B: AutodiffBackend> {
+    value_tower_param_ids: &'a HashSet<ParamId>,
+    remaining: GradientsParams,
+    filtered_grads: GradientsParams,
+    backend: PhantomData<B>,
+}
+
+impl<'a, B: AutodiffBackend> ValueTowerGradFilterVisitor<'a, B> {
+    fn new(value_tower_param_ids: &'a HashSet<ParamId>, grads: GradientsParams) -> Self {
+        Self {
+            value_tower_param_ids,
+            remaining: grads,
+            filtered_grads: GradientsParams::new(),
+            backend: PhantomData,
+        }
+    }
+
+    fn finish(self) -> GradientsParams {
+        // Note: remaining grads are intentionally discarded (non-value tower params)
+        self.filtered_grads
+    }
+}
+
+impl<'a, B: AutodiffBackend> ModuleVisitor<B> for ValueTowerGradFilterVisitor<'a, B> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let id = param.id;
+        let Some(grad) = self.remaining.remove::<B::InnerBackend, D>(id) else {
+            return;
+        };
+
+        // Only keep gradients for value tower parameters
+        if self.value_tower_param_ids.contains(&id) {
+            self.filtered_grads.register::<B::InnerBackend, D>(id, grad);
+        }
+        // Non-value tower gradients are discarded
+    }
 }

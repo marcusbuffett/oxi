@@ -264,6 +264,19 @@ impl ReduceOnPlateauScheduler {
         }
         (self.current_lr - self.min_lr).abs() < 1e-10 && self.detector.is_plateau()
     }
+
+    /// Reset the scheduler to initial state (for transitioning to a new training phase)
+    pub fn reset_to_initial(&mut self) {
+        self.current_lr = self.initial_lr;
+        self.iteration = 0;
+        self.num_reductions = 0;
+        self.detector.reset();
+        tracing::info!(
+            "LR scheduler reset to initial: lr={:.6}, warmup_iterations={}",
+            self.initial_lr,
+            self.warmup_iterations
+        );
+    }
 }
 
 impl LrScheduler for ReduceOnPlateauScheduler {

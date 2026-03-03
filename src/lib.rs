@@ -2,6 +2,7 @@ pub mod config;
 pub mod constants;
 pub mod distribution_utils;
 pub mod encoding;
+pub mod eval_dataset;
 pub mod factorized_policy;
 pub mod inference;
 pub mod model;
@@ -9,6 +10,8 @@ pub mod move_encoding;
 pub mod moves;
 pub mod relative_position_transformer;
 pub mod smolgen;
+pub mod stockfish;
+pub mod value_tower;
 
 #[cfg(not(feature = "train"))]
 pub mod train_stubs {

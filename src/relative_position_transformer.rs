@@ -1,5 +1,5 @@
 use burn::module::Module;
-use burn::nn::{Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::tensor::activation::silu;
 use burn::tensor::Device;
 use burn::tensor::{backend::Backend, Tensor};
@@ -14,16 +14,16 @@ use crate::norm_debug::log_tensor_stats;
 #[cfg(not(feature = "train"))]
 use crate::train_stubs::{log_tensor_stats, TimingScope};
 
-/// FiLM-conditioned LayerNorm: generates its own gamma/beta from global features
+/// FiLM-conditioned RmsNorm: generates its own gamma/beta from global features
 /// Each instance lives inside a transformer block and conditions on globals passed at forward time
 #[derive(Module, Debug)]
-pub struct FiLMLayerNorm<B: Backend> {
-    layer_norm: LayerNorm<B>,
+pub struct FiLMRmsNorm<B: Backend> {
+    rms_norm: RmsNorm<B>,
     gamma_proj: Linear<B>,
     beta_proj: Linear<B>,
 }
 
-impl<B: Backend> FiLMLayerNorm<B> {
+impl<B: Backend> FiLMRmsNorm<B> {
     pub fn new(device: &Device<B>, embed_dim: usize, global_dim: usize) -> Self {
         // Standard initialization: Normal(0, 0.02)
         let std_init = Initializer::Normal {
@@ -32,7 +32,7 @@ impl<B: Backend> FiLMLayerNorm<B> {
         };
 
         Self {
-            layer_norm: LayerNormConfig::new(embed_dim).init(device),
+            rms_norm: RmsNormConfig::new(embed_dim).init(device),
             gamma_proj: LinearConfig::new(global_dim, embed_dim)
                 .with_initializer(std_init.clone())
                 .init(device),
@@ -46,7 +46,7 @@ impl<B: Backend> FiLMLayerNorm<B> {
     /// x: [batch, seq, embed_dim]
     /// globals: [batch, global_dim]
     pub fn forward(&self, x: Tensor<B, 3>, globals: Tensor<B, 2>) -> Tensor<B, 3> {
-        let normed = self.layer_norm.forward(x);
+        let normed = self.rms_norm.forward(x);
         let gamma = self.gamma_proj.forward(globals.clone()) + 1.0;
         let beta = self.beta_proj.forward(globals);
         let gamma = gamma.unsqueeze_dim(1);
@@ -56,15 +56,15 @@ impl<B: Backend> FiLMLayerNorm<B> {
 
     /// Forward without FiLM modulation (for inference without globals)
     pub fn forward_plain(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.layer_norm.forward(x)
+        self.rms_norm.forward(x)
     }
 }
 
 #[derive(Module, Debug)]
 pub struct TransformerBlock<B: Backend> {
     attention: SmolgenAttention<B>,
-    norm_post_attn: FiLMLayerNorm<B>,
-    norm_post_mlp: FiLMLayerNorm<B>,
+    norm_post_attn: FiLMRmsNorm<B>,
+    norm_post_mlp: FiLMRmsNorm<B>,
     mlp: MLP<B>,
 }
 
@@ -73,9 +73,9 @@ impl<B: Backend> TransformerBlock<B> {
         let config = get_global_config();
         let attention = SmolgenAttention::new(device);
         let norm_post_attn =
-            FiLMLayerNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
+            FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
         let norm_post_mlp =
-            FiLMLayerNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
+            FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
         let mlp = MLP::new(device);
         Self {
             attention,
@@ -127,7 +127,7 @@ impl<B: Backend> TransformerBlock<B> {
     }
 
     /// Forward pass with FiLM conditioning from globals
-    /// globals: [batch, NUM_GLOBALS] - passed to each LayerNorm to generate gamma/beta
+    /// globals: [batch, NUM_GLOBALS] - passed to each FiLMRmsNorm to generate gamma/beta
     pub fn forward_with_film(
         &self,
         x: Tensor<B, 3>,

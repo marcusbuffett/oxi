@@ -1,5 +1,5 @@
 use burn::prelude::*;
-use burn::record::{CompactRecorder, Recorder};
+use burn::record::{DefaultRecorder, Recorder};
 use burn::tensor::activation::log_softmax;
 use std::path::Path;
 
@@ -347,7 +347,7 @@ pub fn load_model<B: Backend>(
     config: &Config,
     device: &Device<B>,
 ) -> anyhow::Result<OXIModel<B>> {
-    let record = CompactRecorder::new().load(path.to_path_buf(), device)?;
+    let record = DefaultRecorder::new().load(path.to_path_buf(), device)?;
 
     let model = OXIModel::new(device, config).load_record(record);
 
@@ -627,6 +627,84 @@ where
             wdl,
             time_usage,
         })
+    }
+
+    /// Predict the full policy distribution over ALL legal moves.
+    ///
+    /// Returns a HashMap mapping UCI move strings to probabilities, covering
+    /// every legal move in the position. Unlike `predict()` which returns top-k,
+    /// this returns the complete distribution needed for ECL computation.
+    ///
+    /// Moves are returned in the original coordinate system (not mirrored).
+    pub fn predict_full_policy(
+        &self,
+        positions: &[Chess],
+        global_features: &GlobalFeatures,
+        temperature: f32,
+    ) -> anyhow::Result<std::collections::HashMap<String, f32>>
+    where
+        B::FloatElem: From<f32>,
+    {
+        let (board_tensor, global_features_tensor, flipped_current, _material_imbalance_history) =
+            self.create_input_tensors(positions, &[], global_features)?;
+
+        let current_position = &positions[0];
+        let is_black_to_move = current_position.turn() == Color::Black;
+
+        let (policy_logits, _value_logits, _side_info_logits, _time_usage_logits) =
+            self.model.forward(board_tensor, global_features_tensor);
+
+        // Get legal moves mask
+        let mut legal_moves_mask = vec![0.0f32; LEGAL_MOVES];
+        for legal_move in flipped_current.legal_moves() {
+            if let Some((from_idx, promo_idx)) =
+                encode_move(&legal_move.to_uci(shakmaty::CastlingMode::Standard))
+            {
+                let move_idx = from_idx as usize * 76 + promo_idx as usize;
+                legal_moves_mask[move_idx] = 1.0;
+            }
+        }
+
+        let legal_moves_tensor =
+            Tensor::<B, 1>::from_floats(legal_moves_mask.as_slice(), &self.device)
+                .reshape([1, LEGAL_MOVES]);
+
+        // Reshape policy logits to [batch, LEGAL_MOVES]
+        let policy_logits_flat = policy_logits.reshape([1, LEGAL_MOVES]);
+
+        // Apply legal move masking
+        let mask = legal_moves_tensor.clone().equal_elem(0.0);
+        let masked_logits = policy_logits_flat.mask_fill(mask, f32::NEG_INFINITY);
+
+        // Apply temperature and softmax
+        let log_probs = if temperature != 1.0 {
+            log_softmax(masked_logits.div_scalar(temperature), 1)
+        } else {
+            log_softmax(masked_logits, 1)
+        };
+        let probs = log_probs.exp();
+
+        // Extract all legal moves with probabilities
+        let probs_data = probs.to_data();
+        let probs_slice = probs_data.as_slice::<f32>().unwrap();
+
+        let mut result = std::collections::HashMap::new();
+        for (move_idx, &prob) in probs_slice[0..LEGAL_MOVES].iter().enumerate() {
+            if prob > 0.0 && !prob.is_infinite() && !prob.is_nan() {
+                let from_idx = (move_idx / 76) as u8;
+                let to_idx = (move_idx % 76) as u8;
+                if let Some(uci_move) = decode_move(from_idx, to_idx) {
+                    let final_uci = if is_black_to_move {
+                        mirror_move(&uci_move.to_string())
+                    } else {
+                        uci_move.to_string()
+                    };
+                    result.insert(final_uci, prob);
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Helper function to flip a chess position for Black's perspective

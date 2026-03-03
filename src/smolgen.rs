@@ -1,6 +1,6 @@
 use burn::module::Module;
-use burn::nn::{Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig};
-use burn::tensor::activation::{sigmoid, softmax};
+use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::tensor::activation::{silu, softmax};
 use burn::tensor::{backend::Backend, Device, Tensor};
 
 use crate::config::get_global_config;
@@ -24,11 +24,11 @@ pub struct Smolgen<B: Backend> {
 
     /// Global state extraction: (64 * smolgen_hidden) -> global_dim
     dense1: Linear<B>,
-    ln1: LayerNorm<B>,
+    ln1: RmsNorm<B>,
 
     /// Per-head projection: global_dim -> (num_heads * gen_size)
     dense2: Linear<B>,
-    ln2: LayerNorm<B>,
+    ln2: RmsNorm<B>,
 }
 
 /// Shared weight generator across all Smolgen instances in all transformer blocks.
@@ -65,13 +65,13 @@ impl<B: Backend> Smolgen<B> {
             .with_bias(true)
             .with_initializer(std_init.clone())
             .init(device);
-        let ln1 = LayerNormConfig::new(global_dim).init(device);
+        let ln1 = RmsNormConfig::new(global_dim).init(device);
 
         let dense2 = LinearConfig::new(global_dim, num_heads * gen_size)
             .with_bias(true)
             .with_initializer(std_init.clone())
             .init(device);
-        let ln2 = LayerNormConfig::new(gen_size).init(device);
+        let ln2 = RmsNormConfig::new(gen_size).init(device);
 
         Self {
             compress,
@@ -106,7 +106,7 @@ impl<B: Backend> Smolgen<B> {
             let _t = TimingScope::new_with_sync::<B>("smolgen_dense1", &device);
             self.dense1.forward(flat)
         };
-        let global = global.clone() * sigmoid(global);
+        let global = silu(global);
         let global = self.ln1.forward(global);
         log_tensor_stats("smolgen.global", &global);
 
@@ -115,7 +115,7 @@ impl<B: Backend> Smolgen<B> {
             self.dense2.forward(global)
         };
         let per_head = per_head.reshape([batch_size, num_heads, gen_size]);
-        let per_head = per_head.clone() * sigmoid(per_head);
+        let per_head = silu(per_head);
         let per_head = self.ln2.forward(per_head);
         log_tensor_stats("smolgen.per_head", &per_head);
 
