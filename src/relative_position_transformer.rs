@@ -63,8 +63,8 @@ impl<B: Backend> FiLMRmsNorm<B> {
 #[derive(Module, Debug)]
 pub struct TransformerBlock<B: Backend> {
     attention: SmolgenAttention<B>,
-    norm_post_attn: FiLMRmsNorm<B>,
-    norm_post_mlp: FiLMRmsNorm<B>,
+    norm1: FiLMRmsNorm<B>,
+    norm2: FiLMRmsNorm<B>,
     mlp: MLP<B>,
 }
 
@@ -72,20 +72,18 @@ impl<B: Backend> TransformerBlock<B> {
     pub fn new(device: &Device<B>) -> Self {
         let config = get_global_config();
         let attention = SmolgenAttention::new(device);
-        let norm_post_attn =
-            FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
-        let norm_post_mlp =
-            FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
+        let norm1 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
+        let norm2 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
         let mlp = MLP::new(device);
         Self {
             attention,
-            norm_post_attn,
-            norm_post_mlp,
+            norm1,
+            norm2,
             mlp,
         }
     }
 
-    /// Forward pass without FiLM conditioning
+    /// Forward pass without FiLM conditioning (pre-norm)
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
@@ -94,39 +92,42 @@ impl<B: Backend> TransformerBlock<B> {
         let device = x.device();
         log_tensor_stats("block.input", &x);
 
+        // Pre-norm: norm before attention, then residual add
+        let normed1 = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_attn", &device);
+            self.norm1.forward_plain(x.clone())
+        };
+        log_tensor_stats("block.norm1", &normed1);
+
         let attn_out = {
             let _t = TimingScope::new_with_sync::<B>("block_attention", &device);
-            self.attention.forward(x.clone(), shared_weight_gen)
+            self.attention.forward(normed1, shared_weight_gen)
         };
         log_tensor_stats("block.attn_out", &attn_out);
 
-        let residual_attn = x + attn_out;
-        log_tensor_stats("block.post_attn", &residual_attn);
+        let x = x + attn_out;
+        log_tensor_stats("block.post_attn_residual", &x);
 
-        let post_attn = {
-            let _t = TimingScope::new_with_sync::<B>("block_norm_attn", &device);
-            self.norm_post_attn.forward_plain(residual_attn)
+        // Pre-norm: norm before MLP, then residual add
+        let normed2 = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_mlp", &device);
+            self.norm2.forward_plain(x.clone())
         };
-        log_tensor_stats("block.norm_post_attn", &post_attn);
+        log_tensor_stats("block.norm2", &normed2);
 
         let mlp_out = {
             let _t = TimingScope::new_with_sync::<B>("block_mlp", &device);
-            self.mlp.forward(post_attn.clone())
+            self.mlp.forward(normed2)
         };
         log_tensor_stats("block.mlp_out", &mlp_out);
 
-        let residual_mlp = post_attn + mlp_out;
-
-        let output = {
-            let _t = TimingScope::new_with_sync::<B>("block_norm_mlp", &device);
-            self.norm_post_mlp.forward_plain(residual_mlp)
-        };
+        let output = x + mlp_out;
         log_tensor_stats("block.output", &output);
 
         output
     }
 
-    /// Forward pass with FiLM conditioning from globals
+    /// Forward pass with FiLM conditioning from globals (pre-norm)
     /// globals: [batch, NUM_GLOBALS] - passed to each FiLMRmsNorm to generate gamma/beta
     pub fn forward_with_film(
         &self,
@@ -137,33 +138,36 @@ impl<B: Backend> TransformerBlock<B> {
         let device = x.device();
         log_tensor_stats("block.input", &x);
 
+        // Pre-norm: norm before attention, then residual add
+        let normed1 = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_attn", &device);
+            self.norm1.forward(x.clone(), globals.clone())
+        };
+        log_tensor_stats("block.norm1", &normed1);
+
         let attn_out = {
             let _t = TimingScope::new_with_sync::<B>("block_attention", &device);
-            self.attention.forward(x.clone(), shared_weight_gen)
+            self.attention.forward(normed1, shared_weight_gen)
         };
         log_tensor_stats("block.attn_out", &attn_out);
 
-        let residual_attn = x + attn_out;
-        log_tensor_stats("block.post_attn", &residual_attn);
+        let x = x + attn_out;
+        log_tensor_stats("block.post_attn_residual", &x);
 
-        let post_attn = {
-            let _t = TimingScope::new_with_sync::<B>("block_norm_attn", &device);
-            self.norm_post_attn.forward(residual_attn, globals.clone())
+        // Pre-norm: norm before MLP, then residual add
+        let normed2 = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_mlp", &device);
+            self.norm2.forward(x.clone(), globals)
         };
-        log_tensor_stats("block.norm_post_attn", &post_attn);
+        log_tensor_stats("block.norm2", &normed2);
 
         let mlp_out = {
             let _t = TimingScope::new_with_sync::<B>("block_mlp", &device);
-            self.mlp.forward(post_attn.clone())
+            self.mlp.forward(normed2)
         };
         log_tensor_stats("block.mlp_out", &mlp_out);
 
-        let residual_mlp = post_attn + mlp_out;
-
-        let output = {
-            let _t = TimingScope::new_with_sync::<B>("block_norm_mlp", &device);
-            self.norm_post_mlp.forward(residual_mlp, globals)
-        };
+        let output = x + mlp_out;
         log_tensor_stats("block.output", &output);
 
         output

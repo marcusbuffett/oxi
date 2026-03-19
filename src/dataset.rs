@@ -262,6 +262,7 @@ pub struct ChessBatch<B: Backend> {
     pub fens: Vec<String>,         // FENs for each position in the batch
     pub global_features: Tensor<B, 2, Float>,
     pub value_weights: Tensor<B, 1>, // [batch] - per-sample weights for value loss (ply ramp + puzzle mask)
+    pub material_imbalance: Tensor<B, 1>, // [batch] - normalized material imbalance for aux head
     // TODO: Remove these for less memory usage
     pub items: Vec<ChessItem>, // Original ChessItems for debugging/logging
 }
@@ -278,6 +279,7 @@ impl<B: Backend> ChessBatch<B> {
             fens: self.fens,
             global_features: self.global_features.to_device(device),
             value_weights: self.value_weights.to_device(device),
+            material_imbalance: self.material_imbalance.to_device(device),
             items: self.items,
         }
     }
@@ -317,6 +319,7 @@ where
         let mut time_usages_data = vec![0.0f32; batch_size];
         let mut global_features_data = vec![0.0f32; batch_size * NUM_GLOBALS];
         let mut value_weights_data = vec![0.0f32; batch_size];
+        let mut material_imbalance_data = vec![0.0f32; batch_size];
         let mut fens = Vec::with_capacity(batch_size);
         let config = get_global_config();
 
@@ -363,6 +366,10 @@ where
             };
             value_weights_data[i] = ply_weight * puzzle_mask;
 
+            // Normalize material imbalance to [-1, 1] by dividing by 39 (max possible)
+            material_imbalance_data[i] =
+                (item.material_imbalance as f32 / 39.0).clamp(-1.0, 1.0);
+
             fens.push(item.fen.clone());
         }
         let board_input =
@@ -398,6 +405,11 @@ where
         let value_weights =
             Tensor::<B, 1>::from_data(TensorData::from(value_weights_data.as_slice()), device);
 
+        let material_imbalance = Tensor::<B, 1>::from_data(
+            TensorData::from(material_imbalance_data.as_slice()),
+            device,
+        );
+
         ChessBatch {
             board_input,
             move_distributions,
@@ -409,6 +421,7 @@ where
             items,
             global_features,
             value_weights,
+            material_imbalance,
         }
     }
 }

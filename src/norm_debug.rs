@@ -23,6 +23,8 @@ struct TensorStats {
     l1: f32,
     entropy: f32,
     max_abs: f32,
+    /// Fraction of elements with |x| < 0.01 (detects dead/near-zero activations).
+    frac_near_zero: f32,
     numel: usize,
     shape: Vec<usize>,
 }
@@ -204,6 +206,14 @@ fn collect_stats<B: Backend, const D: usize>(tensor: &Tensor<B, D>) -> Option<Te
     let mean_abs = abs_tensor.clone().mean().into_scalar().elem::<f32>();
     let l1 = mean_abs * numel as f32;
     let max_abs = abs_tensor.clone().max().into_scalar().elem::<f32>();
+    let near_zero_count = abs_tensor
+        .clone()
+        .lower_elem(0.01)
+        .float()
+        .sum()
+        .into_scalar()
+        .elem::<f32>();
+    let frac_near_zero = near_zero_count / numel as f32;
     let abs_sum = abs_tensor.clone().sum().into_scalar().elem::<f32>();
     let entropy = if abs_sum <= 0.0 || !abs_sum.is_finite() {
         0.0
@@ -223,6 +233,7 @@ fn collect_stats<B: Backend, const D: usize>(tensor: &Tensor<B, D>) -> Option<Te
         l1,
         entropy,
         max_abs,
+        frac_near_zero,
         numel,
         shape: dims.to_vec(),
     })
@@ -266,7 +277,7 @@ pub fn log_tensor_stats<B: Backend, const D: usize>(label: &str, tensor: &Tensor
 
     info!(
         target: "norm_debug",
-        "norm_debug: [{}] layer={} label={} | l2={:.4} rms={:.4} mean={:.4} mean_abs={:.4} l1={:.4} entropy={:.4} max_abs={:.4} numel={} shape={:?}",
+        "norm_debug: [{}] layer={} label={} | l2={:.4} rms={:.4} mean={:.4} mean_abs={:.4} l1={:.4} entropy={:.4} max_abs={:.4} frac_near_zero={:.4} numel={} shape={:?}",
         stream,
         layer,
         label,
@@ -277,6 +288,7 @@ pub fn log_tensor_stats<B: Backend, const D: usize>(label: &str, tensor: &Tensor
         stats.l1,
         stats.entropy,
         stats.max_abs,
+        stats.frac_near_zero,
         stats.numel,
         stats.shape,
     );

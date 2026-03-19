@@ -66,6 +66,7 @@ fn format_status(status: &GradNormTaskStatus) -> String {
         GradNormTask::Policy => "policy",
         GradNormTask::Value => "value",
         GradNormTask::TimeUsage => "time",
+        GradNormTask::Auxiliary => "aux",
     };
 
     if !status.enabled {

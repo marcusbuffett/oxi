@@ -180,6 +180,9 @@ pub struct Config {
     /// Priority multiplier applied to time-usage GradNorm target (1.0 = neutral)
     pub gradnorm_time_priority: f32,
 
+    /// Priority multiplier applied to auxiliary GradNorm target (1.0 = neutral)
+    pub gradnorm_aux_priority: f32,
+
     /// Number of samples to materialize on the lead device when probing GradNorm weights
     #[serde(default)]
     pub gradnorm_probe_size: usize,
@@ -300,6 +303,10 @@ pub struct Config {
     /// Muon LR adjustment function: "original" or "match_rms_adamw"
     #[serde(default)]
     pub muon_lr_adjust: Option<String>,
+
+    /// Weight for auxiliary losses (mobility + material prediction)
+    #[serde(default = "default_aux_loss_weight")]
+    pub aux_loss_weight: f32,
 }
 
 // Serde default functions for backwards compatibility with older params.json files
@@ -316,13 +323,16 @@ fn default_use_muon() -> Option<bool> {
     Some(true)
 }
 fn default_muon_base_lr() -> f64 {
-    0.02
+    0.015 // Was 0.02; reduced 25% per Optuna sweep (lr_mult=0.75 optimal)
 }
 fn default_adamw_base_lr() -> f64 {
-    3e-4
+    2.25e-4 // Was 3e-4; reduced 25% per Optuna sweep
 }
 fn default_embedding_base_lr() -> f64 {
-    0.1 // Width-independent per μP; embeddings need much higher LR than hidden layers
+    0.075 // Was 0.1; reduced 25% per Optuna sweep. Width-independent per μP.
+}
+fn default_aux_loss_weight() -> f32 {
+    0.05
 }
 
 /// Command-line overrides for Config. All fields are optional.
@@ -483,6 +493,10 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub gradnorm_time_priority: Option<f32>,
 
+    /// Priority multiplier applied to auxiliary GradNorm target
+    #[arg(long)]
+    pub gradnorm_aux_priority: Option<f32>,
+
     /// Number of samples to materialize on the lead device when probing GradNorm weights
     #[arg(long)]
     pub gradnorm_probe_size: Option<usize>,
@@ -622,6 +636,10 @@ pub struct ConfigOverrides {
     /// Muon LR adjustment function: "original" or "match_rms_adamw"
     #[arg(long)]
     pub muon_lr_adjust: Option<String>,
+
+    /// Weight for auxiliary losses (mobility + material prediction)
+    #[arg(long)]
+    pub aux_loss_weight: Option<f32>,
 }
 
 impl Config {
@@ -740,6 +758,9 @@ impl Config {
         if let Some(v) = overrides.gradnorm_time_priority {
             config.gradnorm_time_priority = v;
         }
+        if let Some(v) = overrides.gradnorm_aux_priority {
+            config.gradnorm_aux_priority = v;
+        }
         if let Some(v) = overrides.gradnorm_probe_size {
             config.gradnorm_probe_size = v;
         }
@@ -849,6 +870,9 @@ impl Config {
         if let Some(v) = overrides.muon_lr_adjust {
             config.muon_lr_adjust = Some(v);
         }
+        if let Some(v) = overrides.aux_loss_weight {
+            config.aux_loss_weight = v;
+        }
 
         config
     }
@@ -943,6 +967,10 @@ impl Config {
 
     pub fn gradnorm_time_priority(&self) -> f32 {
         self.gradnorm_time_priority.max(0.0)
+    }
+
+    pub fn gradnorm_aux_priority(&self) -> f32 {
+        self.gradnorm_aux_priority.max(0.0)
     }
 
     pub fn gradnorm_probe_size(&self) -> usize {
@@ -1048,10 +1076,11 @@ impl Default for Config {
             enable_gradnorm: Some(true),
             gradnorm_interval: 20,
             gradnorm_alpha: 0.5,
-            gradnorm_learning_rate: 0.5,
-            gradnorm_policy_priority: 20.0,
+            gradnorm_learning_rate: 0.1,
+            gradnorm_policy_priority: 5.0,
             gradnorm_value_priority: 1.0,
             gradnorm_time_priority: 1.0,
+            gradnorm_aux_priority: 0.5,
             gradnorm_probe_size: 256,
             lr_min: 0.000001,
             lr_window_size: 1000,
@@ -1108,6 +1137,7 @@ impl Default for Config {
 
             use_muon: Some(true),
             muon_lr_adjust: None,
+            aux_loss_weight: default_aux_loss_weight(),
         }
     }
 }

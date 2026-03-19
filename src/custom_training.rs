@@ -421,6 +421,7 @@ struct GradNormWeights {
     policy: f32,
     value: f32,
     time: f32,
+    aux: f32,
 }
 
 impl GradNormWeights {
@@ -429,15 +430,17 @@ impl GradNormWeights {
             policy: state.weight_for(GradNormTask::Policy),
             value: state.weight_for(GradNormTask::Value),
             time: state.weight_for(GradNormTask::TimeUsage),
+            aux: state.weight_for(GradNormTask::Auxiliary),
         }
     }
 
-    /// Create weights for value tower only training: policy=0, time=0
+    /// Create weights for value tower only training: policy=0, time=0, aux=0
     fn for_value_tower_only(state: &GradNormState) -> Self {
         Self {
             policy: 0.0,
             value: state.weight_for(GradNormTask::Value),
             time: 0.0,
+            aux: 0.0,
         }
     }
 }
@@ -448,9 +451,11 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         policy_loss: output.policy_loss.to_device(device),
         value_loss: output.value_loss.to_device(device),
         time_usage_loss: output.time_usage_loss.to_device(device),
+        aux_loss: output.aux_loss.to_device(device),
         base_policy_loss: output.base_policy_loss.to_device(device),
         base_value_loss: output.base_value_loss.to_device(device),
         base_time_usage_loss: output.base_time_usage_loss.to_device(device),
+        base_aux_loss: output.base_aux_loss.to_device(device),
         policy_output: output.policy_output.to_device(device),
         policy_targets: output.policy_targets.to_device(device),
         value_output: output.value_output.to_device(device),
@@ -464,6 +469,15 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         raw_time_usage_loss: output
             .raw_time_usage_loss
             .map(|tensor| tensor.to_device(device)),
+        aux_mobility_loss: output.aux_mobility_loss,
+        aux_material_loss: output.aux_material_loss,
+        aux_mobility_mae: output.aux_mobility_mae,
+        aux_material_mae: output.aux_material_mae,
+        aux_side_info_loss: output.aux_side_info_loss,
+        aux_from_square_loss: output.aux_from_square_loss,
+        aux_to_square_loss: output.aux_to_square_loss,
+        aux_from_square_accuracy: output.aux_from_square_accuracy,
+        aux_to_square_accuracy: output.aux_to_square_accuracy,
     }
     .detach()
 }
@@ -475,8 +489,11 @@ fn apply_gradnorm_weights_to_output<B: Backend>(
     output.policy_loss = output.base_policy_loss.clone() * weights.policy;
     output.value_loss = output.base_value_loss.clone() * weights.value;
     output.time_usage_loss = output.base_time_usage_loss.clone() * weights.time;
-    output.loss =
-        output.policy_loss.clone() + output.value_loss.clone() + output.time_usage_loss.clone();
+    output.aux_loss = output.base_aux_loss.clone() * weights.aux;
+    output.loss = output.policy_loss.clone()
+        + output.value_loss.clone()
+        + output.time_usage_loss.clone()
+        + output.aux_loss.clone();
 }
 
 fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -> ChessOutput<B> {
@@ -490,9 +507,21 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_policy_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_value_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_time_loss = Tensor::<B, 1>::zeros([1], device);
+    let mut sum_aux_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_policy_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_value_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_time_loss = Tensor::<B, 1>::zeros([1], device);
+    let mut sum_base_aux_loss = Tensor::<B, 1>::zeros([1], device);
+
+    let mut sum_aux_mobility_loss = 0.0f32;
+    let mut sum_aux_material_loss = 0.0f32;
+    let mut sum_aux_mobility_mae = 0.0f32;
+    let mut sum_aux_material_mae = 0.0f32;
+    let mut sum_aux_side_info_loss = 0.0f32;
+    let mut sum_aux_from_square_loss = 0.0f32;
+    let mut sum_aux_to_square_loss = 0.0f32;
+    let mut sum_aux_from_square_accuracy = 0.0f32;
+    let mut sum_aux_to_square_accuracy = 0.0f32;
 
     let all_raw_policy = outputs.iter().all(|o| o.raw_policy_loss.is_some());
     let all_raw_value = outputs.iter().all(|o| o.raw_value_loss.is_some());
@@ -517,12 +546,24 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_policy_loss = sum_policy_loss + output.policy_loss.clone() * batch_scalar;
         sum_value_loss = sum_value_loss + output.value_loss.clone() * batch_scalar;
         sum_time_loss = sum_time_loss + output.time_usage_loss.clone() * batch_scalar;
+        sum_aux_loss = sum_aux_loss + output.aux_loss.clone() * batch_scalar;
 
         sum_base_policy_loss =
             sum_base_policy_loss + output.base_policy_loss.clone() * batch_scalar;
         sum_base_value_loss = sum_base_value_loss + output.base_value_loss.clone() * batch_scalar;
         sum_base_time_loss =
             sum_base_time_loss + output.base_time_usage_loss.clone() * batch_scalar;
+        sum_base_aux_loss = sum_base_aux_loss + output.base_aux_loss.clone() * batch_scalar;
+
+        sum_aux_mobility_loss += output.aux_mobility_loss * batch_scalar;
+        sum_aux_material_loss += output.aux_material_loss * batch_scalar;
+        sum_aux_mobility_mae += output.aux_mobility_mae * batch_scalar;
+        sum_aux_material_mae += output.aux_material_mae * batch_scalar;
+        sum_aux_side_info_loss += output.aux_side_info_loss * batch_scalar;
+        sum_aux_from_square_loss += output.aux_from_square_loss * batch_scalar;
+        sum_aux_to_square_loss += output.aux_to_square_loss * batch_scalar;
+        sum_aux_from_square_accuracy += output.aux_from_square_accuracy * batch_scalar;
+        sum_aux_to_square_accuracy += output.aux_to_square_accuracy * batch_scalar;
 
         if let Some(sum) = sum_raw_policy_loss.as_mut() {
             if let Some(raw) = output.raw_policy_loss.as_ref() {
@@ -556,10 +597,12 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let policy_loss = sum_policy_loss / total_scalar;
     let value_loss = sum_value_loss / total_scalar;
     let time_usage_loss = sum_time_loss / total_scalar;
+    let aux_loss = sum_aux_loss / total_scalar;
 
     let base_policy_loss = sum_base_policy_loss / total_scalar;
     let base_value_loss = sum_base_value_loss / total_scalar;
     let base_time_usage_loss = sum_base_time_loss / total_scalar;
+    let base_aux_loss = sum_base_aux_loss / total_scalar;
 
     let raw_policy_loss = sum_raw_policy_loss.map(|sum| sum / total_scalar);
     let raw_value_loss = sum_raw_value_loss.map(|sum| sum / total_scalar);
@@ -578,9 +621,11 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         policy_loss,
         value_loss,
         time_usage_loss,
+        aux_loss,
         base_policy_loss,
         base_value_loss,
         base_time_usage_loss,
+        base_aux_loss,
         policy_output,
         policy_targets,
         value_output,
@@ -590,6 +635,15 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         raw_policy_loss,
         raw_value_loss,
         raw_time_usage_loss,
+        aux_mobility_loss: sum_aux_mobility_loss / total_scalar,
+        aux_material_loss: sum_aux_material_loss / total_scalar,
+        aux_mobility_mae: sum_aux_mobility_mae / total_scalar,
+        aux_material_mae: sum_aux_material_mae / total_scalar,
+        aux_side_info_loss: sum_aux_side_info_loss / total_scalar,
+        aux_from_square_loss: sum_aux_from_square_loss / total_scalar,
+        aux_to_square_loss: sum_aux_to_square_loss / total_scalar,
+        aux_from_square_accuracy: sum_aux_from_square_accuracy / total_scalar,
+        aux_to_square_accuracy: sum_aux_to_square_accuracy / total_scalar,
     }
     .detach()
 }
@@ -609,6 +663,7 @@ where
         (GradNormTask::Policy, weights.policy),
         (GradNormTask::Value, weights.value),
         (GradNormTask::TimeUsage, weights.time),
+        (GradNormTask::Auxiliary, weights.aux),
     ];
 
     for (task, weight) in tasks {
@@ -621,10 +676,13 @@ where
             GradNormTask::Policy => output.base_policy_loss.clone(),
             GradNormTask::Value => output.base_value_loss.clone(),
             GradNormTask::TimeUsage => output.base_time_usage_loss.clone(),
+            GradNormTask::Auxiliary => output.base_aux_loss.clone(),
         };
         let base_loss_value = base_loss_tensor.clone().into_scalar().elem::<f32>();
-        let weighted_loss = base_loss_tensor * weight;
-        let grads = weighted_loss.backward();
+        // Use base (unweighted) loss for gradient norm measurement.
+        // GradNorm needs to compare the *intrinsic* gradient magnitudes of each task,
+        // not the currently-weighted ones, to avoid a feedback loop.
+        let grads = base_loss_tensor.backward();
         let grads_params = GradientsParams::from_grads(grads, &model);
         let breakdown = compute_gradient_norm_with_breakdown(&grads_params, &model, false);
         results.push(GradNormProbeResult {
@@ -912,14 +970,18 @@ fn log_gradient_breakdown(
     breakdown: &GradientNormBreakdown,
     config: &Config,
     optimizer_step: usize,
+    muon_lr: f64,
+    adamw_lr: f64,
+    embedding_lr: f64,
 ) {
     tracing::info!(
         target: "gradient_debug",
-        "gradient_debug: step={} total_grad_norm={:.6}",
+        "gradient_debug: step={} total_grad_norm={:.4e}",
         optimizer_step,
         breakdown.total()
     );
 
+    // Log per-layer diagnostics: grad_norm, weight_norm, update_ratio, SNR
     for layer in breakdown
         .per_layer
         .iter()
@@ -927,16 +989,104 @@ fn log_gradient_breakdown(
     {
         tracing::info!(
             target: "gradient_debug",
-            "gradient_debug: layer={} grad_norm={:.6}",
+            "gradient_debug: layer={} grad_norm={:.4e} weight_norm={:.4e} update_ratio={:.4e} snr={:.4e} grad_mean={:.4e} grad_std={:.4e} numel={}",
             layer.name,
-            layer.norm
+            layer.norm,
+            layer.weight_norm,
+            layer.update_ratio,
+            layer.grad_snr,
+            layer.grad_mean,
+            layer.grad_std,
+            layer.numel,
+        );
+    }
+
+    // Log effective update ratios accounting for optimizer type
+    // For Muon layers: NS orthogonalizes the gradient, so raw grad norms are meaningless.
+    // The actual update: delta = muon_lr * lr_adjust(shape) * NS(momentum(grad))
+    // ||NS(.)|| = sqrt(min(A,B)), so ||delta||_F = muon_lr * lr_adjust * sqrt(min(A,B))
+    // We precomputed muon_update_scale = sqrt(sum of (sqrt(min(A,B)) * lr_adjust)^2) per layer.
+    tracing::info!(
+        target: "gradient_debug",
+        "gradient_debug: effective_lrs muon={:.4e} adamw={:.4e} embedding={:.4e}",
+        muon_lr, adamw_lr, embedding_lr,
+    );
+
+    for layer in breakdown
+        .per_layer
+        .iter()
+        .filter(|l| l.muon_numel > 0)
+        .take(config.gradient_layer_limit())
+    {
+        // ||update||_F = muon_lr * muon_update_scale
+        let update_frob = muon_lr * layer.muon_update_scale;
+        let update_rms = update_frob / (layer.muon_numel as f64).sqrt();
+        let muon_update_ratio = if layer.muon_weight_rms > 0.0 {
+            update_rms / layer.muon_weight_rms
+        } else {
+            0.0
+        };
+        tracing::info!(
+            target: "gradient_debug",
+            "gradient_debug: muon_update layer={} update_rms={:.4e} weight_rms={:.4e} ratio={:.4e} muon_numel={}",
+            layer.name,
+            update_rms,
+            layer.muon_weight_rms,
+            muon_update_ratio,
+            layer.muon_numel,
+        );
+    }
+
+    // Log layer gradient ratio summary (first block vs last block, max/min ratio)
+    let block_layers: Vec<&_> = breakdown
+        .per_layer
+        .iter()
+        .filter(|l| l.name.starts_with("blocks."))
+        .collect();
+    if block_layers.len() >= 2 {
+        // Sort by block index for first/last comparison
+        let mut sorted_blocks: Vec<&_> = block_layers.clone();
+        sorted_blocks.sort_by_key(|l| {
+            l.name
+                .strip_prefix("blocks.")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0)
+        });
+        let first_norm = sorted_blocks.first().map(|l| l.norm).unwrap_or(0.0);
+        let last_norm = sorted_blocks.last().map(|l| l.norm).unwrap_or(0.0);
+        let first_last_ratio = if last_norm > 0.0 {
+            first_norm / last_norm
+        } else {
+            f64::INFINITY
+        };
+
+        let max_norm = block_layers.iter().map(|l| l.norm).fold(0.0_f64, f64::max);
+        let min_norm = block_layers
+            .iter()
+            .map(|l| l.norm)
+            .fold(f64::INFINITY, f64::min);
+        let max_min_ratio = if min_norm > 0.0 {
+            max_norm / min_norm
+        } else {
+            f64::INFINITY
+        };
+
+        tracing::info!(
+            target: "gradient_debug",
+            "gradient_debug: layer_ratio first/last={:.2} max/min={:.2} (first={:.4e} last={:.4e} max={:.4e} min={:.4e})",
+            first_last_ratio,
+            max_min_ratio,
+            first_norm,
+            last_norm,
+            max_norm,
+            min_norm,
         );
     }
 
     for head in breakdown.per_head.iter().take(config.gradient_head_limit()) {
         tracing::info!(
             target: "gradient_debug",
-            "gradient_debug: layer={} projection={} head={} grad_norm={:.6}",
+            "gradient_debug: layer={} projection={} head={} grad_norm={:.4e}",
             head.layer,
             head.component.as_str(),
             head.head_index,
@@ -2403,7 +2553,17 @@ where
             }
 
             if need_breakdown {
-                log_gradient_breakdown(&gradient_breakdown, &config, next_step);
+                let bd_adamw_lr = current_lr;
+                let bd_muon_lr = current_lr * muon_to_adamw_lr_ratio;
+                let bd_embedding_lr = current_lr * lr_multiplier;
+                log_gradient_breakdown(
+                    &gradient_breakdown,
+                    &config,
+                    next_step,
+                    bd_muon_lr,
+                    bd_adamw_lr,
+                    bd_embedding_lr,
+                );
             }
 
             // Compute and log L2 penalty from weight decay at full metrics interval
@@ -2598,6 +2758,109 @@ where
             metric_logger.log("time_usage_loss", iteration, value);
         }
         let time_usage_metric_time = t_time_usage.elapsed();
+
+        // Aux head metrics (mobility + material)
+        if output.aux_mobility_loss > 0.0 || output.aux_material_loss > 0.0 {
+            let mob_loss = output.aux_mobility_loss as f64;
+            let mat_loss = output.aux_material_loss as f64;
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Loss|Mobility".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Mobility MSE: {mob_loss:.6}"),
+                    format!("{mob_loss:.6}"),
+                ),
+                value: NumericEntry::Value(mob_loss),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Loss|Material".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Material MSE: {mat_loss:.6}"),
+                    format!("{mat_loss:.6}"),
+                ),
+                value: NumericEntry::Value(mat_loss),
+            });
+            metric_logger.log("aux_mobility_loss", iteration, mob_loss);
+            metric_logger.log("aux_material_loss", iteration, mat_loss);
+
+            let mob_mae = output.aux_mobility_mae as f64;
+            let mat_mae = output.aux_material_mae as f64;
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Head MAE|Mobility".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Mobility MAE: {mob_mae:.4}"),
+                    format!("{mob_mae:.4}"),
+                ),
+                value: NumericEntry::Value(mob_mae),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Head MAE|Material".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Material MAE: {mat_mae:.4}"),
+                    format!("{mat_mae:.4}"),
+                ),
+                value: NumericEntry::Value(mat_mae),
+            });
+            metric_logger.log("aux_mobility_mae", iteration, mob_mae);
+            metric_logger.log("aux_material_mae", iteration, mat_mae);
+        }
+
+        // Maia 2-style auxiliary metrics (side info, from/to square)
+        if output.aux_side_info_loss > 0.0
+            || output.aux_from_square_loss > 0.0
+            || output.aux_to_square_loss > 0.0
+        {
+            let si_loss = output.aux_side_info_loss as f64;
+            let from_loss = output.aux_from_square_loss as f64;
+            let to_loss = output.aux_to_square_loss as f64;
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Loss|Side Info".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Side Info BCE: {si_loss:.6}"),
+                    format!("{si_loss:.6}"),
+                ),
+                value: NumericEntry::Value(si_loss),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Loss|From Sq".to_string(),
+                entry: SerializedEntry::new(
+                    format!("From Sq BCE: {from_loss:.6}"),
+                    format!("{from_loss:.6}"),
+                ),
+                value: NumericEntry::Value(from_loss),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Loss|To Sq".to_string(),
+                entry: SerializedEntry::new(
+                    format!("To Sq BCE: {to_loss:.6}"),
+                    format!("{to_loss:.6}"),
+                ),
+                value: NumericEntry::Value(to_loss),
+            });
+            metric_logger.log("aux_side_info_loss", iteration, si_loss);
+            metric_logger.log("aux_from_square_loss", iteration, from_loss);
+            metric_logger.log("aux_to_square_loss", iteration, to_loss);
+
+            let from_acc = output.aux_from_square_accuracy as f64;
+            let to_acc = output.aux_to_square_accuracy as f64;
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Accuracy|From Sq".to_string(),
+                entry: SerializedEntry::new(
+                    format!("From Sq Acc: {from_acc:.4}"),
+                    format!("{from_acc:.4}"),
+                ),
+                value: NumericEntry::Value(from_acc),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Aux Accuracy|To Sq".to_string(),
+                entry: SerializedEntry::new(
+                    format!("To Sq Acc: {to_acc:.4}"),
+                    format!("{to_acc:.4}"),
+                ),
+                value: NumericEntry::Value(to_acc),
+            });
+            metric_logger.log("aux_from_square_accuracy", iteration, from_acc);
+            metric_logger.log("aux_to_square_accuracy", iteration, to_acc);
+        }
 
         let t_top1 = Instant::now();
         let _move_top1_entry = move_top1_metric.update(&output.adapt(), &metadata);

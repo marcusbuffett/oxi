@@ -33,6 +33,10 @@ pub struct ChessOutput<B: Backend> {
     pub base_value_loss: Tensor<B, 1>,
     /// Base (unweighted) time usage loss
     pub base_time_usage_loss: Tensor<B, 1>,
+    /// The auxiliary loss component (after GradNorm weighting)
+    pub aux_loss: Tensor<B, 1>,
+    /// Base (unweighted) auxiliary loss (mobility + material)
+    pub base_aux_loss: Tensor<B, 1>,
     /// The policy output (masked move logits)
     pub policy_output: Tensor<B, 2>,
     /// The policy targets (for move accuracy)
@@ -45,6 +49,18 @@ pub struct ChessOutput<B: Backend> {
     pub legal_moves_mask: Tensor<B, 2>,
     /// Uncertainty values (sigma) for each loss component
     pub uncertainties: Option<(f32, f32, f32)>,
+    /// Individual aux loss components (for charting)
+    pub aux_mobility_loss: f32,
+    pub aux_material_loss: f32,
+    /// Aux head accuracy metrics (MAE)
+    pub aux_mobility_mae: f32,
+    pub aux_material_mae: f32,
+    /// Maia 2-style auxiliary metrics
+    pub aux_side_info_loss: f32,
+    pub aux_from_square_loss: f32,
+    pub aux_to_square_loss: f32,
+    pub aux_from_square_accuracy: f32,
+    pub aux_to_square_accuracy: f32,
 }
 
 impl<B: Backend> ChessOutput<B> {
@@ -55,6 +71,7 @@ impl<B: Backend> ChessOutput<B> {
         policy_loss: Tensor<B, 1>,
         value_loss: Tensor<B, 1>,
         time_usage_loss: Tensor<B, 1>,
+        aux_loss: Tensor<B, 1>,
         policy_output: Tensor<B, 2>,
         policy_targets: Tensor<B, 1, Int>,
         value_output: Tensor<B, 2>,
@@ -64,12 +81,15 @@ impl<B: Backend> ChessOutput<B> {
         let base_policy_loss = policy_loss.clone();
         let base_value_loss = value_loss.clone();
         let base_time_usage_loss = time_usage_loss.clone();
+        let base_aux_loss = aux_loss.clone();
 
         Self {
             loss,
             policy_loss,
             value_loss,
             time_usage_loss,
+            aux_loss,
+            base_aux_loss,
             base_policy_loss,
             base_value_loss,
             base_time_usage_loss,
@@ -82,7 +102,48 @@ impl<B: Backend> ChessOutput<B> {
             raw_policy_loss: None,
             raw_value_loss: None,
             raw_time_usage_loss: None,
+            aux_mobility_loss: 0.0,
+            aux_material_loss: 0.0,
+            aux_mobility_mae: 0.0,
+            aux_material_mae: 0.0,
+            aux_side_info_loss: 0.0,
+            aux_from_square_loss: 0.0,
+            aux_to_square_loss: 0.0,
+            aux_from_square_accuracy: 0.0,
+            aux_to_square_accuracy: 0.0,
         }
+    }
+
+    /// Sets aux head metrics for charting
+    pub fn with_aux_metrics(
+        mut self,
+        mobility_loss: f32,
+        material_loss: f32,
+        mobility_mae: f32,
+        material_mae: f32,
+    ) -> Self {
+        self.aux_mobility_loss = mobility_loss;
+        self.aux_material_loss = material_loss;
+        self.aux_mobility_mae = mobility_mae;
+        self.aux_material_mae = material_mae;
+        self
+    }
+
+    /// Sets Maia 2-style auxiliary metrics
+    pub fn with_maia_metrics(
+        mut self,
+        side_info_loss: f32,
+        from_square_loss: f32,
+        to_square_loss: f32,
+        from_square_accuracy: f32,
+        to_square_accuracy: f32,
+    ) -> Self {
+        self.aux_side_info_loss = side_info_loss;
+        self.aux_from_square_loss = from_square_loss;
+        self.aux_to_square_loss = to_square_loss;
+        self.aux_from_square_accuracy = from_square_accuracy;
+        self.aux_to_square_accuracy = to_square_accuracy;
+        self
     }
 
     /// Sets the uncertainty values
@@ -116,10 +177,12 @@ impl<B: Backend> ChessOutput<B> {
         base_policy_loss: Tensor<B, 1>,
         base_value_loss: Tensor<B, 1>,
         base_time_usage_loss: Tensor<B, 1>,
+        base_aux_loss: Tensor<B, 1>,
     ) -> Self {
         self.base_policy_loss = base_policy_loss;
         self.base_value_loss = base_value_loss;
         self.base_time_usage_loss = base_time_usage_loss;
+        self.base_aux_loss = base_aux_loss;
         self
     }
 
@@ -132,7 +195,7 @@ impl<B: Backend> ChessOutput<B> {
             &self.raw_time_usage_loss,
         ) {
             // Use raw losses if available (same as LossMetric)
-            raw_policy.clone() + raw_value.clone() + raw_time.clone()
+            raw_policy.clone() + raw_value.clone() + raw_time.clone() + self.aux_loss.clone()
         } else {
             // Fallback to combined loss
             self.loss.clone()
@@ -146,9 +209,11 @@ impl<B: Backend> ChessOutput<B> {
             policy_loss: self.policy_loss.detach(),
             value_loss: self.value_loss.detach(),
             time_usage_loss: self.time_usage_loss.detach(),
+            aux_loss: self.aux_loss.detach(),
             base_policy_loss: self.base_policy_loss.detach(),
             base_value_loss: self.base_value_loss.detach(),
             base_time_usage_loss: self.base_time_usage_loss.detach(),
+            base_aux_loss: self.base_aux_loss.detach(),
             policy_output: self.policy_output.detach(),
             policy_targets: self.policy_targets,
             value_output: self.value_output.detach(),
@@ -158,6 +223,15 @@ impl<B: Backend> ChessOutput<B> {
             raw_policy_loss: self.raw_policy_loss.map(|tensor| tensor.detach()),
             raw_value_loss: self.raw_value_loss.map(|tensor| tensor.detach()),
             raw_time_usage_loss: self.raw_time_usage_loss.map(|tensor| tensor.detach()),
+            aux_mobility_loss: self.aux_mobility_loss,
+            aux_material_loss: self.aux_material_loss,
+            aux_mobility_mae: self.aux_mobility_mae,
+            aux_material_mae: self.aux_material_mae,
+            aux_side_info_loss: self.aux_side_info_loss,
+            aux_from_square_loss: self.aux_from_square_loss,
+            aux_to_square_loss: self.aux_to_square_loss,
+            aux_from_square_accuracy: self.aux_from_square_accuracy,
+            aux_to_square_accuracy: self.aux_to_square_accuracy,
         }
     }
 }
@@ -240,16 +314,26 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
 
     fn sync(self) -> Self::ItemSync {
         let uncertainties = self.uncertainties;
+        let aux_mobility_loss = self.aux_mobility_loss;
+        let aux_material_loss = self.aux_material_loss;
+        let aux_mobility_mae = self.aux_mobility_mae;
+        let aux_material_mae = self.aux_material_mae;
+        let aux_side_info_loss = self.aux_side_info_loss;
+        let aux_from_square_loss = self.aux_from_square_loss;
+        let aux_to_square_loss = self.aux_to_square_loss;
+        let aux_from_square_accuracy = self.aux_from_square_accuracy;
+        let aux_to_square_accuracy = self.aux_to_square_accuracy;
         let raw_policy_loss = self.raw_policy_loss;
         let raw_value_loss = self.raw_value_loss;
         let raw_time_usage_loss = self.raw_time_usage_loss;
 
-        let [loss, policy_loss, value_loss, time_usage_loss, policy_output, policy_targets, value_output, value_targets, legal_moves_mask] =
+        let [loss, policy_loss, value_loss, time_usage_loss, aux_loss, policy_output, policy_targets, value_output, value_targets, legal_moves_mask] =
             Transaction::default()
                 .register(self.loss)
                 .register(self.policy_loss)
                 .register(self.value_loss)
                 .register(self.time_usage_loss)
+                .register(self.aux_loss)
                 .register(self.policy_output)
                 .register(self.policy_targets)
                 .register(self.value_output)
@@ -293,9 +377,11 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             policy_loss: Tensor::from_data(policy_loss.clone(), device),
             value_loss: Tensor::from_data(value_loss.clone(), device),
             time_usage_loss: Tensor::from_data(time_usage_loss.clone(), device),
+            aux_loss: Tensor::from_data(aux_loss.clone(), device),
             base_policy_loss: Tensor::from_data(policy_loss, device),
             base_value_loss: Tensor::from_data(value_loss, device),
             base_time_usage_loss: Tensor::from_data(time_usage_loss, device),
+            base_aux_loss: Tensor::from_data(aux_loss, device),
             policy_output: Tensor::from_data(policy_output, device),
             policy_targets: Tensor::from_data(policy_targets, device),
             value_output: Tensor::from_data(value_output, device),
@@ -305,6 +391,15 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             raw_policy_loss: synced_raw_policy_loss,
             raw_value_loss: synced_raw_value_loss,
             raw_time_usage_loss: synced_raw_time_usage_loss,
+            aux_mobility_loss,
+            aux_material_loss,
+            aux_mobility_mae,
+            aux_material_mae,
+            aux_side_info_loss,
+            aux_from_square_loss,
+            aux_to_square_loss,
+            aux_from_square_accuracy,
+            aux_to_square_accuracy,
         }
     }
 }

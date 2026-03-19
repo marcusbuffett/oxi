@@ -241,7 +241,8 @@ impl<B: AutodiffBackend> WeightDecayClassifier<B> {
         };
 
         // Muon is for 2D+ weight matrices in hidden layers only.
-        // Exclude: embeddings, output/head layers, biases, layer norms, 1D params.
+        // Exclude: embeddings, output/head layers, biases, layer norms, 1D params,
+        // and shared weights with structurally low gradient SNR.
         let use_muon = crate::config::get_global_config().use_muon();
         let is_embedding =
             path_contains(path, "token_embed") || path_contains(path, "global_embed");
@@ -253,13 +254,23 @@ impl<B: AutodiffBackend> WeightDecayClassifier<B> {
             || path_contains(path, "beta")
             || path_contains(path, "norm");
         let is_bias = path_contains(path, "bias");
+        // SmolgenWeightGen is shared across all attention layers. Gradients from
+        // different layers cancel (SNR ~1e-9), making Muon's fixed-RMS updates a
+        // random walk. AdamW respects gradient magnitude and handles this correctly.
+        let is_shared_weight = path_contains(path, "smolgen_weight_gen");
 
-        let optimizer =
-            if use_muon && dims >= 2 && !is_embedding && !is_output_head && !is_norm && !is_bias {
-                OptimizerType::Muon
-            } else {
-                OptimizerType::AdamW
-            };
+        let optimizer = if use_muon
+            && dims >= 2
+            && !is_embedding
+            && !is_output_head
+            && !is_norm
+            && !is_bias
+            && !is_shared_weight
+        {
+            OptimizerType::Muon
+        } else {
+            OptimizerType::AdamW
+        };
 
         ParameterGroup {
             decay,

@@ -55,6 +55,10 @@ pub struct OXIModel<B: Backend> {
     policy_block: TransformerBlock<B>,
     value_block: TransformerBlock<B>,
     time_block: TransformerBlock<B>,
+    aux_mobility_head: Linear<B>,
+    aux_material_head: Linear<B>,
+    aux_from_square_head: Linear<B>,
+    aux_to_square_head: Linear<B>,
 }
 
 impl<B: Backend> OXIModel<B> {
@@ -144,6 +148,20 @@ impl<B: Backend> OXIModel<B> {
         let value_block = TransformerBlock::new(device);
         let time_block = TransformerBlock::new(device);
 
+        // Auxiliary prediction heads
+        let aux_mobility_head = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
+        let aux_material_head = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
+        let aux_from_square_head = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
+        let aux_to_square_head = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
+
         Self {
             token_embed,
             conv_layers,
@@ -170,6 +188,10 @@ impl<B: Backend> OXIModel<B> {
             policy_block,
             value_block,
             time_block,
+            aux_mobility_head,
+            aux_material_head,
+            aux_from_square_head,
+            aux_to_square_head,
         }
     }
 
@@ -178,6 +200,16 @@ impl<B: Backend> OXIModel<B> {
         board: Tensor<B, 3>,
         globals: Tensor<B, 2, Float>,
     ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
+        let (policy, value, side_info, time_usage, _trunk) =
+            self.forward_with_trunk(board, globals);
+        (policy, value, side_info, time_usage)
+    }
+
+    fn forward_with_trunk(
+        &self,
+        board: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 3>) {
         start_forward_pass();
         let device = board.device();
         let total_timing = TimingScope::new_with_sync::<B>("forward_total", &device);
@@ -284,8 +316,31 @@ impl<B: Backend> OXIModel<B> {
         };
 
         let aux_batch_size = board.dims()[0];
-        let value_logits = Tensor::zeros([aux_batch_size, 3], &device);
-        let side_info_logits = Tensor::zeros([aux_batch_size, 13], &device);
+        let embed_dim = x.dims()[2];
+
+        // Value head: value_block → attention pooling → hidden → WDL logits
+        let value_logits = {
+            let _stream = StreamScope::enter("value");
+            let _timing = TimingScope::new_with_sync::<B>("value_head", &device);
+            let value_tokens = self.value_block.forward(x.clone(), &self.smolgen_weight_gen);
+            log_tensor_stats("value.tokens", &value_tokens);
+
+            // Attention pooling: fc1 → silu → fc2 → softmax → weighted sum
+            let pool_hidden = silu(self.value_pool_fc1.forward(value_tokens.clone()));
+            let pool_weights = softmax(self.value_pool_fc2.forward(pool_hidden).reshape([aux_batch_size, 64]), 1)
+                .reshape([aux_batch_size, 64, 1]);
+            let pooled = (value_tokens * pool_weights).sum_dim(1).reshape([aux_batch_size, embed_dim]);
+            log_tensor_stats("value.pooled", &pooled);
+
+            // Concat with globals, hidden layer, output
+            let with_globals = Tensor::cat(vec![pooled, globals.clone()], 1);
+            let hidden = silu(self.value_head_hidden.forward(with_globals));
+            self.value_head.forward(hidden)
+        };
+        log_tensor_stats("value.logits", &value_logits);
+
+        let trunk_pooled = x.clone().mean_dim(1).reshape([aux_batch_size, embed_dim]);
+        let side_info_logits = self.side_info_head.forward(trunk_pooled);
         let time_usage_logits = Tensor::zeros([aux_batch_size, 2], &device);
 
         drop(total_timing);
@@ -295,6 +350,7 @@ impl<B: Backend> OXIModel<B> {
             value_logits,
             side_info_logits,
             time_usage_logits,
+            x,
         )
     }
 
@@ -310,8 +366,8 @@ impl<B: Backend> OXIModel<B> {
         let config = get_global_config();
         let batch_size = batch.board_input.shape().dims[0];
 
-        let (policy_logits, value_logits, _side_info_logits, time_usage_logits) =
-            self.forward(batch.board_input, batch.global_features);
+        let (policy_logits, value_logits, _side_info_logits, time_usage_logits, trunk_output) =
+            self.forward_with_trunk(batch.board_input, batch.global_features);
 
         let policy_logits_flat_original = policy_logits.reshape([batch_size, LEGAL_MOVES]);
 
@@ -402,8 +458,105 @@ impl<B: Backend> OXIModel<B> {
         let base_policy_loss = policy_loss.clone();
         let config_weighted_policy_loss = base_policy_loss.clone() * config.policy_loss_weight;
 
-        let loss =
-            config_weighted_policy_loss.clone() + value_term.clone() + time_usage_term.clone();
+        // Auxiliary losses (mobility + material prediction)
+        let (base_aux_loss, aux_mobility_loss_f32, aux_material_loss_f32, aux_mobility_mae_f32, aux_material_mae_f32) = if config.aux_loss_weight > 0.0 {
+            // Mobility: predict legal move count per square from trunk output
+            let legal_per_square = batch
+                .legal_moves
+                .clone()
+                .reshape([batch_size, 64, 76])
+                .sum_dim(2)
+                .reshape([batch_size, 64]);
+            let legal_per_square_norm = legal_per_square / 27.0f32;
+
+            let mobility_pred = self
+                .aux_mobility_head
+                .forward(trunk_output.clone())
+                .reshape([batch_size, 64]);
+            let mobility_diff = mobility_pred - legal_per_square_norm;
+            let mobility_mse = mobility_diff.clone().powf_scalar(2.0).mean();
+            let mobility_mae = mobility_diff.abs().mean();
+
+            // Material: predict material imbalance from mean-pooled trunk
+            let embed_dim = trunk_output.dims()[2];
+            let trunk_pooled = trunk_output.clone().mean_dim(1).reshape([batch_size, embed_dim]);
+            let material_pred = self
+                .aux_material_head
+                .forward(trunk_pooled)
+                .reshape([batch_size]);
+            let material_target = batch.material_imbalance.clone();
+            let material_diff = material_pred - material_target;
+            let material_mse = material_diff.clone().powf_scalar(2.0).mean();
+            let material_mae = material_diff.abs().mean();
+
+            // Extract f32 values for metrics (detached, no grad)
+            let mob_loss_f32 = mobility_mse.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let mat_loss_f32 = material_mse.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let mob_mae_f32 = mobility_mae.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let mat_mae_f32 = material_mae.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+
+            (mobility_mse + material_mse, mob_loss_f32, mat_loss_f32, mob_mae_f32, mat_mae_f32)
+        } else {
+            (zero_like(), 0.0, 0.0, 0.0, 0.0)
+        };
+
+        // Maia 2-style auxiliary losses: side info, from-square, to-square
+        let (maia_loss, aux_side_info_loss_f32, aux_from_sq_loss_f32, aux_to_sq_loss_f32, aux_from_sq_acc_f32, aux_to_sq_acc_f32) = if config.aux_loss_weight > 0.0 {
+            let embed_dim = trunk_output.dims()[2];
+
+            // Side info: piece moved/captured/check (first 13 values)
+            let side_info_target_int = batch.side_info.clone()
+                .slice([0..batch_size, 0..13]);
+            let trunk_pooled_si = trunk_output.clone().mean_dim(1).reshape([batch_size, embed_dim]);
+            let side_info_logits = self.side_info_head.forward(trunk_pooled_si);
+            let side_info_bce = self.side_info_bce.forward(side_info_logits, side_info_target_int);
+
+            let si_loss_f32 = side_info_bce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+
+            // From-square: per-token prediction → [batch, 64]
+            let from_sq_logits = self.aux_from_square_head
+                .forward(trunk_output.clone())
+                .reshape([batch_size, 64]);
+            let from_sq_target_int = batch.side_info.clone()
+                .slice([0..batch_size, 13..77]);
+            let from_sq_bce = self.side_info_bce.forward(from_sq_logits.clone(), from_sq_target_int.clone());
+
+            let from_loss_f32 = from_sq_bce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+
+            // From-square accuracy: argmax match
+            let from_pred = from_sq_logits.argmax(1).squeeze_dim::<1>(1);
+            let from_true = from_sq_target_int.argmax(1).squeeze_dim::<1>(1);
+            let from_correct = from_pred.equal(from_true).float().mean();
+            let from_acc_f32 = from_correct.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+
+            // To-square: per-token prediction → [batch, 64]
+            let to_sq_logits = self.aux_to_square_head
+                .forward(trunk_output.clone())
+                .reshape([batch_size, 64]);
+            let to_sq_target_int = batch.side_info.clone()
+                .slice([0..batch_size, 77..141]);
+            let to_sq_bce = self.side_info_bce.forward(to_sq_logits.clone(), to_sq_target_int.clone());
+
+            let to_loss_f32 = to_sq_bce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+
+            // To-square accuracy: argmax match
+            let to_pred = to_sq_logits.argmax(1).squeeze_dim::<1>(1);
+            let to_true = to_sq_target_int.argmax(1).squeeze_dim::<1>(1);
+            let to_correct = to_pred.equal(to_true).float().mean();
+            let to_acc_f32 = to_correct.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+
+            (side_info_bce + from_sq_bce + to_sq_bce, si_loss_f32, from_loss_f32, to_loss_f32, from_acc_f32, to_acc_f32)
+        } else {
+            (zero_like(), 0.0, 0.0, 0.0, 0.0, 0.0)
+        };
+
+        let base_aux_loss = base_aux_loss + maia_loss;
+        let aux_term = base_aux_loss.clone() * config.aux_loss_weight;
+
+        let loss = config_weighted_policy_loss.clone()
+            + value_term.clone()
+            + time_usage_term.clone()
+            + aux_term.clone();
 
         // Accuracy
         let targets = batch.move_distributions.clone().argmax(1).squeeze_dim(1);
@@ -416,6 +569,7 @@ impl<B: Backend> OXIModel<B> {
             config_weighted_policy_loss.clone(),
             value_term.clone(),
             time_usage_term.clone(),
+            aux_term,
             policy_logits_flat,
             targets,
             value_logits,
@@ -427,7 +581,25 @@ impl<B: Backend> OXIModel<B> {
             base_value_loss.clone(),
             base_time_usage_loss.clone(),
         )
-        .with_base_losses(base_policy_loss, base_value_loss, base_time_usage_loss)
+        .with_base_losses(
+            base_policy_loss,
+            base_value_loss,
+            base_time_usage_loss,
+            base_aux_loss,
+        )
+        .with_aux_metrics(
+            aux_mobility_loss_f32,
+            aux_material_loss_f32,
+            aux_mobility_mae_f32,
+            aux_material_mae_f32,
+        )
+        .with_maia_metrics(
+            aux_side_info_loss_f32,
+            aux_from_sq_loss_f32,
+            aux_to_sq_loss_f32,
+            aux_from_sq_acc_f32,
+            aux_to_sq_acc_f32,
+        )
     }
 
     #[cfg(test)]

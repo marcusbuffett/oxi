@@ -12,6 +12,7 @@ pub enum GradNormTask {
     Policy = 0,
     Value = 1,
     TimeUsage = 2,
+    Auxiliary = 3,
 }
 
 impl GradNormTask {
@@ -20,6 +21,7 @@ impl GradNormTask {
             GradNormTask::Policy,
             GradNormTask::Value,
             GradNormTask::TimeUsage,
+            GradNormTask::Auxiliary,
         ]
         .into_iter()
     }
@@ -29,6 +31,7 @@ impl GradNormTask {
             GradNormTask::Policy => "policy",
             GradNormTask::Value => "value",
             GradNormTask::TimeUsage => "time_usage",
+            GradNormTask::Auxiliary => "auxiliary",
         }
     }
 }
@@ -50,6 +53,7 @@ pub struct GradNormTaskStatus {
 struct TaskState {
     task: GradNormTask,
     weight: f32,
+    initial_weight: f32,
     enabled: bool,
     priority: f32,
     initial_loss: Option<f32>,
@@ -66,6 +70,7 @@ impl TaskState {
         Self {
             task,
             weight: initial_weight.max(0.0),
+            initial_weight: initial_weight.max(0.0),
             enabled,
             priority: priority.max(EPS),
             initial_loss: None,
@@ -124,6 +129,9 @@ impl GradNormState {
                         config.time_usage_loss_weight,
                         config.gradnorm_time_priority(),
                     ),
+                    GradNormTask::Auxiliary => {
+                        (config.aux_loss_weight, config.gradnorm_aux_priority())
+                    }
                 };
                 TaskState::new(task, weight, priority)
             })
@@ -163,6 +171,7 @@ impl GradNormState {
                 GradNormTask::Policy => config.policy_loss_weight,
                 GradNormTask::Value => config.value_loss_weight,
                 GradNormTask::TimeUsage => config.time_usage_loss_weight,
+                GradNormTask::Auxiliary => config.aux_loss_weight,
             };
             task_state.weight = weight;
             task_state.enabled = weight > 0.0;
@@ -204,6 +213,7 @@ impl GradNormState {
                 GradNormTask::Policy => (&output.base_policy_loss, true),
                 GradNormTask::Value => (&output.base_value_loss, true),
                 GradNormTask::TimeUsage => (&output.base_time_usage_loss, true),
+                GradNormTask::Auxiliary => (&output.base_aux_loss, true),
             };
 
             let base_loss = if enabled_by_output {
@@ -231,12 +241,16 @@ impl GradNormState {
         let policy_weight = self.weight_for(GradNormTask::Policy);
         let value_weight = self.weight_for(GradNormTask::Value);
         let time_weight = self.weight_for(GradNormTask::TimeUsage);
+        let aux_weight = self.weight_for(GradNormTask::Auxiliary);
 
         output.policy_loss = output.base_policy_loss.clone() * policy_weight;
         output.value_loss = output.base_value_loss.clone() * value_weight;
         output.time_usage_loss = output.base_time_usage_loss.clone() * time_weight;
-        output.loss =
-            output.policy_loss.clone() + output.value_loss.clone() + output.time_usage_loss.clone();
+        output.aux_loss = output.base_aux_loss.clone() * aux_weight;
+        output.loss = output.policy_loss.clone()
+            + output.value_loss.clone()
+            + output.time_usage_loss.clone()
+            + output.aux_loss.clone();
     }
 
     pub fn apply_probe_results(
@@ -297,16 +311,29 @@ impl GradNormState {
             let current_grad = grad_norm.max(EPS);
             let ratio = (target_grad + EPS) / current_grad;
             let adjusted = task_state.weight * ratio.powf(self.lr);
+            tracing::info!(
+                "gradnorm_update: task={} weight={:.6} grad={:.2e} target_grad={:.2e} ratio={:.4} adjusted={:.6} loss_ratio={:.4}",
+                task_state.task.name(), task_state.weight, current_grad, target_grad, ratio, adjusted, loss_ratio
+            );
             task_state.last_grad_norm = Some(current_grad);
             task_state.last_grad_step = Some(next_optimizer_step);
             updated_weights.push((task_index, adjusted.max(EPS)));
         }
 
         for (index, new_weight) in updated_weights {
-            self.tasks[index].weight = new_weight;
+            // Clamp weight to [0.1x, 10x] of initial value to prevent collapse
+            let initial = self.tasks[index].initial_weight.max(EPS);
+            let clamped = new_weight.clamp(initial * 0.1, initial * 10.0);
+            self.tasks[index].weight = clamped;
         }
 
         self.renormalize_weights();
+
+        let final_weights: Vec<String> = self.tasks.iter()
+            .filter(|t| t.enabled)
+            .map(|t| format!("{}={:.6}", t.task.name(), t.weight))
+            .collect();
+        tracing::info!("gradnorm_post_renorm: {}", final_weights.join(" "));
 
         Some(self.status_snapshot())
     }

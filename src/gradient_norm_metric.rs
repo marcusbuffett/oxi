@@ -32,6 +32,25 @@ impl GradientNormBreakdown {
 pub struct LayerGradientNorm {
     pub name: String,
     pub norm: f64,
+    /// L2 norm of the weight parameters in this layer.
+    pub weight_norm: f64,
+    /// Update ratio: ||grad|| / ||weight|| (should be ~1e-3 for healthy training).
+    pub update_ratio: f64,
+    /// Gradient signal-to-noise ratio: |mean(grad)| / std(grad).
+    pub grad_snr: f64,
+    /// Mean of gradient elements.
+    pub grad_mean: f64,
+    /// Standard deviation of gradient elements.
+    pub grad_std: f64,
+    /// Number of gradient elements in this layer.
+    pub numel: usize,
+    /// RMS of Muon weight params in this layer (0 if no Muon params).
+    pub muon_weight_rms: f64,
+    /// Analytical Muon update Frobenius scale: sqrt(sum of (sqrt(min(A,B)) * lr_adjust)^2).
+    /// Multiply by muon_lr to get ||update||_F.
+    pub muon_update_scale: f64,
+    /// Number of Muon elements in this layer.
+    pub muon_numel: usize,
 }
 
 /// Which projection a head gradient corresponds to.
@@ -82,10 +101,26 @@ pub fn compute_gradient_norm_with_breakdown<B: AutodiffBackend, M: AutodiffModul
     visitor.into_breakdown()
 }
 
+/// Per-layer accumulator for computing aggregate statistics.
+#[derive(Debug, Clone, Default)]
+struct LayerAccumulator {
+    grad_norm_sq: f64,
+    weight_norm_sq: f64,
+    grad_sum: f64,
+    grad_sum_sq: f64,
+    numel: usize,
+    /// Sum of weight_norm_sq for Muon (2D) params only.
+    muon_weight_norm_sq: f64,
+    /// Total number of elements in Muon (2D) params.
+    muon_numel: usize,
+    /// Sum of sqrt(min(A,B)) * sqrt(max(1,A/B)) across Muon params, for analytical update calc.
+    muon_update_scale_sum_sq: f64,
+}
+
 struct GradientNormVisitor<'a, B: AutodiffBackend> {
     grads: &'a GradientsParams,
     total_norm_squared: f64,
-    per_layer_norms: HashMap<String, f64>,
+    per_layer_accum: HashMap<String, LayerAccumulator>,
     per_head_norms: HashMap<HeadKey, f64>,
     config: &'static Config,
     path_stack: Vec<String>,
@@ -98,7 +133,7 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
         Self {
             grads,
             total_norm_squared: 0.0,
-            per_layer_norms: HashMap::new(),
+            per_layer_accum: HashMap::new(),
             per_head_norms: HashMap::new(),
             config: get_global_config(),
             path_stack: Vec::new(),
@@ -109,11 +144,43 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
 
     fn into_breakdown(self) -> GradientNormBreakdown {
         let mut per_layer: Vec<LayerGradientNorm> = self
-            .per_layer_norms
+            .per_layer_accum
             .into_iter()
-            .map(|(name, norm_sq)| LayerGradientNorm {
-                name,
-                norm: norm_sq.sqrt(),
+            .map(|(name, acc)| {
+                let grad_norm = acc.grad_norm_sq.sqrt();
+                let weight_norm = acc.weight_norm_sq.sqrt();
+                let update_ratio = if weight_norm > 0.0 {
+                    grad_norm / weight_norm
+                } else {
+                    0.0
+                };
+                let (grad_mean, grad_std, grad_snr) = if acc.numel > 0 {
+                    let mean = acc.grad_sum / acc.numel as f64;
+                    let variance = (acc.grad_sum_sq / acc.numel as f64 - mean * mean).max(0.0);
+                    let std = variance.sqrt();
+                    let snr = if std > 0.0 { mean.abs() / std } else { 0.0 };
+                    (mean, std, snr)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+                let muon_weight_rms = if acc.muon_numel > 0 {
+                    (acc.muon_weight_norm_sq / acc.muon_numel as f64).sqrt()
+                } else {
+                    0.0
+                };
+                LayerGradientNorm {
+                    name,
+                    norm: grad_norm,
+                    weight_norm,
+                    update_ratio,
+                    grad_snr,
+                    grad_mean,
+                    grad_std,
+                    numel: acc.numel,
+                    muon_weight_rms,
+                    muon_update_scale: acc.muon_update_scale_sum_sq.sqrt(),
+                    muon_numel: acc.muon_numel,
+                }
             })
             .collect();
         per_layer.sort_by(|a, b| b.norm.partial_cmp(&a.norm).unwrap_or(Ordering::Equal));
@@ -137,7 +204,12 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
         }
     }
 
-    fn handle_float<const D: usize>(&mut self, id: ParamId, path: &[String]) {
+    fn handle_float<const D: usize>(
+        &mut self,
+        id: ParamId,
+        path: &[String],
+        weight_tensor: Option<&Tensor<B::InnerBackend, D>>,
+    ) {
         if let Some(grad_tensor) = self.grads.get::<B::InnerBackend, D>(id) {
             let norm_sq = grad_tensor
                 .clone()
@@ -149,7 +221,52 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
 
             if self.need_breakdown {
                 let layer_key = self.layer_key(path);
-                *self.per_layer_norms.entry(layer_key.clone()).or_default() += norm_sq;
+                let acc = self.per_layer_accum.entry(layer_key.clone()).or_default();
+                acc.grad_norm_sq += norm_sq;
+
+                // Compute weight norm
+                if let Some(wt) = weight_tensor {
+                    let w_norm_sq =
+                        wt.clone().powi_scalar(2).sum().into_scalar().elem::<f32>() as f64;
+                    acc.weight_norm_sq += w_norm_sq;
+                }
+
+                // Track Muon (2D weight) params separately for analytical update ratio
+                // Muon applies to 2D weight matrices (not biases, norms, embeddings)
+                let is_muon_param = D == 2
+                    && path.last().map_or(false, |s| s == "weight")
+                    && !path.iter().any(|s| s == "token_embed");
+                if is_muon_param {
+                    if let Some(wt) = weight_tensor {
+                        let w_norm_sq =
+                            wt.clone().powi_scalar(2).sum().into_scalar().elem::<f32>() as f64;
+                        acc.muon_weight_norm_sq += w_norm_sq;
+                    }
+                    let dims = grad_tensor.dims();
+                    let a = dims[0] as f64;
+                    let b = dims[1] as f64;
+                    // NS output Frobenius norm = sqrt(min(A,B))
+                    // lr_adjust (Original) = sqrt(max(1, A/B))
+                    // ||update||_F = lr * sqrt(min(A,B)) * sqrt(max(1, A/B))
+                    let ns_frob = a.min(b).sqrt();
+                    let lr_adjust = (a / b).max(1.0).sqrt();
+                    acc.muon_update_scale_sum_sq += (ns_frob * lr_adjust).powi(2);
+                    acc.muon_numel += grad_tensor.dims().iter().product::<usize>();
+                }
+
+                // Compute grad mean and sum-of-squares for SNR
+                let numel = grad_tensor.dims().iter().product::<usize>();
+                let grad_sum = grad_tensor.clone().sum().into_scalar().elem::<f32>() as f64;
+                let grad_sum_sq = grad_tensor
+                    .clone()
+                    .powi_scalar(2)
+                    .sum()
+                    .into_scalar()
+                    .elem::<f32>() as f64;
+                acc.grad_sum += grad_sum;
+                acc.grad_sum_sq += grad_sum_sq;
+                acc.numel += numel;
+
                 self.accumulate_head_norm::<D>(path, &layer_key, &grad_tensor);
             }
         }
@@ -279,7 +396,12 @@ impl<'a, B: AutodiffBackend> ModuleVisitor<B> for GradientNormVisitor<'a, B> {
         }
 
         let path = self.path_stack.clone();
-        self.handle_float::<D>(param.id, &path);
+        let weight_inner = if self.need_breakdown {
+            Some(param.val().inner())
+        } else {
+            None
+        };
+        self.handle_float::<D>(param.id, &path, weight_inner.as_ref());
     }
 }
 

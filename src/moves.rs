@@ -114,22 +114,22 @@ pub fn get_side_info(pos: &Chess, uci_move: &str) -> Vec<i32> {
         Ok(u) => u,
         Err(_) => {
             tracing::warn!("Warning: Invalid UCI move: {}", uci_move);
-            return vec![0i32; 13];
+            return vec![0i32; 141];
         }
     };
     let mv = match uci.to_move(pos) {
         Ok(m) => m,
         Err(_) => {
             tracing::warn!("Warning: Illegal move {} for position", uci_move);
-            return vec![0i32; 13];
+            return vec![0i32; 141];
         }
     };
 
-    // Create side info vector
-    let mut side_info = vec![0i32; 6 + 6 + 1]; // pieces + captured + check
+    // Create side info vector: 6 piece moved + 6 captured + 1 check + 64 from sq + 64 to sq = 141
+    let mut side_info = vec![0i32; 141];
 
     match &mv {
-        Move::Normal { from, capture, .. } => {
+        Move::Normal { from, to, capture, .. } => {
             // Moving piece type
             if let Some(piece) = pos.board().piece_at(*from) {
                 let piece_idx = match piece.role {
@@ -161,32 +161,37 @@ pub fn get_side_info(pos: &Chess, uci_move: &str) -> Vec<i32> {
                 side_info[6 + captured_idx] = 1;
             }
 
-            // From/to square encoding
-            // let from_idx = 13 + from.file() as usize * 8 + from.rank() as usize;
-            // let to_idx = 13 + 64 + to.file() as usize * 8 + to.rank() as usize;
-            // side_info[from_idx] = 1;
-            // side_info[to_idx] = 1;
-
-            // // Castling rook moves
-            // if uci_move == "e1g1" {
-            //     side_info[13 + 7] = 1; // h1
-            //     side_info[13 + 64 + 5] = 1; // f1
-            // } else if uci_move == "e1c1" {
-            //     side_info[13 + 0] = 1; // a1
-            //     side_info[13 + 64 + 3] = 1; // d1
-            // }
+            // From/to square encoding (file * 8 + rank)
+            let from_sq = from.file() as usize * 8 + from.rank() as usize;
+            let to_sq = to.file() as usize * 8 + to.rank() as usize;
+            side_info[13 + from_sq] = 1;
+            side_info[13 + 64 + to_sq] = 1;
         }
-        Move::EnPassant { .. } => {
+        Move::EnPassant { from, to } => {
             // Moving piece type (always pawn for en passant)
             side_info[0] = 1; // Pawn
 
             // Captured piece (always pawn for en passant)
             side_info[6] = 1; // Captured pawn
+
+            // From/to square encoding
+            let from_sq = from.file() as usize * 8 + from.rank() as usize;
+            let to_sq = to.file() as usize * 8 + to.rank() as usize;
+            side_info[13 + from_sq] = 1;
+            side_info[13 + 64 + to_sq] = 1;
         }
-        Move::Castle { .. } => {
+        Move::Castle { king, rook } => {
             // This shouldn't happen with UCI notation
             side_info[5] = 1; // King
             side_info[3] = 1; // Rook
+
+            // Use king's from/to for the squares (king is the primary piece)
+            let from_sq = king.file() as usize * 8 + king.rank() as usize;
+            // Determine king's destination based on rook position
+            let to_file = if rook.file() as usize > king.file() as usize { 6 } else { 2 };
+            let to_sq = to_file * 8 + king.rank() as usize;
+            side_info[13 + from_sq] = 1;
+            side_info[13 + 64 + to_sq] = 1;
         }
         _ => {}
     }
