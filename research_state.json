@@ -1,6 +1,49 @@
 {
-  "iteration": 1,
-  "best_ao10": 0.330794647,
+  "iteration": 4,
+  "best_ao10": 0.337110193,
   "baseline_ao10": 0.330794647,
-  "results": []
+  "results": [
+    {
+      "iter": 0,
+      "title": "Baseline",
+      "ao10": 0.330794647,
+      "status": "baseline"
+    },
+    {
+      "iter": 1,
+      "title": "Intent: Analyze model architecture files to identify tweakable parameters for im",
+      "ao10": 0.337110193,
+      "status": "kept"
+    },
+    {
+      "iter": 1,
+      "title": "[ERROR] ERROR: unknown tool id: \"artifact_upload\"",
+      "ao10": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 2,
+      "title": "Intent: Explore Oxi chess model codebase and architecture.  Outcome: Successfull",
+      "ao10": 0.336623485,
+      "status": "discarded"
+    },
+    {
+      "iter": 2,
+      "title": "[ERROR] ERROR: unknown tool id: \"artifact_upload\"",
+      "ao10": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 3,
+      "title": "Improved policy head expressiveness by increasing POLICY_RANK.   Files: src/fact",
+      "ao10": 0.32801577800000004,
+      "status": "discarded"
+    },
+    {
+      "iter": 3,
+      "title": "[ERROR] ERROR: unknown tool id: \"artifact_upload\"",
+      "ao10": 0.0,
+      "status": "error"
+    }
+  ]
 }
