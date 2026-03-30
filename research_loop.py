@@ -2,7 +2,7 @@
 Automated ML research loop for the Oxi chess model.
 Runs 20 iterations of: propose change → compile check → train → evaluate → keep/discard.
 """
-from shadesmar_tools import subagent, call_tool
+from shadesmar_tools import call_tool
 import subprocess
 import json
 import re
