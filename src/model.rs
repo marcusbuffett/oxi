@@ -249,7 +249,6 @@ impl<B: Backend> OXIModel<B> {
             let mut conv_activations = token_features
                 .reshape([batch_size, 8, 8, channels])
                 .permute([0, 3, 1, 2]);
-            let conv_residual = conv_activations.clone();
             for (layer_idx, conv) in self.conv_layers.iter().enumerate() {
                 log_tensor_stats(&format!("embed.conv{layer_idx}.input"), &conv_activations);
                 conv_activations = conv.forward(conv_activations);
@@ -257,7 +256,6 @@ impl<B: Backend> OXIModel<B> {
                 conv_activations = silu(conv_activations);
                 log_tensor_stats(&format!("embed.conv{layer_idx}.silu"), &conv_activations);
             }
-            conv_activations = conv_activations + conv_residual;
             token_features = conv_activations
                 .permute([0, 2, 3, 1])
                 .reshape([batch_size, seq_len, channels]);
