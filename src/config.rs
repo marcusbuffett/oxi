@@ -1117,7 +1117,7 @@ impl Default for Config {
             enable_forward_timing: Some(false),
             forward_timing_interval: 100,
             num_devices: 1,
-            focal_loss_gamma: 2.0,
+            focal_loss_gamma: 1.0,
             enable_ply_sampling: Some(true),
             enable_elo_sampling: Some(true),
             checkpoint_interval: 100,
