@@ -1092,7 +1092,7 @@ impl Default for Config {
             embedding_base_lr: default_embedding_base_lr(),
             warmup_multiplier: 2.0,
             policy_loss_weight: 0.15,
-            policy_label_smoothing: 0.03,
+            policy_label_smoothing: 0.01,
             value_loss_weight: 0.0001,
             value_entropy_weight: 0.0,
             embed_dim: 384,

@@ -20,7 +20,7 @@ AUTORESEARCH_DIR = WORKSPACE / "autoresearch"
 RESEARCH_RUNS = WORKSPACE / "research_runs"
 STATE_FILE = WORKSPACE / "research_state.json"
 TRAINING_TIMEOUT = 600  # 10 minutes
-MAX_ITERATIONS = 20
+MAX_ITERATIONS = 50  # 50 iterations from current start point
 
 # Key source files for the subagent to know about
 KEY_FILES = [
@@ -147,6 +147,10 @@ def generate_chart(results, baseline_ao10):
     """Generate and upload a progress chart."""
     if not results:
         return
+    # Filter to only real results (not errors from chart upload)
+    results = [r for r in results if r['status'] not in ('error',)]
+    if not results:
+        return
     chart_path = RESEARCH_RUNS / "progress.png"
     fig, ax = plt.subplots(figsize=(12, 6))
 
@@ -154,9 +158,9 @@ def generate_chart(results, baseline_ao10):
     ao10s = [r['ao10'] for r in results]
     colors = []
     for r in results:
-        if r['status'] == 'kept' or r['status'] == 'baseline':
+        if r['status'] in ('kept', 'baseline'):
             colors.append('green')
-        elif r['status'] == 'fail' or r['status'] == 'error':
+        elif r['status'] == 'fail':
             colors.append('gray')
         else:
             colors.append('red')
@@ -189,8 +193,11 @@ def generate_chart(results, baseline_ao10):
     plt.tight_layout()
     plt.savefig(chart_path, dpi=150)
     plt.close()
-    call_tool("artifact_upload", path=str(chart_path), kind="image",
-              description="ao10 accuracy progress chart")
+    try:
+        call_tool("artifact_upload", path=str(chart_path), kind="image",
+                  description="ao10 accuracy progress chart")
+    except Exception:
+        print("  (chart saved locally, artifact_upload not available)")
 
 
 def get_recent_context(max_recent=5):
@@ -206,12 +213,39 @@ def get_recent_context(max_recent=5):
     return "\n\n".join(context_parts) if context_parts else "(no prior experiments)"
 
 
+def extract_structured_output(text):
+    """Extract the last JSON block from subagent output for title/description/changes."""
+    json_blocks = re.findall(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if not json_blocks:
+        json_blocks = re.findall(r'(\{"title".*?\})', text, re.DOTALL)
+    if json_blocks:
+        try:
+            data = json.loads(json_blocks[-1])
+            title = data.get("title", "").strip().replace("|", "-").replace("\n", " ")[:80]
+            description = data.get("description", "").strip()
+            changes = data.get("changes", "").strip()
+            if title:
+                return title, description, changes
+        except json.JSONDecodeError:
+            pass
+    # Fallback: use first 80 chars of first non-empty line
+    for line in text.split("\n"):
+        line = line.strip()
+        if line and not line.startswith("#") and not line.startswith("```"):
+            return line[:80].replace("|", "-"), "", ""
+    return "Unknown change", "", ""
+
+
 def main():
     AUTORESEARCH_DIR.mkdir(parents=True, exist_ok=True)
     RESEARCH_RUNS.mkdir(parents=True, exist_ok=True)
 
     state = load_state()
     existing_results = parse_existing_log()
+
+    # Clean up state results to remove error duplicates from prior runs
+    if state.get("results"):
+        state["results"] = [r for r in state["results"] if r.get('status') != 'error']
 
     # Initialize research log if needed
     if not RESEARCH_LOG.exists() or RESEARCH_LOG.stat().st_size == 0:
@@ -237,11 +271,12 @@ def main():
     best = state["best_ao10"]
     baseline = state["baseline_ao10"]
     start_iter = state["iteration"]
-    all_results = list(existing_results)
+    all_results = [r for r in state.get("results", existing_results) if r.get('status') != 'error']
+    end_iter = start_iter + MAX_ITERATIONS  # 50 iterations from wherever we resume
 
-    for i in range(start_iter, MAX_ITERATIONS + 1):
+    for i in range(start_iter, end_iter):
         print(f"\n{'='*60}")
-        print(f"=== Iteration {i}/{MAX_ITERATIONS} | best: {best:.6f} | baseline: {baseline:.6f} ===")
+        print(f"=== Iteration {i} | {i - start_iter + 1}/{MAX_ITERATIONS} | best: {best:.6f} | baseline: {baseline:.6f} ===")
         print(f"{'='*60}")
 
         try:
@@ -252,6 +287,13 @@ def main():
             history = RESEARCH_LOG.read_text()
             recent_context = get_recent_context(max_recent=5)
 
+            # Build list of things NOT to try (already failed)
+            failed_ideas = []
+            for r in all_results:
+                if r.get('status') in ('discarded', 'fail'):
+                    failed_ideas.append(f"- Iter {r['iter']}: {r['title']} (ao10={r['ao10']:.6f})")
+            failed_summary = "\n".join(failed_ideas[-15:]) if failed_ideas else "(none yet)"
+
             # Ask subagent to propose AND implement a change
             idea_prompt = f"""You are an ML researcher improving a chess move-prediction transformer (the "oxi" model).
 
@@ -261,19 +303,24 @@ Improve the model's top-1 move prediction accuracy (measured as "ao10" — avera
 ## Current State
 - Current best ao10: {best:.6f}
 - Baseline ao10: {baseline:.6f}
+- We are on iteration {i} of the research loop
 
-## Past Experiments
+## Past Experiments (FULL LOG)
 {history}
+
+## FAILED IDEAS — DO NOT REPEAT THESE:
+{failed_summary}
 
 ## Recent Experiment Details
 {recent_context}
 
 ## Architecture Summary
 - Transformer with FiLM-conditioned RMSNorm, SwiGLU MLPs, SmolGen attention
-- Factorized policy head (source/target projections, rank-64)
+- Factorized policy head (source/target projections, POLICY_RANK constant)
 - Separate value tower with attention pooling
 - Auxiliary heads: mobility, material, from-square, to-square, side-info
 - Training uses Muon + AdamW optimizers with μP scaling
+- Residual scaling: 1/sqrt(2*num_layers) per block
 
 ## Key Files (read these before making changes)
 - src/model.rs — forward pass, loss computation, head architectures
@@ -283,57 +330,56 @@ Improve the model's top-1 move prediction accuracy (measured as "ao10" — avera
 - src/custom_training.rs — training loop, optimizer setup
 - src/smolgen.rs — SmolGen attention mechanism
 
-## Your Task
-1. Read the key files listed above to understand the current code
-2. Think about what change would most likely improve ao10
-3. Make EXACTLY ONE focused code change
-4. The change must compile: `cargo check --features "train,backend-tch"`
+## CRITICAL RULES
+1. DO NOT repeat any failed idea from the list above
+2. Try something GENUINELY DIFFERENT from all prior experiments
+3. Read the actual code first to find unexplored opportunities
+4. Make EXACTLY ONE focused code change
+5. The change must compile: `cargo check --features "train,backend-tch"`
+6. Don't change CLI argument handling or data loading
 
-## Good Ideas to Try (pick ONE, or come up with your own)
-- Adjust loss weights (policy_loss_weight, value_loss_weight, aux_loss_weight)
-- Change learning rates (muon_base_lr, adamw_base_lr, embedding_base_lr)
-- Modify policy head (increase POLICY_RANK, add layer norm, change init)
-- Tweak MLP hidden ratio (currently 2.5x embed_dim)
-- Adjust label smoothing (currently 0.03)
-- Change warmup multiplier or weight decay
-- Modify focal loss gamma
-- Add/change activation functions
-- Adjust attention mechanism
-- Change initialization scales
-- Modify the residual scaling formula
-- Tweak the puzzle sampling ratio
-- Adjust value tower configuration
+## Ideas to Explore (NOVEL — not tried before)
+- Learning rate adjustments (muon_base_lr, adamw_base_lr, embedding_base_lr)
+- Weight decay tuning
+- Warmup schedule changes
+- Residual scaling formula changes
+- Attention head count changes
+- Pre-norm vs post-norm changes
+- Skip connection modifications
+- Dropout rates
+- Embedding initialization changes
+- Value head architecture changes
+- From/to square head improvements
+- Gradient clipping adjustments
+- Optimizer hyperparameters (beta1, beta2)
+- Layer-specific learning rate scaling
+- Temperature scaling for policy logits
+- Auxiliary loss weight adjustments (value, mobility, material weights individually)
+- Number of attention heads
+- SmolGen architecture (activation, compression ratio)
 
-## Constraints
-- Do NOT change CLI argument handling (--embed-dim, --num-layers, --physical-batch-size are fixed at 192, 6, 512)
-- Do NOT run training yourself
-- Do NOT change data loading or PGN parsing
-- Make sure your change compiles
+## REQUIRED: Structured Output
+After making your change, you MUST end your response with a JSON block in exactly this format:
 
-## Output Format
-At the end, clearly state:
-1. **What you changed** (one sentence)
-2. **Why it should help** (one sentence)
-3. **Files modified** (list)"""
+```json
+{{"title": "<=10 word title of the change", "description": "1-2 sentence description of what was changed and why", "changes": "list of files changed and what was done in each"}}
+```
+
+This JSON block is parsed programmatically. Do not omit it."""
 
             print(f"  Requesting experiment idea from subagent...")
-            idea_output = subagent.run(
-                task=idea_prompt,
-                timeout_secs=1200,
-                context_paths=KEY_FILES
-            )
+            idea_output = call_tool("subagent.run", task=idea_prompt).get("output", "")
 
             # Save full output
             iter_dir = AUTORESEARCH_DIR / str(i)
             iter_dir.mkdir(parents=True, exist_ok=True)
             (iter_dir / "idea.md").write_text(idea_output)
 
-            # Generate short title
-            title = subagent.run(
-                task=f"Summarize in at most 8 words what code change was made:\n\n{idea_output[:2000]}",
-                model="fast"
-            ).strip().replace("|", "-").replace("\n", " ")[:80]
+            # Extract structured output instead of spawning a summarization subagent
+            title, description, changes = extract_structured_output(idea_output)
             print(f"  Title: {title}")
+            if description:
+                print(f"  Description: {description}")
 
             # Compile check
             print(f"  Checking compilation...")
@@ -400,15 +446,18 @@ At the end, clearly state:
     print(f"  Best ao10:     {best:.6f}")
     print(f"  Improvement:   {best - baseline:+.6f}")
     kept = [r for r in all_results if r['status'] == 'kept']
-    print(f"  Kept changes:  {len(kept)} / {len(all_results) - 1}")  # -1 for baseline
+    print(f"  Kept changes:  {len(kept)} / {len([r for r in all_results if r.get('status') != 'baseline'])}")
     print(f"  Log: {RESEARCH_LOG}")
 
     # Final chart
     generate_chart(all_results, baseline)
 
     # Upload final log
-    call_tool("artifact_upload", path=str(RESEARCH_LOG), kind="file",
-              description="Final research log with all iterations")
+    try:
+        call_tool("artifact_upload", path=str(RESEARCH_LOG), kind="file",
+                  description="Final research log with all iterations")
+    except Exception:
+        print("  (artifact_upload not available)")
 
 
 if __name__ == "__main__":

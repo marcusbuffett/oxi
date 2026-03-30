@@ -2,26 +2,54 @@
 
 | Iter | Description | ao10 | Kept |
 |------|-------------|------|------|
-| 0 | Baseline (no changes) | 0.330795 | baseline |
-| 1 | Intent: Analyze model architecture files to identify tweakable parameters for im | 0.337110 | ✅ |
-| 1 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 2 | Intent: Explore Oxi chess model codebase and architecture.  Outcome: Successfull | 0.336623 | ❌ |
-| 2 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 3 | Improved policy head expressiveness by increasing POLICY_RANK.   Files: src/fact | 0.328016 | ❌ |
-| 3 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 4 | Improve oxi chess model's prediction capacity.  Outcome: Successfully increased  | 0.345991 | ✅ |
-| 4 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 5 | Improve puzzle sampling ratio for training accuracy.   Outcome: Configuration mo | 0.329589 | ❌ |
-| 5 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 6 | Intent: Enable focal loss (gamma=2.0) in the OXI chess model to improve accuracy | 0.337002 | ❌ |
-| 6 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 7 | Improve focal loss gamma from 2.0 to 1.0.  Outcome: Change applied successfully; | 0.331107 | ❌ |
-| 7 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 8 | Intent: Tune hyperparameters for oxi chess model accuracy improvement.  Outcome: | 0.337010 | ❌ |
-| 8 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 9 | Intent: Modify focal_loss_gamma from 2.0 to 0.5 to improve model performance.  O | 0.329562 | ❌ |
-| 9 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 10 | Intent: Improve oxi chess model's top-1 move prediction accuracy by increasing t | 0.339916 | ❌ |
-| 10 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
-| 11 | Improve focal_loss_gamma for better accuracy.   Outcome: Successfully updated fo | 0.331467 | ❌ |
-| 11 | [ERROR] ERROR: unknown tool id: "artifact_upload" | 0.000000 | ⚠️ |
+| 0 | Baseline (no changes) | 0.289394 | baseline |
+| 1 | [ERROR] Bridge request failed: Remote end closed connectio | 0.000000 | ⚠️ |
+| 2 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 3 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 4 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 5 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 6 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 7 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 8 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 9 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 10 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 11 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 12 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 13 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 14 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 15 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 16 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 17 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 18 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 19 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 20 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 21 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 22 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 23 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 24 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 25 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 26 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 27 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 28 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 29 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 30 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 31 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 32 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 33 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 34 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 35 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 36 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 37 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 38 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 39 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 40 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 41 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 42 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 43 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 44 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 45 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 46 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 47 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 48 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 49 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |
+| 50 | [ERROR] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | ⚠️ |

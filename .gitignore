@@ -11,3 +11,4 @@ model
 models
 train.log
 metrics_logs
+.shadesmar/runs
