@@ -66,10 +66,18 @@ pub struct TransformerBlock<B: Backend> {
     norm1: FiLMRmsNorm<B>,
     norm2: FiLMRmsNorm<B>,
     mlp: MLP<B>,
+    #[module(skip)]
+    layer_index: usize,
+    #[module(skip)]
+    num_layers: usize,
 }
 
 impl<B: Backend> TransformerBlock<B> {
     pub fn new(device: &Device<B>) -> Self {
+        Self::new_with_index(device, 0, 1)
+    }
+
+    pub fn new_with_index(device: &Device<B>, layer_index: usize, num_layers: usize) -> Self {
         let config = get_global_config();
         let attention = SmolgenAttention::new(device);
         let norm1 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
@@ -80,6 +88,8 @@ impl<B: Backend> TransformerBlock<B> {
             norm1,
             norm2,
             mlp,
+            layer_index,
+            num_layers,
         }
     }
 
@@ -168,6 +178,78 @@ impl<B: Backend> TransformerBlock<B> {
         log_tensor_stats("block.mlp_out", &mlp_out);
 
         let output = x + mlp_out;
+        log_tensor_stats("block.output", &output);
+
+        output
+    }
+
+    /// Forward pass with FiLM conditioning and stochastic depth for training.
+    /// With probability drop_rate * (layer_index / (num_layers - 1)), this layer is skipped
+    /// and the input is returned unchanged. When not skipped, the residual is scaled by
+    /// 1 / (1 - drop_prob) to maintain the expected output magnitude.
+    pub fn forward_with_film_stochastic(
+        &self,
+        x: Tensor<B, 3>,
+        shared_weight_gen: &SmolgenWeightGen<B>,
+        globals: Tensor<B, 2>,
+        stochastic_depth_rate: f32,
+    ) -> Tensor<B, 3> {
+        // Compute layer-specific drop probability (linearly increasing with depth)
+        let drop_prob = if self.num_layers > 1 {
+            stochastic_depth_rate * (self.layer_index as f32 / (self.num_layers - 1) as f32)
+        } else {
+            0.0
+        };
+
+        // Stochastic depth: randomly skip this layer during training
+        if drop_prob > 0.0 {
+            use rand::Rng;
+            let should_drop = rand::rng().random::<f32>() < drop_prob;
+            if should_drop {
+                return x;
+            }
+        }
+
+        let device = x.device();
+        log_tensor_stats("block.input", &x);
+
+        // Scale factor to compensate for dropped layers (maintain expected value)
+        let scale = if drop_prob > 0.0 {
+            1.0 / (1.0 - drop_prob)
+        } else {
+            1.0
+        };
+
+        // Pre-norm: norm before attention, then residual add
+        let normed1 = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_attn", &device);
+            self.norm1.forward(x.clone(), globals.clone())
+        };
+        log_tensor_stats("block.norm1", &normed1);
+
+        let attn_out = {
+            let _t = TimingScope::new_with_sync::<B>("block_attention", &device);
+            self.attention.forward(normed1, shared_weight_gen)
+        };
+        log_tensor_stats("block.attn_out", &attn_out);
+
+        let x = x + attn_out * scale;
+        log_tensor_stats("block.post_attn_residual", &x);
+
+        // Pre-norm: norm before MLP, then residual add
+        let normed2 = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_mlp", &device);
+            self.norm2.forward(x.clone(), globals)
+        };
+        log_tensor_stats("block.norm2", &normed2);
+
+        let mlp_out = {
+            let _t = TimingScope::new_with_sync::<B>("block_mlp", &device);
+            self.mlp.forward(normed2)
+        };
+        log_tensor_stats("block.mlp_out", &mlp_out);
+
+        let output = x + mlp_out * scale;
         log_tensor_stats("block.output", &output);
 
         output

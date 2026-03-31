@@ -2170,13 +2170,14 @@ where
     }
     // ==================== END LR RANGE FINDER ====================
 
-    let mut lr_scheduler = ReduceOnPlateauScheduler::new(
+    let mut lr_scheduler = ReduceOnPlateauScheduler::with_cosine(
         initial_lr,
         config.lr_min,
         config.lr_reduction_factor,
         config.lr_window_size,
         config.lr_improvement_threshold,
         warmup_iterations,
+        config.cosine_period,
     );
 
     let mut loss_metric = LossMetric::new();

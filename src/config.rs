@@ -307,6 +307,18 @@ pub struct Config {
     /// Weight for auxiliary losses (mobility + material prediction)
     #[serde(default = "default_aux_loss_weight")]
     pub aux_loss_weight: f32,
+
+    /// Stochastic depth (layer drop) rate. Maximum drop probability at deepest layer.
+    /// Linearly increases from 0 at layer 0 to this value at the last layer.
+    /// Set to 0.0 to disable. Typical values: 0.1–0.3.
+    #[serde(default = "default_stochastic_depth_rate")]
+    pub stochastic_depth_rate: f32,
+
+    /// Cosine decay period in optimizer steps (post-warmup). After warmup, LR follows
+    /// a cosine schedule from peak down to lr_min over this many steps.
+    /// Set to 0 to disable cosine decay (use plateau scheduler only).
+    #[serde(default = "default_cosine_period")]
+    pub cosine_period: usize,
 }
 
 // Serde default functions for backwards compatibility with older params.json files
@@ -333,6 +345,12 @@ fn default_embedding_base_lr() -> f64 {
 }
 fn default_aux_loss_weight() -> f32 {
     0.01 // Was 0.05; reduced to minimize gradient competition with policy
+}
+fn default_stochastic_depth_rate() -> f32 {
+    0.2
+}
+fn default_cosine_period() -> usize {
+    1600 // Moderate cosine decay: ~20% of peak LR after ~1100 post-warmup steps
 }
 
 /// Command-line overrides for Config. All fields are optional.
@@ -640,6 +658,18 @@ pub struct ConfigOverrides {
     /// Weight for auxiliary losses (mobility + material prediction)
     #[arg(long)]
     pub aux_loss_weight: Option<f32>,
+
+    /// Stochastic depth (layer drop) rate. Maximum drop probability at deepest layer.
+    /// Linearly increases from 0 at layer 0 to this value at the last layer.
+    /// Set to 0.0 to disable. Typical values: 0.1–0.3.
+    #[arg(long)]
+    pub stochastic_depth_rate: Option<f32>,
+
+    /// Cosine decay period in optimizer steps (post-warmup). After warmup, LR follows
+    /// a cosine schedule from peak down to lr_min over this many steps.
+    /// Set to 0 to disable cosine decay (use plateau scheduler only).
+    #[arg(long)]
+    pub cosine_period: Option<usize>,
 }
 
 impl Config {
@@ -872,6 +902,12 @@ impl Config {
         }
         if let Some(v) = overrides.aux_loss_weight {
             config.aux_loss_weight = v;
+        }
+        if let Some(v) = overrides.stochastic_depth_rate {
+            config.stochastic_depth_rate = v;
+        }
+        if let Some(v) = overrides.cosine_period {
+            config.cosine_period = v;
         }
 
         config
@@ -1138,6 +1174,8 @@ impl Default for Config {
             use_muon: Some(true),
             muon_lr_adjust: None,
             aux_loss_weight: default_aux_loss_weight(),
+            stochastic_depth_rate: default_stochastic_depth_rate(),
+            cosine_period: default_cosine_period(),
         }
     }
 }

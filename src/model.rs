@@ -94,8 +94,8 @@ impl<B: Backend> OXIModel<B> {
         let smolgen_weight_gen = SmolgenWeightGen::new(device);
 
         let mut blocks = Vec::new();
-        for _ in 0..config.num_layers() {
-            blocks.push(TransformerBlock::new(device));
+        for i in 0..config.num_layers() {
+            blocks.push(TransformerBlock::new_with_index(device, i, config.num_layers()));
         }
 
         let token_norm = RmsNormConfig::new(base_embed_dim).init(device);
@@ -201,7 +201,7 @@ impl<B: Backend> OXIModel<B> {
         globals: Tensor<B, 2, Float>,
     ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
         let (policy, value, side_info, time_usage, _trunk) =
-            self.forward_with_trunk(board, globals);
+            self.forward_with_trunk(board, globals, false);
         (policy, value, side_info, time_usage)
     }
 
@@ -209,6 +209,7 @@ impl<B: Backend> OXIModel<B> {
         &self,
         board: Tensor<B, 3>,
         globals: Tensor<B, 2, Float>,
+        training: bool,
     ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 3>) {
         start_forward_pass();
         let device = board.device();
@@ -285,12 +286,21 @@ impl<B: Backend> OXIModel<B> {
         {
             let _encoder_stream = StreamScope::enter("encoder");
             let _encoder_timing = TimingScope::new_with_sync::<B>("encoder_blocks", &device);
+            let stochastic_depth_rate = if training {
+                get_global_config().stochastic_depth_rate
+            } else {
+                0.0
+            };
             for (layer_idx, block) in self.blocks.iter().enumerate() {
                 let _layer_scope = LayerScope::enter(layer_idx);
                 let _block_timing = TimingScope::new_with_sync::<B>("encoder_block", &device);
                 log_tensor_stats("encoder.pre_block", &x);
 
-                x = block.forward_with_film(x, &self.smolgen_weight_gen, globals.clone());
+                if stochastic_depth_rate > 0.0 {
+                    x = block.forward_with_film_stochastic(x, &self.smolgen_weight_gen, globals.clone(), stochastic_depth_rate);
+                } else {
+                    x = block.forward_with_film(x, &self.smolgen_weight_gen, globals.clone());
+                }
                 log_tensor_stats("encoder.post_block", &x);
             }
         }
@@ -367,7 +377,7 @@ impl<B: Backend> OXIModel<B> {
         let batch_size = batch.board_input.shape().dims[0];
 
         let (policy_logits, value_logits, _side_info_logits, time_usage_logits, trunk_output) =
-            self.forward_with_trunk(batch.board_input, batch.global_features);
+            self.forward_with_trunk(batch.board_input, batch.global_features, true);
 
         let policy_logits_flat_original = policy_logits.reshape([batch_size, LEGAL_MOVES]);
 
