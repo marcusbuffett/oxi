@@ -121,7 +121,6 @@ pub struct ReduceOnPlateauScheduler {
     iteration: usize,
     num_reductions: usize,
     warmup_iterations: usize,
-    cosine_period: usize,
 }
 
 impl ReduceOnPlateauScheduler {
@@ -133,18 +132,6 @@ impl ReduceOnPlateauScheduler {
         improvement_threshold: f64,
         warmup_iterations: usize,
     ) -> Self {
-        Self::with_cosine(initial_lr, min_lr, reduction_factor, window_size, improvement_threshold, warmup_iterations, 0)
-    }
-
-    pub fn with_cosine(
-        initial_lr: f64,
-        min_lr: f64,
-        reduction_factor: f64,
-        window_size: usize,
-        improvement_threshold: f64,
-        warmup_iterations: usize,
-        cosine_period: usize,
-    ) -> Self {
         Self {
             initial_lr,
             current_lr: initial_lr,
@@ -154,7 +141,6 @@ impl ReduceOnPlateauScheduler {
             iteration: 0,
             num_reductions: 0,
             warmup_iterations,
-            cosine_period,
         }
     }
 
@@ -235,12 +221,6 @@ impl ReduceOnPlateauScheduler {
         if self.warmup_iterations > 0 && self.iteration < self.warmup_iterations {
             let warmup_progress = self.iteration as f64 / self.warmup_iterations as f64;
             self.current_lr * warmup_progress
-        } else if self.cosine_period > 0 {
-            // Cosine decay from current_lr to min_lr over cosine_period steps post-warmup
-            let steps_since_warmup = self.iteration.saturating_sub(self.warmup_iterations);
-            let progress = (steps_since_warmup as f64 / self.cosine_period as f64).min(1.0);
-            let cosine_factor = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
-            self.min_lr + (self.current_lr - self.min_lr) * cosine_factor
         } else {
             self.current_lr
         }
@@ -309,7 +289,7 @@ impl LrScheduler for ReduceOnPlateauScheduler {
         f64,      // improvement_threshold
         usize,    // iteration
         usize,    // num_reductions
-        (usize, usize), // (warmup_iterations, cosine_period)
+        usize,    // warmup_iterations
         Vec<f64>, // detector window
     );
 
@@ -327,7 +307,7 @@ impl LrScheduler for ReduceOnPlateauScheduler {
             self.detector.improvement_threshold,
             self.iteration,
             self.num_reductions,
-            (self.warmup_iterations, self.cosine_period),
+            self.warmup_iterations,
             self.detector.window.iter().copied().collect(),
         )
     }
@@ -343,8 +323,7 @@ impl LrScheduler for ReduceOnPlateauScheduler {
         }
         self.iteration = record.6;
         self.num_reductions = record.7;
-        self.warmup_iterations = record.8.0;
-        self.cosine_period = record.8.1;
+        self.warmup_iterations = record.8;
         self
     }
 }

@@ -27,18 +27,24 @@ MODEL_LAYERS = 12
 MODEL_EMBED = 256
 MODEL_BATCH = 512
 
-# Metric: average of last 100 top-1 accuracy values
-AO_WINDOW = 100
+# Composite metric: weighted combination of top-1 accuracy, WDL accuracy, and aux head accuracy
+# All components are averaged over the last METRIC_WINDOW values from their respective log files.
+# top1_accuracy: 0-1 fraction, wdl_accuracy: 0-100 percentage (divided by 100), aux: 0-1 fraction
+METRIC_WINDOW = 100
+WEIGHT_TOP1 = 1.0
+WEIGHT_WDL = 1.0 / 3.0
+WEIGHT_AUX = 0.1  # average of from-square and to-square aux accuracy
 MIN_IMPROVEMENT_PCT = 1.0  # require 1% relative improvement to keep a change
 
-def parse_ao(log_dir):
-    """Parse ao metric from top1_accuracy.log (average of last AO_WINDOW values)."""
-    log_file = Path(log_dir) / "metrics_logs" / "top1_accuracy.log"
+
+def parse_metric_log(log_dir, metric_name):
+    """Parse a metric TSV log file, returning the average of last METRIC_WINDOW values."""
+    log_file = Path(log_dir) / "metrics_logs" / f"{metric_name}.log"
     if not log_file.exists():
         return 0.0
     with open(log_file, 'r') as f:
         lines = f.readlines()
-    recent = lines[-AO_WINDOW:] if len(lines) >= AO_WINDOW else lines
+    recent = lines[-METRIC_WINDOW:] if len(lines) >= METRIC_WINDOW else lines
     values = []
     for line in recent:
         if '\t' in line:
@@ -47,6 +53,20 @@ def parse_ao(log_dir):
             except (ValueError, IndexError):
                 pass
     return sum(values) / len(values) if values else 0.0
+
+
+def parse_composite_score(log_dir):
+    """Compute composite score from multiple metrics. Returns (score, components_dict)."""
+    top1 = parse_metric_log(log_dir, "top1_accuracy")
+    wdl_raw = parse_metric_log(log_dir, "wdl_accuracy")
+    wdl = wdl_raw / 100.0  # normalize from 0-100 to 0-1
+    aux_from = parse_metric_log(log_dir, "aux_from_square_accuracy")
+    aux_to = parse_metric_log(log_dir, "aux_to_square_accuracy")
+    aux = (aux_from + aux_to) / 2.0
+
+    score = WEIGHT_TOP1 * top1 + WEIGHT_WDL * wdl + WEIGHT_AUX * aux
+    components = {"top1": top1, "wdl": wdl, "aux": aux}
+    return score, components
 
 
 def compile_check():
@@ -58,10 +78,15 @@ def compile_check():
     return result.returncode == 0, result.stderr
 
 
+def format_components(components):
+    """Format component scores for display: (top1=0.41, wdl=0.52, aux=0.38)"""
+    return f"(top1={components['top1']:.4f}, wdl={components['wdl']:.4f}, aux={components['aux']:.4f})"
+
+
 def run_training(run_name, seed):
-    """Run training for TRAINING_TIMEOUT seconds and return ao metric."""
+    """Run training for TRAINING_TIMEOUT seconds and return (composite_score, components_dict)."""
     log_dir = RESEARCH_RUNS / run_name
-    # Clean stale metrics from previous runs so parse_ao never reads old data
+    # Clean stale metrics from previous runs so parse never reads old data
     metrics_dir = log_dir / "metrics_logs"
     if metrics_dir.exists():
         import shutil
@@ -76,7 +101,7 @@ def run_training(run_name, seed):
     )
     if build_result.returncode != 0:
         print(f"  Build failed: {build_result.stderr[-500:]}")
-        return 0.0
+        return 0.0, {"top1": 0.0, "wdl": 0.0, "aux": 0.0}
 
     print(f"  Running training for {TRAINING_TIMEOUT}s (seed={seed})...")
     cmd = [
@@ -101,9 +126,9 @@ def run_training(run_name, seed):
         proc.kill()
         proc.wait()
 
-    ao = parse_ao(log_dir)
-    print(f"  ao{AO_WINDOW} = {ao:.6f}")
-    return ao
+    score, components = parse_composite_score(log_dir)
+    print(f"  score = {score:.6f} {format_components(components)}")
+    return score, components
 
 
 def git_revert():
@@ -122,7 +147,7 @@ def load_state():
     """Load persisted state for resumability."""
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    return {"best_ao": 0.0, "baseline_ao": 0.0, "results": []}
+    return {"best_score": 0.0, "baseline_score": 0.0, "results": []}
 
 
 def save_state(state):
@@ -189,7 +214,7 @@ def generate_chart(results, baseline_ao):
                 linewidth=2, label=f'Best: {best_so_far:.6f}')
 
     ax.set_xlabel('Iteration')
-    ax.set_ylabel(f'ao{AO_WINDOW} Accuracy')
+    ax.set_ylabel('Composite Score')
     ax.set_title('Oxi Research Loop Progress')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -198,7 +223,7 @@ def generate_chart(results, baseline_ao):
     plt.close()
     try:
         call_tool("artifact_upload", path=str(chart_path), kind="image",
-                  description=f"ao{AO_WINDOW} accuracy progress chart")
+                  description="Composite score progress chart")
     except Exception:
         print("  (chart saved locally, artifact_upload not available)")
 
@@ -237,26 +262,26 @@ def main():
 
     if not RESEARCH_LOG.exists() or RESEARCH_LOG.stat().st_size == 0:
         with open(RESEARCH_LOG, 'w') as f:
-            f.write(f"# OXI Research Log\n\n| Iter | Description | ao{AO_WINDOW} | Kept |\n|------|-------------|------|------|\n")
+            f.write(f"# OXI Research Log\n\n| Iter | Description | Score | Kept |\n|------|-------------|-------|------|\n")
 
     # Run baseline if needed
-    if state["baseline_ao"] == 0.0:
+    if state["baseline_score"] == 0.0:
         print("=== Running baseline training ===")
         git_revert()
-        baseline = run_training("baseline", seed=42)
-        state["baseline_ao"] = baseline
-        state["best_ao"] = baseline
+        baseline, baseline_components = run_training("baseline", seed=42)
+        state["baseline_score"] = baseline
+        state["best_score"] = baseline
         if not any(r['iter'] == 0 for r in existing_results):
             with open(RESEARCH_LOG, 'a') as f:
-                f.write(f"| 0 | Baseline (no changes) | {baseline:.6f} | baseline |\n")
+                f.write(f"| 0 | Baseline (no changes) | {baseline:.6f} {format_components(baseline_components)} | baseline |\n")
             existing_results.append({'iter': 0, 'title': 'Baseline', 'ao': baseline, 'status': 'baseline'})
         save_state(state)
-        print(f"Baseline ao{AO_WINDOW}: {baseline:.6f}")
+        print(f"Baseline score: {baseline:.6f} {format_components(baseline_components)}")
     else:
-        print(f"Resuming with {len(existing_results)} prior results, best ao{AO_WINDOW}: {state['best_ao']:.6f}")
+        print(f"Resuming with {len(existing_results)} prior results, best score: {state['best_score']:.6f}")
 
-    best = state["best_ao"]
-    baseline = state["baseline_ao"]
+    best = state["best_score"]
+    baseline = state["baseline_score"]
     all_results = [r for r in state.get("results", existing_results) if r.get('status') != 'error']
 
     for iteration_count in range(MAX_ITERATIONS):
@@ -270,9 +295,14 @@ def main():
 
             idea_prompt = f"""You are an ML researcher improving a chess move-prediction transformer.
 
-Your goal is to improve top-1 move prediction accuracy (measured as "ao{AO_WINDOW}" — average of last {AO_WINDOW} accuracy values during a 30-minute training run).
+Your goal is to improve a composite score computed as:
+  score = {WEIGHT_TOP1}*top1_accuracy + {WEIGHT_WDL:.4f}*wdl_accuracy + {WEIGHT_AUX}*aux_accuracy
+where each component is the average of its last {METRIC_WINDOW} logged values during a {TRAINING_TIMEOUT//60}-minute training run.
+- top1_accuracy: policy head move prediction accuracy (0-1)
+- wdl_accuracy: win/draw/loss prediction accuracy (0-1)
+- aux_accuracy: average of from-square and to-square auxiliary head accuracy (0-1)
 
-Current best ao{AO_WINDOW}: {best:.6f} | Baseline: {baseline:.6f} | Iteration {i}
+Current best score: {best:.6f} | Baseline: {baseline:.6f} | Iteration {i}
 
 The experiment log is at research_log.md — read it to see what has been tried. Do not repeat failed ideas.
 
@@ -284,13 +314,16 @@ The training command that will be run to evaluate your change:
 ```
 cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=100 --seed=<varies> --log-dir=<run_dir> --disable-tui
 ```
-Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly.
+Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly. Changes must achieve at least {MIN_IMPROVEMENT_PCT}% relative improvement over the current best to be kept, so aim for meaningful changes rather than micro-tuning.
 
 Previous run logs are in research_runs/. Each run directory contains:
-- `metrics_logs/` — per-metric TSV files (top1_accuracy.log, policy_loss.log, total_loss.log, etc.)
+- `metrics_logs/` — per-metric TSV files (top1_accuracy.log, wdl_accuracy.log, aux_from_square_accuracy.log, aux_to_square_accuracy.log, policy_loss.log, total_loss.log, etc.)
 - `train.log` — detailed training log including per-layer gradient norms, weight norms, update ratios, and per-head gradient statistics (logged every 100 iterations)
 
-Don't change CLI argument handling or data loading.
+DO NOT TOUCH:
+- CLI argument handling or data loading
+- The LR scheduler type — we use reduce-on-plateau so training is duration-agnostic. Do not add cosine decay, cyclic schedules, or any schedule that depends on knowing total training steps. Adjusting the LR value itself, warmup, or plateau detector parameters is fine.
+- The evaluation metric or how accuracy is measured
 
 End your response with:
 ```json
@@ -298,8 +331,7 @@ End your response with:
 ```"""
 
             print(f"  Requesting experiment idea from subagent...")
-            # Use a different seed per iteration for training stochasticity
-            seed = 42 + i
+            seed = 42
             idea_output = call_tool("subagent.run", task=idea_prompt).get("output", "")
 
             iter_dir = AUTORESEARCH_DIR / str(i)
@@ -326,27 +358,27 @@ End your response with:
 
             print(f"  ✅ Compilation succeeded")
 
-            ao = run_training(f"run_{i}", seed=seed)
+            score, components = run_training(f"run_{i}", seed=seed)
 
             threshold = best * (1 + MIN_IMPROVEMENT_PCT / 100)
-            if ao >= threshold:
-                print(f"  ✅ IMPROVEMENT: {ao:.6f} >= {threshold:.6f} (>{MIN_IMPROVEMENT_PCT}% above {best:.6f})")
-                best = ao
-                git_commit(f"research iter {i}: {title} (ao{AO_WINDOW}={ao:.6f})")
+            if score >= threshold:
+                print(f"  ✅ IMPROVEMENT: {score:.6f} >= {threshold:.6f} (>{MIN_IMPROVEMENT_PCT}% above {best:.6f})")
+                best = score
+                git_commit(f"research iter {i}: {title} (score={score:.6f})")
                 status = "kept"
                 status_emoji = "✅"
             else:
-                print(f"  ❌ No improvement: {ao:.6f} < {threshold:.6f} (need >{MIN_IMPROVEMENT_PCT}% above {best:.6f})")
+                print(f"  ❌ No improvement: {score:.6f} < {threshold:.6f} (need >{MIN_IMPROVEMENT_PCT}% above {best:.6f})")
                 git_revert()
                 status = "discarded"
                 status_emoji = "❌"
 
-            result = {'iter': i, 'title': title, 'ao': ao, 'status': status}
+            result = {'iter': i, 'title': title, 'ao': score, 'status': status}
             all_results.append(result)
             with open(RESEARCH_LOG, 'a') as f:
-                f.write(f"| {i} | {title} | {ao:.6f} | {status_emoji} |\n")
+                f.write(f"| {i} | {title} | {score:.6f} {format_components(components)} | {status_emoji} |\n")
 
-            state["best_ao"] = best
+            state["best_score"] = best
             state["results"] = all_results
             save_state(state)
 
@@ -364,8 +396,8 @@ End your response with:
 
     print(f"\n{'='*60}")
     print(f"=== RESEARCH COMPLETE ===")
-    print(f"  Baseline ao{AO_WINDOW}: {baseline:.6f}")
-    print(f"  Best ao{AO_WINDOW}:     {best:.6f}")
+    print(f"  Baseline score: {baseline:.6f}")
+    print(f"  Best score:     {best:.6f}")
     print(f"  Improvement:   {best - baseline:+.6f}")
     kept = [r for r in all_results if r['status'] == 'kept']
     print(f"  Kept changes:  {len(kept)} / {len([r for r in all_results if r.get('status') != 'baseline'])}")

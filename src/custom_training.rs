@@ -2170,14 +2170,13 @@ where
     }
     // ==================== END LR RANGE FINDER ====================
 
-    let mut lr_scheduler = ReduceOnPlateauScheduler::with_cosine(
+    let mut lr_scheduler = ReduceOnPlateauScheduler::new(
         initial_lr,
         config.lr_min,
         config.lr_reduction_factor,
         config.lr_window_size,
         config.lr_improvement_threshold,
         warmup_iterations,
-        config.cosine_period,
     );
 
     let mut loss_metric = LossMetric::new();
@@ -3019,6 +3018,7 @@ where
         let wdl_acc_value = Numeric::value(&wdl_accuracy_metric);
         if let Some(value) = numeric_entry_value(&wdl_acc_value) {
             wdl_history.push(value);
+            metric_logger.log("wdl_accuracy", iteration, value);
         }
         renderer.update_train(MetricState::Numeric {
             name: wdl_accuracy_metric.name().to_string(),
