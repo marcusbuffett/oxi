@@ -25,10 +25,11 @@ MAX_ITERATIONS = 50
 # Research model config (~57 GB memory, ~0.5-0.67x production on each axis)
 MODEL_LAYERS = 12
 MODEL_EMBED = 256
-MODEL_BATCH = 1536
+MODEL_BATCH = 512
 
 # Metric: average of last 100 top-1 accuracy values
 AO_WINDOW = 100
+MIN_IMPROVEMENT_PCT = 1.0  # require 1% relative improvement to keep a change
 
 def parse_ao(log_dir):
     """Parse ao metric from top1_accuracy.log (average of last AO_WINDOW values)."""
@@ -90,6 +91,8 @@ def run_training(run_name, seed):
         f"--log-dir={log_dir}",
         "--disable-tui",
         "--warmup-multiplier=0.1",
+        "--log-gradient-breakdown",
+        "--full-metrics-interval=100",
     ]
     try:
         proc = subprocess.Popen(cmd, cwd=WORKSPACE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -273,15 +276,19 @@ Current best ao{AO_WINDOW}: {best:.6f} | Baseline: {baseline:.6f} | Iteration {i
 
 The experiment log is at research_log.md — read it to see what has been tried. Do not repeat failed ideas.
 
-Explore the codebase (start with src/) to understand the architecture, then make EXACTLY ONE focused change. You are free to make architectural changes, hyperparameter changes, ablation tests, loss function modifications, or anything else you think could help.
+Explore the codebase (start with src/) to understand the architecture, then make up to 3 related changes. You are free to make architectural changes, hyperparameter changes, ablation tests, loss function modifications, or anything else you think could help.
 
 Verify your change compiles: `cargo check --features "train,backend-tch"`
 
 The training command that will be run to evaluate your change:
 ```
-cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --seed=<varies> --log-dir=<run_dir> --disable-tui
+cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=100 --seed=<varies> --log-dir=<run_dir> --disable-tui
 ```
 Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly.
+
+Previous run logs are in research_runs/. Each run directory contains:
+- `metrics_logs/` — per-metric TSV files (top1_accuracy.log, policy_loss.log, total_loss.log, etc.)
+- `train.log` — detailed training log including per-layer gradient norms, weight norms, update ratios, and per-head gradient statistics (logged every 100 iterations)
 
 Don't change CLI argument handling or data loading.
 
@@ -321,14 +328,15 @@ End your response with:
 
             ao = run_training(f"run_{i}", seed=seed)
 
-            if ao > best:
-                print(f"  ✅ IMPROVEMENT: {ao:.6f} > {best:.6f} (+{ao-best:.6f})")
+            threshold = best * (1 + MIN_IMPROVEMENT_PCT / 100)
+            if ao >= threshold:
+                print(f"  ✅ IMPROVEMENT: {ao:.6f} >= {threshold:.6f} (>{MIN_IMPROVEMENT_PCT}% above {best:.6f})")
                 best = ao
                 git_commit(f"research iter {i}: {title} (ao{AO_WINDOW}={ao:.6f})")
                 status = "kept"
                 status_emoji = "✅"
             else:
-                print(f"  ❌ No improvement: {ao:.6f} <= {best:.6f}")
+                print(f"  ❌ No improvement: {ao:.6f} < {threshold:.6f} (need >{MIN_IMPROVEMENT_PCT}% above {best:.6f})")
                 git_revert()
                 status = "discarded"
                 status_emoji = "❌"
