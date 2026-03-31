@@ -35,7 +35,7 @@ MODEL_BATCH = 512
 METRIC_WINDOW = 100
 WEIGHT_TOP1 = 1.0
 WEIGHT_WDL = 1.0 / 3.0
-WEIGHT_AUX = 0.1  # average of from-square and to-square aux accuracy
+WEIGHT_AUX = 0.2  # average of from-square and to-square aux accuracy
 
 # Acceptance criterion: Welch's t-test on composite score, last METRIC_WINDOW iterations.
 # A change is kept only if p < ALPHA and Cohen's d >= MIN_COHEN_D.
@@ -487,14 +487,20 @@ End your response with:
             generate_chart(all_results, baseline)
 
         except Exception as e:
-            print(f"  ⚠️ Error in iteration {i}: {e}")
-            traceback.print_exc()
             git_revert()
-            result = {'iter': i, 'title': f'[ERROR] {str(e)[:50]}', 'ao': 0.0, 'status': 'error'}
-            all_results.append(result)
-            with open(RESEARCH_LOG, 'a') as f:
-                f.write(f"| {i} | [ERROR] {str(e)[:50]} | 0.000000 | ⚠️ |\n")
-            save_state(state)
+            msg = str(e)
+            # Transient bridge/connection errors shouldn't consume an iteration — just retry.
+            if any(kw in msg for kw in ("Bridge request failed", "Connection refused", "Remote end closed")):
+                print(f"  ⚠️ Transient error (retrying next loop): {msg[:80]}")
+                traceback.print_exc()
+            else:
+                print(f"  ⚠️ Error in iteration {i}: {msg}")
+                traceback.print_exc()
+                result = {'iter': i, 'title': f'[ERROR] {msg[:50]}', 'ao': 0.0, 'status': 'error'}
+                all_results.append(result)
+                with open(RESEARCH_LOG, 'a') as f:
+                    f.write(f"| {i} | [ERROR] {msg[:50]} | 0.000000 | ⚠️ |\n")
+                save_state(state)
 
     print(f"\n{'='*60}")
     print(f"=== RESEARCH COMPLETE ===")
