@@ -5,7 +5,7 @@ use burn::tensor::backend::Backend;
 
 use crate::config::get_global_config;
 
-const POLICY_RANK: usize = 128;
+const POLICY_RANK: usize = 192;
 const NUM_PROMO_PIECES: usize = 4;
 
 #[derive(Module, Debug)]
