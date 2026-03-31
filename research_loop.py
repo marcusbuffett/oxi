@@ -89,6 +89,7 @@ def run_training(run_name, seed):
         f"--seed={seed}",
         f"--log-dir={log_dir}",
         "--disable-tui",
+        "--warmup-multiplier=0.1",
     ]
     try:
         proc = subprocess.Popen(cmd, cwd=WORKSPACE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -118,7 +119,7 @@ def load_state():
     """Load persisted state for resumability."""
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    return {"iteration": 1, "best_ao": 0.0, "baseline_ao": 0.0, "results": []}
+    return {"best_ao": 0.0, "baseline_ao": 0.0, "results": []}
 
 
 def save_state(state):
@@ -249,17 +250,16 @@ def main():
         save_state(state)
         print(f"Baseline ao{AO_WINDOW}: {baseline:.6f}")
     else:
-        print(f"Resuming from iteration {state['iteration']}, best ao{AO_WINDOW}: {state['best_ao']:.6f}")
+        print(f"Resuming with {len(existing_results)} prior results, best ao{AO_WINDOW}: {state['best_ao']:.6f}")
 
     best = state["best_ao"]
     baseline = state["baseline_ao"]
-    start_iter = state["iteration"]
     all_results = [r for r in state.get("results", existing_results) if r.get('status') != 'error']
-    end_iter = start_iter + MAX_ITERATIONS
 
-    for i in range(start_iter, end_iter):
+    for iteration_count in range(MAX_ITERATIONS):
+        i = len(all_results)
         print(f"\n{'='*60}")
-        print(f"=== Iteration {i} | {i - start_iter + 1}/{MAX_ITERATIONS} | best: {best:.6f} | baseline: {baseline:.6f} ===")
+        print(f"=== Iteration {i} | {iteration_count + 1}/{MAX_ITERATIONS} | best: {best:.6f} | baseline: {baseline:.6f} ===")
         print(f"{'='*60}")
 
         try:
@@ -279,7 +279,7 @@ Verify your change compiles: `cargo check --features "train,backend-tch"`
 
 The training command that will be run to evaluate your change:
 ```
-cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --seed=<varies> --log-dir=<run_dir> --disable-tui
+cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --seed=<varies> --log-dir=<run_dir> --disable-tui
 ```
 Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly.
 
@@ -314,7 +314,6 @@ End your response with:
                 all_results.append(result)
                 with open(RESEARCH_LOG, 'a') as f:
                     f.write(f"| {i} | [COMPILE FAIL] {title} | 0.000000 | ❌ |\n")
-                state["iteration"] = i + 1
                 save_state(state)
                 continue
 
@@ -339,7 +338,6 @@ End your response with:
             with open(RESEARCH_LOG, 'a') as f:
                 f.write(f"| {i} | {title} | {ao:.6f} | {status_emoji} |\n")
 
-            state["iteration"] = i + 1
             state["best_ao"] = best
             state["results"] = all_results
             save_state(state)
@@ -354,7 +352,6 @@ End your response with:
             all_results.append(result)
             with open(RESEARCH_LOG, 'a') as f:
                 f.write(f"| {i} | [ERROR] {str(e)[:50]} | 0.000000 | ⚠️ |\n")
-            state["iteration"] = i + 1
             save_state(state)
 
     print(f"\n{'='*60}")

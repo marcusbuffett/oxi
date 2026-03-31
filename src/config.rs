@@ -1066,7 +1066,7 @@ impl Default for Config {
             physical_batch_size: 16000,
             seed: 42,
             num_workers: 4,
-            weight_decay: 0.01,
+            weight_decay: 0.005,
             cautious_weight_decay: Some(true),
             adam_epsilon: 1e-8,
             gradient_clip: 3.0,
