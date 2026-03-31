@@ -277,6 +277,12 @@ Explore the codebase (start with src/) to understand the architecture, then make
 
 Verify your change compiles: `cargo check --features "train,backend-tch"`
 
+The training command that will be run to evaluate your change:
+```
+cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --seed=<varies> --log-dir=<run_dir> --disable-tui
+```
+Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly.
+
 Don't change CLI argument handling or data loading.
 
 End your response with:
