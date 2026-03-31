@@ -10,6 +10,8 @@ import os
 import time
 import traceback
 from pathlib import Path
+import numpy as np
+from scipy import stats
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -34,39 +36,116 @@ METRIC_WINDOW = 100
 WEIGHT_TOP1 = 1.0
 WEIGHT_WDL = 1.0 / 3.0
 WEIGHT_AUX = 0.1  # average of from-square and to-square aux accuracy
-MIN_IMPROVEMENT_PCT = 1.0  # require 1% relative improvement to keep a change
+
+# Acceptance criterion: Welch's t-test on composite score, last METRIC_WINDOW iterations.
+# A change is kept only if p < ALPHA and Cohen's d >= MIN_COHEN_D.
+MIN_COHEN_D = 0.5   # medium effect size
+ALPHA = 0.05
+
+
+def load_metric_array(log_dir, metric_name):
+    """Parse a metric TSV log, returning a numpy array of the last METRIC_WINDOW values."""
+    log_file = Path(log_dir) / "metrics_logs" / f"{metric_name}.log"
+    if not log_file.exists():
+        return np.array([])
+    values = []
+    with open(log_file, 'r') as f:
+        for line in f:
+            if '\t' in line:
+                try:
+                    values.append(float(line.strip().split('\t')[1]))
+                except (ValueError, IndexError):
+                    pass
+    arr = np.array(values)
+    return arr[-METRIC_WINDOW:] if len(arr) >= METRIC_WINDOW else arr
+
+
+def load_composite_array(log_dir):
+    """Return a numpy array of per-step composite scores (last METRIC_WINDOW aligned steps)."""
+    def load_map(name):
+        log_file = Path(log_dir) / "metrics_logs" / f"{name}.log"
+        if not log_file.exists():
+            return {}
+        m = {}
+        with open(log_file, 'r') as f:
+            for line in f:
+                if '\t' in line:
+                    try:
+                        step, val = line.strip().split('\t')
+                        m[int(step)] = float(val)
+                    except (ValueError, IndexError):
+                        pass
+        return m
+
+    top1_map = load_map("top1_accuracy")
+    wdl_map  = load_map("wdl_accuracy")
+    from_map = load_map("aux_from_square_accuracy")
+    to_map   = load_map("aux_to_square_accuracy")
+
+    common = sorted(set(top1_map) & set(wdl_map) & set(from_map) & set(to_map))
+    if not common:
+        return np.array([])
+
+    values = []
+    for s in common:
+        aux = (from_map[s] + to_map[s]) / 2.0
+        score = WEIGHT_TOP1 * top1_map[s] + WEIGHT_WDL * (wdl_map[s] / 100.0) + WEIGHT_AUX * aux
+        values.append(score)
+
+    arr = np.array(values)
+    return arr[-METRIC_WINDOW:] if len(arr) >= METRIC_WINDOW else arr
 
 
 def parse_metric_log(log_dir, metric_name):
-    """Parse a metric TSV log file, returning the average of last METRIC_WINDOW values."""
-    log_file = Path(log_dir) / "metrics_logs" / f"{metric_name}.log"
-    if not log_file.exists():
-        return 0.0
-    with open(log_file, 'r') as f:
-        lines = f.readlines()
-    recent = lines[-METRIC_WINDOW:] if len(lines) >= METRIC_WINDOW else lines
-    values = []
-    for line in recent:
-        if '\t' in line:
-            try:
-                values.append(float(line.strip().split('\t')[1]))
-            except (ValueError, IndexError):
-                pass
-    return sum(values) / len(values) if values else 0.0
+    """Return the mean of the last METRIC_WINDOW values for a metric (scalar, for reporting)."""
+    arr = load_metric_array(log_dir, metric_name)
+    return float(arr.mean()) if len(arr) > 0 else 0.0
 
 
 def parse_composite_score(log_dir):
     """Compute composite score from multiple metrics. Returns (score, components_dict)."""
     top1 = parse_metric_log(log_dir, "top1_accuracy")
     wdl_raw = parse_metric_log(log_dir, "wdl_accuracy")
-    wdl = wdl_raw / 100.0  # normalize from 0-100 to 0-1
+    wdl = wdl_raw / 100.0
     aux_from = parse_metric_log(log_dir, "aux_from_square_accuracy")
     aux_to = parse_metric_log(log_dir, "aux_to_square_accuracy")
     aux = (aux_from + aux_to) / 2.0
-
     score = WEIGHT_TOP1 * top1 + WEIGHT_WDL * wdl + WEIGHT_AUX * aux
     components = {"top1": top1, "wdl": wdl, "aux": aux}
     return score, components
+
+
+def check_improvement(current_dir, baseline_dir):
+    """
+    Test whether current_dir is a statistically significant improvement over baseline_dir.
+    Uses Welch's t-test + Cohen's d on the composite score (last METRIC_WINDOW steps).
+    Returns (is_improvement: bool, stats: dict).
+    """
+    a = load_composite_array(baseline_dir)
+    b = load_composite_array(current_dir)
+    if len(a) < 2 or len(b) < 2:
+        return False, {"error": "insufficient data"}
+
+    t_stat, p_val = stats.ttest_ind(a, b, equal_var=False)
+    delta = b.mean() - a.mean()
+    pooled_std = np.sqrt((a.std(ddof=1) ** 2 + b.std(ddof=1) ** 2) / 2)
+    d = delta / pooled_std if pooled_std > 0 else 0.0
+
+    passed = (p_val < ALPHA) and (d >= MIN_COHEN_D)
+    return passed, {"delta": delta, "p": p_val, "d": d, "mean_new": b.mean(), "mean_old": a.mean()}
+
+
+def best_run_dir_by_score():
+    """Scan research_runs/ and return the dir with the highest composite score."""
+    best_dir, best_score = None, -1.0
+    for p in RESEARCH_RUNS.iterdir():
+        if p.is_dir() and (p / "metrics_logs").is_dir():
+            arr = load_composite_array(p)
+            if len(arr) > 0:
+                s = float(arr.mean())
+                if s > best_score:
+                    best_score, best_dir = s, p
+    return best_dir
 
 
 def compile_check():
@@ -146,8 +225,14 @@ def git_commit(message):
 def load_state():
     """Load persisted state for resumability."""
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"best_score": 0.0, "baseline_score": 0.0, "results": []}
+        state = json.loads(STATE_FILE.read_text())
+    else:
+        state = {"best_score": 0.0, "baseline_score": 0.0, "results": []}
+    # Infer best_run_dir from disk if not already stored
+    if not state.get("best_run_dir"):
+        d = best_run_dir_by_score()
+        state["best_run_dir"] = str(d) if d else str(RESEARCH_RUNS / "baseline")
+    return state
 
 
 def save_state(state):
@@ -271,6 +356,7 @@ def main():
         baseline, baseline_components = run_training("baseline", seed=42)
         state["baseline_score"] = baseline
         state["best_score"] = baseline
+        state["best_run_dir"] = str(RESEARCH_RUNS / "baseline")
         if not any(r['iter'] == 0 for r in existing_results):
             with open(RESEARCH_LOG, 'a') as f:
                 f.write(f"| 0 | Baseline (no changes) | {baseline:.6f} {format_components(baseline_components)} | baseline |\n")
@@ -314,7 +400,7 @@ The training command that will be run to evaluate your change:
 ```
 cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=100 --seed=<varies> --log-dir=<run_dir> --disable-tui
 ```
-Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly. Changes must achieve at least {MIN_IMPROVEMENT_PCT}% relative improvement over the current best to be kept, so aim for meaningful changes rather than micro-tuning.
+Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly. Changes are kept only if they achieve a statistically significant improvement (Welch's t-test p < {ALPHA}, Cohen's d >= {MIN_COHEN_D}) on the composite score compared to the current best run. Aim for meaningful changes — small tweaks that improve the mean by less than ~1 pooled std dev will be discarded.
 
 Previous run logs are in research_runs/. Each run directory contains:
 - `metrics_logs/` — per-metric TSV files (top1_accuracy.log, wdl_accuracy.log, aux_from_square_accuracy.log, aux_to_square_accuracy.log, policy_loss.log, total_loss.log, etc.)
@@ -324,6 +410,14 @@ DO NOT TOUCH:
 - CLI argument handling or data loading
 - The LR scheduler type — we use reduce-on-plateau so training is duration-agnostic. Do not add cosine decay, cyclic schedules, or any schedule that depends on knowing total training steps. Adjusting the LR value itself, warmup, or plateau detector parameters is fine.
 - The evaluation metric or how accuracy is measured
+- research_log.md and research_runs/ — these are read-only. You may read them for context but do not write to, modify, or delete any files in them. The one exception is research_runs/run_{i}/conclusion.md which you must create (see below).
+
+Before your final response, write a file at research_runs/run_{i}/conclusion.md describing:
+1. **What you did** — a short summary of the change(s) made.
+2. **Why you chose this** — a detailed breakdown of your reasoning: what prior results, architectural insights, or hypotheses led you to believe this was the best option to try. Reference specific prior experiments from research_log.md if relevant.
+3. **What you expect** — what outcome you predict and why.
+
+Be concise but thorough on the reasoning.
 
 End your response with:
 ```json
@@ -360,20 +454,28 @@ End your response with:
 
             score, components = run_training(f"run_{i}", seed=seed)
 
-            threshold = best * (1 + MIN_IMPROVEMENT_PCT / 100)
-            if score >= threshold:
-                print(f"  ✅ IMPROVEMENT: {score:.6f} >= {threshold:.6f} (>{MIN_IMPROVEMENT_PCT}% above {best:.6f})")
+            best_dir = Path(state.get("best_run_dir", str(RESEARCH_RUNS / "baseline")))
+            improved, stat = check_improvement(RESEARCH_RUNS / f"run_{i}", best_dir)
+            if "error" not in stat:
+                stat_str = f"Δ={stat['delta']:+.4f}  p={stat['p']:.4f}  d={stat['d']:+.3f}"
+            else:
+                stat_str = stat["error"]
+
+            if improved:
+                print(f"  ✅ IMPROVEMENT: {score:.6f}  ({stat_str})")
                 best = score
+                state["best_run_dir"] = str(RESEARCH_RUNS / f"run_{i}")
                 git_commit(f"research iter {i}: {title} (score={score:.6f})")
                 status = "kept"
                 status_emoji = "✅"
             else:
-                print(f"  ❌ No improvement: {score:.6f} < {threshold:.6f} (need >{MIN_IMPROVEMENT_PCT}% above {best:.6f})")
+                print(f"  ❌ No improvement: {score:.6f}  ({stat_str})  need p<{ALPHA} and d>={MIN_COHEN_D}")
                 git_revert()
                 status = "discarded"
                 status_emoji = "❌"
 
             result = {'iter': i, 'title': title, 'ao': score, 'status': status}
+
             all_results.append(result)
             with open(RESEARCH_LOG, 'a') as f:
                 f.write(f"| {i} | {title} | {score:.6f} {format_components(components)} | {status_emoji} |\n")
