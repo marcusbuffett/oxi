@@ -1,5 +1,5 @@
 use burn::module::Module;
-use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::nn::{Dropout, DropoutConfig, Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::tensor::activation::silu;
 use burn::tensor::Device;
 use burn::tensor::{backend::Backend, Tensor};
@@ -184,6 +184,7 @@ pub struct MLP<B: Backend> {
     fused_gate_up: Linear<B>,
     /// Down projection: hidden_dim -> embed_dim
     down_proj: Linear<B>,
+    dropout: Dropout,
 }
 
 impl<B: Backend> MLP<B> {
@@ -211,9 +212,11 @@ impl<B: Backend> MLP<B> {
         let down_proj = LinearConfig::new(hidden_dim, config.embed_dim())
             .with_initializer(residual_init)
             .init(device);
+        let dropout = DropoutConfig::new(0.1).init();
         Self {
             fused_gate_up,
             down_proj,
+            dropout,
         }
     }
 
@@ -232,6 +235,9 @@ impl<B: Backend> MLP<B> {
         // SwiGLU: SiLU(gate) * up
         let activated = silu(gate) * up;
         log_tensor_stats("mlp.swiglu", &activated);
+
+        // Apply dropout before down projection
+        let activated = self.dropout.forward(activated);
 
         // Down projection
         let output = self.down_proj.forward(activated);
