@@ -212,7 +212,7 @@ impl<B: Backend> MLP<B> {
         let down_proj = LinearConfig::new(hidden_dim, config.embed_dim())
             .with_initializer(residual_init)
             .init(device);
-        let dropout = DropoutConfig::new(0.1).init();
+        let dropout = DropoutConfig::new(0.0).init();
         Self {
             fused_gate_up,
             down_proj,
