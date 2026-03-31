@@ -323,16 +323,16 @@ fn default_use_muon() -> Option<bool> {
     Some(true)
 }
 fn default_muon_base_lr() -> f64 {
-    0.015 // Was 0.02; reduced 25% per Optuna sweep (lr_mult=0.75 optimal)
+    0.0225 // Was 0.015; increased 50% for faster convergence in limited-iteration regime
 }
 fn default_adamw_base_lr() -> f64 {
-    2.25e-4 // Was 3e-4; reduced 25% per Optuna sweep
+    3.375e-4 // Was 2.25e-4; increased 50% for faster convergence
 }
 fn default_embedding_base_lr() -> f64 {
-    0.075 // Was 0.1; reduced 25% per Optuna sweep. Width-independent per μP.
+    0.1125 // Was 0.075; increased 50% for faster convergence. Width-independent per μP.
 }
 fn default_aux_loss_weight() -> f32 {
-    0.05
+    0.01 // Was 0.05; reduced to minimize gradient competition with policy
 }
 
 /// Command-line overrides for Config. All fields are optional.
@@ -1117,7 +1117,7 @@ impl Default for Config {
             enable_forward_timing: Some(false),
             forward_timing_interval: 100,
             num_devices: 1,
-            focal_loss_gamma: 1.0,
+            focal_loss_gamma: 0.0,
             enable_ply_sampling: Some(true),
             enable_elo_sampling: Some(true),
             checkpoint_interval: 100,

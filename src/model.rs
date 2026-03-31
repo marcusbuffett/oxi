@@ -396,20 +396,25 @@ impl<B: Backend> OXIModel<B> {
         let targets_smoothed =
             batch.move_distributions.clone() * (1.0 - eps) + uniform_over_legal * eps;
 
+        // Standard cross-entropy loss per sample
+        let ce_loss_per_sample = (targets_smoothed.clone() * log_policy).sum_dim(1).neg();
+
         // Focal Loss: FL(p_t) = -(1 - p_t)^γ * log(p_t)
         let gamma = config.focal_loss_gamma;
-        let policy_probs = softmax(policy_logits_flat.clone(), 1);
-        let policy_probs = policy_probs.mask_fill(mask.clone(), 0.0);
+        let policy_loss = if gamma > 0.0 {
+            let policy_probs = softmax(policy_logits_flat.clone(), 1);
+            let policy_probs = policy_probs.mask_fill(mask.clone(), 0.0);
 
-        // Compute p_t for each target
-        let p_t = (targets_smoothed.clone() * policy_probs).sum_dim(1);
-        let focal_weight = (Tensor::ones_like(&p_t) - p_t.clone()).powf_scalar(gamma);
+            // Compute p_t for each target
+            let p_t = (targets_smoothed * policy_probs).sum_dim(1);
+            let focal_weight = (Tensor::ones_like(&p_t) - p_t.clone()).powf_scalar(gamma);
 
-        // Standard cross-entropy loss per sample
-        let ce_loss_per_sample = (targets_smoothed * log_policy).sum_dim(1).neg();
-
-        // Apply focal weight
-        let policy_loss = (focal_weight * ce_loss_per_sample).mean();
+            // Apply focal weight
+            (focal_weight * ce_loss_per_sample).mean()
+        } else {
+            // gamma=0: standard cross-entropy (focal weight is 1.0)
+            ce_loss_per_sample.mean()
+        };
 
         // Value loss
         let value_log_probs = log_softmax(value_logits.clone(), 1);
