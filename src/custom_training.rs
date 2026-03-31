@@ -1758,8 +1758,6 @@ where
         None
     };
 
-    let cautious = config.cautious_weight_decay.unwrap_or(true);
-
     // Muon optimizer for 2D+ hidden layer weight matrices
     let muon_weight_decay = if config.weight_decay > 0.0 {
         Some(burn::optim::decay::WeightDecayConfig::new(
@@ -1775,6 +1773,7 @@ where
     let mut optim_muon = MuonConfig::new()
         .with_weight_decay(muon_weight_decay)
         .with_adjust_lr_fn(muon_lr_adjust)
+        .with_ns_steps(2)
         .init();
     println!(
         "  Muon optimizer: enabled={}, lr_adjust={}, weight_decay={}",
@@ -1784,6 +1783,7 @@ where
     );
 
     // AdamW optimizers for everything else
+    let cautious = config.cautious_weight_decay.unwrap_or(true);
     let mut optim_decay_normal = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
         .with_epsilon(config.adam_epsilon)

@@ -1,0 +1,37 @@
+{
+  "best_score": 0.672744,
+  "baseline_score": 0.583246713315,
+  "results": [
+    {
+      "iter": 0,
+      "title": "Fix from/to square aux loss: BCE\u2192cross-entropy",
+      "ao": 0.634516,
+      "status": "kept"
+    },
+    {
+      "iter": 1,
+      "title": "Enhanced aux heads: hidden layer + policy tokens",
+      "ao": 0.659628,
+      "status": "kept"
+    },
+    {
+      "iter": 2,
+      "title": "Deeper policy tower + FiLM + wider FFN",
+      "ao": 0.654562,
+      "status": "discarded"
+    },
+    {
+      "iter": 3,
+      "title": "Trunk aux supervision + policy FiLM conditioning",
+      "ao": 0.672744,
+      "status": "kept"
+    },
+    {
+      "iter": 4,
+      "title": "Muon ns_steps=2 + full cautious AdamW",
+      "ao": 0.642984,
+      "status": "discarded"
+    }
+  ],
+  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_3"
+}
