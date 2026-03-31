@@ -59,6 +59,8 @@ pub struct OXIModel<B: Backend> {
     aux_material_head: Linear<B>,
     aux_from_square_head: Linear<B>,
     aux_to_square_head: Linear<B>,
+    aux_from_square_hidden: Linear<B>,
+    aux_to_square_hidden: Linear<B>,
 }
 
 impl<B: Backend> OXIModel<B> {
@@ -161,6 +163,12 @@ impl<B: Backend> OXIModel<B> {
         let aux_to_square_head = LinearConfig::new(config.embed_dim(), 1)
             .with_initializer(std_init.clone())
             .init(device);
+        let aux_from_square_hidden = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
+        let aux_to_square_hidden = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
 
         Self {
             token_embed,
@@ -192,6 +200,8 @@ impl<B: Backend> OXIModel<B> {
             aux_material_head,
             aux_from_square_head,
             aux_to_square_head,
+            aux_from_square_hidden,
+            aux_to_square_hidden,
         }
     }
 
@@ -200,7 +210,7 @@ impl<B: Backend> OXIModel<B> {
         board: Tensor<B, 3>,
         globals: Tensor<B, 2, Float>,
     ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
-        let (policy, value, side_info, time_usage, _trunk) =
+        let (policy, value, side_info, time_usage, _trunk, _policy_tokens) =
             self.forward_with_trunk(board, globals);
         (policy, value, side_info, time_usage)
     }
@@ -209,7 +219,7 @@ impl<B: Backend> OXIModel<B> {
         &self,
         board: Tensor<B, 3>,
         globals: Tensor<B, 2, Float>,
-    ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 3>) {
+    ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 3>, Tensor<B, 3>) {
         start_forward_pass();
         let device = board.device();
         let total_timing = TimingScope::new_with_sync::<B>("forward_total", &device);
@@ -298,7 +308,7 @@ impl<B: Backend> OXIModel<B> {
         x = self.norm.forward(x);
         log_tensor_stats("encoder.post_norm", &x);
 
-        let policy_logits = {
+        let (policy_logits, policy_tokens) = {
             let _stream = StreamScope::enter("policy");
             let _timing = TimingScope::new_with_sync::<B>("policy_head", &device);
             let tokens = {
@@ -309,10 +319,10 @@ impl<B: Backend> OXIModel<B> {
             log_tensor_stats("policy.tokens", &tokens);
             let logits = {
                 let _t = TimingScope::new_with_sync::<B>("factorized_policy", &device);
-                self.policy_head.forward(tokens)
+                self.policy_head.forward(tokens.clone())
             };
             log_tensor_stats("policy.logits", &logits);
-            logits
+            (logits, tokens)
         };
 
         let aux_batch_size = board.dims()[0];
@@ -351,6 +361,7 @@ impl<B: Backend> OXIModel<B> {
             side_info_logits,
             time_usage_logits,
             x,
+            policy_tokens,
         )
     }
 
@@ -366,7 +377,7 @@ impl<B: Backend> OXIModel<B> {
         let config = get_global_config();
         let batch_size = batch.board_input.shape().dims[0];
 
-        let (policy_logits, value_logits, _side_info_logits, time_usage_logits, trunk_output) =
+        let (policy_logits, value_logits, _side_info_logits, time_usage_logits, trunk_output, policy_tokens) =
             self.forward_with_trunk(batch.board_input, batch.global_features);
 
         let policy_logits_flat_original = policy_logits.reshape([batch_size, LEGAL_MOVES]);
@@ -518,9 +529,11 @@ impl<B: Backend> OXIModel<B> {
 
             let si_loss_f32 = side_info_bce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
 
-            // From-square: per-token prediction → [batch, 64]
+            // From-square: per-token prediction using policy tokens → [batch, 64]
+            let from_sq_hidden = silu(self.aux_from_square_hidden
+                .forward(policy_tokens.clone()));
             let from_sq_logits = self.aux_from_square_head
-                .forward(trunk_output.clone())
+                .forward(from_sq_hidden)
                 .reshape([batch_size, 64]);
             let from_sq_target_int = batch.side_info.clone()
                 .slice([0..batch_size, 13..77]);
@@ -538,9 +551,11 @@ impl<B: Backend> OXIModel<B> {
             let from_correct = from_pred.equal(from_true).float().mean();
             let from_acc_f32 = from_correct.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
 
-            // To-square: per-token prediction → [batch, 64]
+            // To-square: per-token prediction using policy tokens → [batch, 64]
+            let to_sq_hidden = silu(self.aux_to_square_hidden
+                .forward(policy_tokens.clone()));
             let to_sq_logits = self.aux_to_square_head
-                .forward(trunk_output.clone())
+                .forward(to_sq_hidden)
                 .reshape([batch_size, 64]);
             let to_sq_target_int = batch.side_info.clone()
                 .slice([0..batch_size, 77..141]);
