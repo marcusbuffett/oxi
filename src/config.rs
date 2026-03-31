@@ -332,7 +332,7 @@ fn default_embedding_base_lr() -> f64 {
     0.1125 // Was 0.075; increased 50% for faster convergence. Width-independent per μP.
 }
 fn default_aux_loss_weight() -> f32 {
-    0.01 // Was 0.05; reduced to minimize gradient competition with policy
+    0.02 // Was 0.01; modest increase to give CE from/to losses stronger initial signal for trunk training
 }
 /// Command-line overrides for Config. All fields are optional.
 /// Use `Config::with_overrides()` to merge with defaults.
@@ -1079,7 +1079,7 @@ impl Default for Config {
             gradnorm_policy_priority: 5.0,
             gradnorm_value_priority: 1.0,
             gradnorm_time_priority: 1.0,
-            gradnorm_aux_priority: 0.5,
+            gradnorm_aux_priority: 1.5,
             gradnorm_probe_size: 256,
             lr_min: 0.000001,
             lr_window_size: 1000,

@@ -524,9 +524,13 @@ impl<B: Backend> OXIModel<B> {
                 .reshape([batch_size, 64]);
             let from_sq_target_int = batch.side_info.clone()
                 .slice([0..batch_size, 13..77]);
-            let from_sq_bce = self.side_info_bce.forward(from_sq_logits.clone(), from_sq_target_int.clone());
 
-            let from_loss_f32 = from_sq_bce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            // Use cross-entropy instead of BCE: from-square is a 64-class classification
+            let from_sq_log_probs = log_softmax(from_sq_logits.clone(), 1);
+            let from_sq_target_float = from_sq_target_int.clone().float();
+            let from_sq_ce = (from_sq_target_float * from_sq_log_probs).sum_dim(1).neg().mean();
+
+            let from_loss_f32 = from_sq_ce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
 
             // From-square accuracy: argmax match
             let from_pred = from_sq_logits.argmax(1).squeeze_dim::<1>(1);
@@ -540,9 +544,13 @@ impl<B: Backend> OXIModel<B> {
                 .reshape([batch_size, 64]);
             let to_sq_target_int = batch.side_info.clone()
                 .slice([0..batch_size, 77..141]);
-            let to_sq_bce = self.side_info_bce.forward(to_sq_logits.clone(), to_sq_target_int.clone());
 
-            let to_loss_f32 = to_sq_bce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            // Use cross-entropy instead of BCE: to-square is a 64-class classification
+            let to_sq_log_probs = log_softmax(to_sq_logits.clone(), 1);
+            let to_sq_target_float = to_sq_target_int.clone().float();
+            let to_sq_ce = (to_sq_target_float * to_sq_log_probs).sum_dim(1).neg().mean();
+
+            let to_loss_f32 = to_sq_ce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
 
             // To-square accuracy: argmax match
             let to_pred = to_sq_logits.argmax(1).squeeze_dim::<1>(1);
@@ -550,7 +558,7 @@ impl<B: Backend> OXIModel<B> {
             let to_correct = to_pred.equal(to_true).float().mean();
             let to_acc_f32 = to_correct.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
 
-            (side_info_bce + from_sq_bce + to_sq_bce, si_loss_f32, from_loss_f32, to_loss_f32, from_acc_f32, to_acc_f32)
+            (side_info_bce + from_sq_ce + to_sq_ce, si_loss_f32, from_loss_f32, to_loss_f32, from_acc_f32, to_acc_f32)
         } else {
             (zero_like(), 0.0, 0.0, 0.0, 0.0, 0.0)
         };
