@@ -61,6 +61,10 @@ pub struct OXIModel<B: Backend> {
     aux_to_square_head: Linear<B>,
     aux_from_square_hidden: Linear<B>,
     aux_to_square_hidden: Linear<B>,
+    aux_trunk_from_square_head: Linear<B>,
+    aux_trunk_from_square_hidden: Linear<B>,
+    aux_trunk_to_square_head: Linear<B>,
+    aux_trunk_to_square_hidden: Linear<B>,
 }
 
 impl<B: Backend> OXIModel<B> {
@@ -169,6 +173,18 @@ impl<B: Backend> OXIModel<B> {
         let aux_to_square_hidden = LinearConfig::new(config.embed_dim(), config.embed_dim())
             .with_initializer(std_init.clone())
             .init(device);
+        let aux_trunk_from_square_head = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
+        let aux_trunk_from_square_hidden = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
+        let aux_trunk_to_square_head = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
+        let aux_trunk_to_square_hidden = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
 
         Self {
             token_embed,
@@ -202,6 +218,10 @@ impl<B: Backend> OXIModel<B> {
             aux_to_square_head,
             aux_from_square_hidden,
             aux_to_square_hidden,
+            aux_trunk_from_square_head,
+            aux_trunk_from_square_hidden,
+            aux_trunk_to_square_head,
+            aux_trunk_to_square_hidden,
         }
     }
 
@@ -314,7 +334,7 @@ impl<B: Backend> OXIModel<B> {
             let tokens = {
                 let _t = TimingScope::new_with_sync::<B>("policy_block", &device);
                 self.policy_block
-                    .forward(x.clone(), &self.smolgen_weight_gen)
+                    .forward_with_film(x.clone(), &self.smolgen_weight_gen, globals.clone())
             };
             log_tensor_stats("policy.tokens", &tokens);
             let logits = {
@@ -573,7 +593,32 @@ impl<B: Backend> OXIModel<B> {
             let to_correct = to_pred.equal(to_true).float().mean();
             let to_acc_f32 = to_correct.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
 
-            (side_info_bce + from_sq_ce + to_sq_ce, si_loss_f32, from_loss_f32, to_loss_f32, from_acc_f32, to_acc_f32)
+            // Trunk-level from/to square prediction: direct aux supervision on trunk tokens
+            // This gives the trunk direct gradient signal about which squares matter,
+            // rather than only getting it indirectly through the policy_block.
+            let trunk_from_sq_target = batch.side_info.clone()
+                .slice([0..batch_size, 13..77]);
+            let trunk_from_sq_hidden = silu(self.aux_trunk_from_square_hidden
+                .forward(trunk_output.clone()));
+            let trunk_from_sq_logits = self.aux_trunk_from_square_head
+                .forward(trunk_from_sq_hidden)
+                .reshape([batch_size, 64]);
+            let trunk_from_sq_log_probs = log_softmax(trunk_from_sq_logits, 1);
+            let trunk_from_sq_target_float = trunk_from_sq_target.float();
+            let trunk_from_sq_ce = (trunk_from_sq_target_float * trunk_from_sq_log_probs).sum_dim(1).neg().mean();
+
+            let trunk_to_sq_target = batch.side_info.clone()
+                .slice([0..batch_size, 77..141]);
+            let trunk_to_sq_hidden = silu(self.aux_trunk_to_square_hidden
+                .forward(trunk_output.clone()));
+            let trunk_to_sq_logits = self.aux_trunk_to_square_head
+                .forward(trunk_to_sq_hidden)
+                .reshape([batch_size, 64]);
+            let trunk_to_sq_log_probs = log_softmax(trunk_to_sq_logits, 1);
+            let trunk_to_sq_target_float = trunk_to_sq_target.float();
+            let trunk_to_sq_ce = (trunk_to_sq_target_float * trunk_to_sq_log_probs).sum_dim(1).neg().mean();
+
+            (side_info_bce + from_sq_ce + to_sq_ce + trunk_from_sq_ce + trunk_to_sq_ce, si_loss_f32, from_loss_f32, to_loss_f32, from_acc_f32, to_acc_f32)
         } else {
             (zero_like(), 0.0, 0.0, 0.0, 0.0, 0.0)
         };

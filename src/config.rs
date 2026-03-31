@@ -332,7 +332,7 @@ fn default_embedding_base_lr() -> f64 {
     0.1125 // Was 0.075; increased 50% for faster convergence. Width-independent per μP.
 }
 fn default_aux_loss_weight() -> f32 {
-    0.04 // Was 0.02; increased to give from/to square CE heads stronger learning signal
+    0.06 // Was 0.04; increased to strengthen trunk-level auxiliary supervision signal
 }
 /// Command-line overrides for Config. All fields are optional.
 /// Use `Config::with_overrides()` to merge with defaults.
