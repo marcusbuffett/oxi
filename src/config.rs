@@ -1091,7 +1091,7 @@ impl Default for Config {
             adamw_base_lr: default_adamw_base_lr(),
             embedding_base_lr: default_embedding_base_lr(),
             warmup_multiplier: 2.0,
-            policy_loss_weight: 0.15,
+            policy_loss_weight: 0.25,
             policy_label_smoothing: 0.01,
             value_loss_weight: 0.0001,
             value_entropy_weight: 0.0,
