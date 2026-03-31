@@ -350,7 +350,7 @@ fn default_stochastic_depth_rate() -> f32 {
     0.2
 }
 fn default_cosine_period() -> usize {
-    1600 // Moderate cosine decay: ~20% of peak LR after ~1100 post-warmup steps
+    1300 // Tighter cosine: LR decays to ~3% by iter 1200 for proper annealing within training window
 }
 
 /// Command-line overrides for Config. All fields are optional.
@@ -1102,7 +1102,7 @@ impl Default for Config {
             physical_batch_size: 16000,
             seed: 42,
             num_workers: 4,
-            weight_decay: 0.005,
+            weight_decay: 0.003,
             cautious_weight_decay: Some(true),
             adam_epsilon: 1e-8,
             gradient_clip: 3.0,
@@ -1127,7 +1127,7 @@ impl Default for Config {
             adamw_base_lr: default_adamw_base_lr(),
             embedding_base_lr: default_embedding_base_lr(),
             warmup_multiplier: 2.0,
-            policy_loss_weight: 0.25,
+            policy_loss_weight: 0.30,
             policy_label_smoothing: 0.005,
             value_loss_weight: 0.0001,
             value_entropy_weight: 0.0,
