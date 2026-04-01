@@ -483,7 +483,7 @@ End your response with:
 
             print(f"  Requesting experiment idea from subagent...")
             seed = 42
-            idea_output = call_tool("subagent.run", task=idea_prompt).get("output", "")
+            idea_output = call_tool("subagent_run", task=idea_prompt).get("output", "")
 
             iter_dir = AUTORESEARCH_DIR / str(i)
             iter_dir.mkdir(parents=True, exist_ok=True)
