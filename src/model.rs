@@ -430,7 +430,7 @@ impl<B: Backend> OXIModel<B> {
             batch.move_distributions.clone() * (1.0 - eps) + uniform_over_legal * eps;
 
         // Standard cross-entropy loss per sample
-        let ce_loss_per_sample = (targets_smoothed.clone() * log_policy).sum_dim(1).neg();
+        let ce_loss_per_sample = (targets_smoothed.clone() * log_policy.clone()).sum_dim(1).neg();
 
         // Focal Loss: FL(p_t) = -(1 - p_t)^γ * log(p_t)
         let gamma = config.focal_loss_gamma;
