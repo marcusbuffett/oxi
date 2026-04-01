@@ -24,9 +24,9 @@ STATE_FILE = WORKSPACE / "research_state.json"
 TRAINING_TIMEOUT = 1800  # 30 minutes
 MAX_ITERATIONS = 50
 
-# Research model config (~57 GB memory, ~0.5-0.67x production on each axis)
-MODEL_LAYERS = 12
-MODEL_EMBED = 256
+# Research model config (matches production dimensions, fewer layers)
+MODEL_LAYERS = 8
+MODEL_EMBED = 384
 MODEL_BATCH = 512
 
 # Composite metric: weighted combination of top-1 accuracy, WDL accuracy, and aux head accuracy
@@ -162,6 +162,15 @@ def format_components(components):
     return f"(top1={components['top1']:.4f}, wdl={components['wdl']:.4f}, aux={components['aux']:.4f})"
 
 
+def format_delta(score, components, prev_score, prev_components):
+    """Format delta vs previous best: +0.0131 (top1=-0.0040, wdl=+0.0092, aux=+0.0702)"""
+    ds = score - prev_score
+    dt = components['top1'] - prev_components['top1']
+    dw = components['wdl'] - prev_components['wdl']
+    da = components['aux'] - prev_components['aux']
+    return f"{ds:+.4f} (top1={dt:+.4f}, wdl={dw:+.4f}, aux={da:+.4f})"
+
+
 def run_training(run_name, seed):
     """Run training for TRAINING_TIMEOUT seconds and return (composite_score, components_dict)."""
     log_dir = RESEARCH_RUNS / run_name
@@ -197,6 +206,8 @@ def run_training(run_name, seed):
         "--warmup-multiplier=0.1",
         "--log-gradient-breakdown",
         "--full-metrics-interval=100",
+        "--gradnorm-interval=100",
+        "--checkpoint-interval=0",
     ]
     try:
         proc = subprocess.Popen(cmd, cwd=WORKSPACE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -347,7 +358,7 @@ def main():
 
     if not RESEARCH_LOG.exists() or RESEARCH_LOG.stat().st_size == 0:
         with open(RESEARCH_LOG, 'w') as f:
-            f.write(f"# OXI Research Log\n\n| Iter | Description | Score | Kept |\n|------|-------------|-------|------|\n")
+            f.write(f"# OXI Research Log\n\n| Iter | Description | Score | Δ vs prev best | Kept |\n|------|-------------|-------|----------------|------|\n")
 
     # Run baseline if needed
     if state["baseline_score"] == 0.0:
@@ -357,9 +368,10 @@ def main():
         state["baseline_score"] = baseline
         state["best_score"] = baseline
         state["best_run_dir"] = str(RESEARCH_RUNS / "baseline")
+        state["best_components"] = baseline_components
         if not any(r['iter'] == 0 for r in existing_results):
             with open(RESEARCH_LOG, 'a') as f:
-                f.write(f"| 0 | Baseline (no changes) | {baseline:.6f} {format_components(baseline_components)} | baseline |\n")
+                f.write(f"| 0 | Baseline (no changes) | {baseline:.6f} {format_components(baseline_components)} | — | baseline |\n")
             existing_results.append({'iter': 0, 'title': 'Baseline', 'ao': baseline, 'status': 'baseline'})
         save_state(state)
         print(f"Baseline score: {baseline:.6f} {format_components(baseline_components)}")
@@ -381,16 +393,27 @@ def main():
 
             idea_prompt = f"""You are an ML researcher improving a chess move-prediction transformer.
 
-Your goal is to improve a composite score computed as:
+## Evaluation Metric
+
+Your changes are evaluated on a **composite score** computed as:
   score = {WEIGHT_TOP1}*top1_accuracy + {WEIGHT_WDL:.4f}*wdl_accuracy + {WEIGHT_AUX}*aux_accuracy
 where each component is the average of its last {METRIC_WINDOW} logged values during a {TRAINING_TIMEOUT//60}-minute training run.
-- top1_accuracy: policy head move prediction accuracy (0-1)
-- wdl_accuracy: win/draw/loss prediction accuracy (0-1)
-- aux_accuracy: average of from-square and to-square auxiliary head accuracy (0-1)
+
+Components:
+- **top1_accuracy** (weight {WEIGHT_TOP1}): Policy head move prediction accuracy (0-1). Fraction of positions where the model's top-1 predicted move matches the game move.
+- **wdl_accuracy** (weight {WEIGHT_WDL:.4f}): Win/draw/loss prediction accuracy (0-1). How well the value head predicts game outcomes.
+- **aux_accuracy** (weight {WEIGHT_AUX}): Average of from-square and to-square auxiliary head accuracy (0-1). These heads predict the origin and destination squares of the played move.
 
 Current best score: {best:.6f} | Baseline: {baseline:.6f} | Iteration {i}
 
-The experiment log is at research_log.md — read it to see what has been tried. Do not repeat failed ideas.
+## Important Context
+
+- **Loss weighting is handled by GradNorm** — the model uses adaptive GradNorm reweighting to balance gradients across the policy, value, time-usage, and auxiliary heads. You do NOT need to manually tune loss weights. GradNorm will automatically adjust them.
+- **This is a time-constrained training run** ({TRAINING_TIMEOUT//60} minutes). Speeding up the per-iteration training loop can be just as valuable as increasing model capacity. Any additional capacity (more parameters, wider layers, extra heads) needs to "earn" its extra FLOPs via higher performance on the composite metric. Prefer efficient changes over expensive ones.
+
+## What To Do
+
+Read the experiment log at research_log.md to see what has been tried. Do not repeat failed ideas.
 
 Explore the codebase (start with src/) to understand the architecture, then make up to 3 related changes. You are free to make architectural changes, hyperparameter changes, ablation tests, loss function modifications, or anything else you think could help. Do not be afraid to make larger, more imaginative changes. Spend the time to really investigate and dig into your ideas before committing to them — an extra few minutes of careful thinking can prevent a wasted 30+ minute training run.
 
@@ -398,19 +421,29 @@ Verify your change compiles: `cargo check --features "train,backend-tch"`
 
 The training command that will be run to evaluate your change:
 ```
-cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=100 --seed=<varies> --log-dir=<run_dir> --disable-tui
+cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=100 --gradnorm-interval=100 --checkpoint-interval=0 --seed=<varies> --log-dir=<run_dir> --disable-tui
 ```
+
+## Acceptance Criteria
+
 Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly. Changes are kept only if they achieve a statistically significant improvement (Welch's t-test p < {ALPHA}, Cohen's d >= {MIN_COHEN_D}) on the composite score compared to the current best run. Aim for meaningful changes — small tweaks that improve the mean by less than ~1 pooled std dev will be discarded.
+
+## Available Data
 
 Previous run logs are in research_runs/. Each run directory contains:
 - `metrics_logs/` — per-metric TSV files (top1_accuracy.log, wdl_accuracy.log, aux_from_square_accuracy.log, aux_to_square_accuracy.log, policy_loss.log, total_loss.log, etc.)
 - `train.log` — detailed training log including per-layer gradient norms, weight norms, update ratios, and per-head gradient statistics (logged every 100 iterations)
 
+## Rules
+
 DO NOT TOUCH:
 - CLI argument handling or data loading
 - The LR scheduler type — we use reduce-on-plateau so training is duration-agnostic. Do not add cosine decay, cyclic schedules, or any schedule that depends on knowing total training steps. Adjusting the LR value itself, warmup, or plateau detector parameters is fine.
 - The evaluation metric or how accuracy is measured
+- Loss weights — GradNorm handles this automatically
 - research_log.md and research_runs/ — these are read-only. You may read them for context but do not write to, modify, or delete any files in them. The one exception is research_runs/run_{i}/conclusion.md which you must create (see below).
+
+## Required Output
 
 Before your final response, write a file at research_runs/run_{i}/conclusion.md describing:
 1. **What you did** — a short summary of the change(s) made.
@@ -446,7 +479,7 @@ End your response with:
                 result = {'iter': i, 'title': f'[COMPILE FAIL] {title}', 'ao': 0.0, 'status': 'fail'}
                 all_results.append(result)
                 with open(RESEARCH_LOG, 'a') as f:
-                    f.write(f"| {i} | [COMPILE FAIL] {title} | 0.000000 | ❌ |\n")
+                    f.write(f"| {i} | [COMPILE FAIL] {title} | 0.000000 | — | ❌ |\n")
                 save_state(state)
                 continue
 
@@ -461,10 +494,14 @@ End your response with:
             else:
                 stat_str = stat["error"]
 
+            prev_components = state.get("best_components", {"top1": 0.0, "wdl": 0.0, "aux": 0.0})
+            delta_str = format_delta(score, components, best, prev_components)
+
             if improved:
                 print(f"  ✅ IMPROVEMENT: {score:.6f}  ({stat_str})")
                 best = score
                 state["best_run_dir"] = str(RESEARCH_RUNS / f"run_{i}")
+                state["best_components"] = components
                 git_commit(f"research iter {i}: {title} (score={score:.6f})")
                 status = "kept"
                 status_emoji = "✅"
@@ -478,7 +515,7 @@ End your response with:
 
             all_results.append(result)
             with open(RESEARCH_LOG, 'a') as f:
-                f.write(f"| {i} | {title} | {score:.6f} {format_components(components)} | {status_emoji} |\n")
+                f.write(f"| {i} | {title} | {score:.6f} {format_components(components)} | {delta_str} | {status_emoji} |\n")
 
             state["best_score"] = best
             state["results"] = all_results
@@ -499,7 +536,7 @@ End your response with:
                 result = {'iter': i, 'title': f'[ERROR] {msg[:50]}', 'ao': 0.0, 'status': 'error'}
                 all_results.append(result)
                 with open(RESEARCH_LOG, 'a') as f:
-                    f.write(f"| {i} | [ERROR] {msg[:50]} | 0.000000 | ⚠️ |\n")
+                    f.write(f"| {i} | [ERROR] {msg[:50]} | 0.000000 | — | ⚠️ |\n")
                 save_state(state)
 
     print(f"\n{'='*60}")

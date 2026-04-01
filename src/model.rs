@@ -54,7 +54,8 @@ pub struct OXIModel<B: Backend> {
     recency_norm: RmsNorm<B>,
     policy_block: TransformerBlock<B>,
     value_block: TransformerBlock<B>,
-    time_block: TransformerBlock<B>,
+    // Disabled: time_block was unused in forward pass, wastes parameters
+    // time_block: TransformerBlock<B>,
     aux_mobility_head: Linear<B>,
     aux_material_head: Linear<B>,
     aux_from_square_head: Linear<B>,
@@ -152,7 +153,8 @@ impl<B: Backend> OXIModel<B> {
 
         let policy_block = TransformerBlock::new(device);
         let value_block = TransformerBlock::new(device);
-        let time_block = TransformerBlock::new(device);
+        // Disabled: time_block was unused in forward pass, wastes parameters
+        // let time_block = TransformerBlock::new(device);
 
         // Auxiliary prediction heads
         let aux_mobility_head = LinearConfig::new(config.embed_dim(), 1)
@@ -211,7 +213,7 @@ impl<B: Backend> OXIModel<B> {
             recency_norm,
             policy_block,
             value_block,
-            time_block,
+            // time_block,
             aux_mobility_head,
             aux_material_head,
             aux_from_square_head,
@@ -433,7 +435,8 @@ impl<B: Backend> OXIModel<B> {
         // Focal Loss: FL(p_t) = -(1 - p_t)^γ * log(p_t)
         let gamma = config.focal_loss_gamma;
         let policy_loss = if gamma > 0.0 {
-            let policy_probs = softmax(policy_logits_flat.clone(), 1);
+            // Derive softmax from log_softmax: softmax(x) = exp(log_softmax(x))
+            let policy_probs = log_policy.clone().exp();
             let policy_probs = policy_probs.mask_fill(mask.clone(), 0.0);
 
             // Compute p_t for each target

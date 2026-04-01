@@ -307,6 +307,10 @@ pub struct Config {
     /// Weight for auxiliary losses (mobility + material prediction)
     #[serde(default = "default_aux_loss_weight")]
     pub aux_loss_weight: f32,
+
+    /// Enable bf16 mixed precision training (cast inputs to bf16, keep optimizer in f32)
+    #[serde(default)]
+    pub mixed_precision: Option<bool>,
 }
 
 // Serde default functions for backwards compatibility with older params.json files
@@ -640,6 +644,9 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub aux_loss_weight: Option<f32>,
 
+    /// Enable bf16 mixed precision training (cast inputs to bf16, keep optimizer in f32)
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub mixed_precision: Option<bool>,
 }
 
 impl Config {
@@ -873,6 +880,9 @@ impl Config {
         if let Some(v) = overrides.aux_loss_weight {
             config.aux_loss_weight = v;
         }
+        if let Some(v) = overrides.mixed_precision {
+            config.mixed_precision = Some(v);
+        }
         config
     }
 }
@@ -986,6 +996,10 @@ impl Config {
 
     pub fn muon_lr_adjust(&self) -> &str {
         self.muon_lr_adjust.as_deref().unwrap_or("original")
+    }
+
+    pub fn mixed_precision(&self) -> bool {
+        self.mixed_precision.unwrap_or(false)
     }
 
     pub fn forward_timing_interval(&self) -> u64 {
@@ -1137,6 +1151,7 @@ impl Default for Config {
             use_muon: Some(true),
             muon_lr_adjust: None,
             aux_loss_weight: default_aux_loss_weight(),
+            mixed_precision: Some(false),
         }
     }
 }

@@ -31,6 +31,12 @@
       "title": "Config validation (no change)",
       "ao": 0.672132,
       "status": "discarded"
+    },
+    {
+      "iter": 5,
+      "title": "Deeper policy tower + value FiLM + value weight boost",
+      "ao": 0.6647268493433335,
+      "status": "discarded"
     }
   ],
   "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_3"
