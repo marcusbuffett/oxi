@@ -18,3 +18,16 @@
 |------|-------------|-------|----------------|------|
 | 6 | [ERROR] ERROR: subagent cancelled | 0.000000 | — | ⚠️ |
 | 6 | Nonlinear embedding + square positions + QK-Norm | 0.230754 (top1=0.0582, wdl=0.4961, aux=0.0361) | -0.4420 (top1=+0.0582, wdl=+0.4961, aux=+0.0361) | ❌ |
+| 7 | [COMPILE FAIL] (no final message) | 0.000000 | — | ❌ |
+| 7 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 8 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 9 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 10 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 11 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 12 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 13 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 14 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 15 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 16 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 17 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
+| 18 | [ERROR] ERROR: openrouter API error (status=400 Bad Reques | 0.000000 | — | ⚠️ |
