@@ -446,6 +446,8 @@ The training command that will be run to evaluate your change:
 cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=200 --gradnorm-interval=200 --checkpoint-interval=0 --seed=<varies> --log-dir=<run_dir> --disable-tui
 ```
 
+Feel free to use the ./research directory, to make notes and see notes from previous agents. Future agents will edit and add to this.
+
 ## Acceptance Criteria
 
 Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly. Changes are kept only if they achieve a statistically significant improvement (Welch's t-test p < {ALPHA}, Cohen's d >= {MIN_COHEN_D}) on the composite score compared to the current best run. Aim for meaningful changes — small tweaks that improve the mean by less than ~1 pooled std dev will be discarded.
