@@ -7,5 +7,4 @@
 | 1 | Enhanced aux heads: hidden layer + policy tokens | 0.659628 (top1=0.3910, wdl=0.5879, aux=0.3632) | ✅ |
 | 2 | Deeper policy tower + FiLM + wider FFN | 0.654562 (top1=0.3839, wdl=0.6079, aux=0.3402) | ❌ |
 | 3 | Trunk aux supervision + policy FiLM conditioning | 0.672744 (top1=0.3870, wdl=0.5971, aux=0.4334) | ✅ |
-| 4 | Muon ns_steps=2 + full cautious AdamW (mask update step where grad·m1<0) | 0.642984 (delta=-0.030, p=0.0000, d=-1.27) | ❌ |
-|   | _ns_steps=2 kept alone (no stat sig harm on its own); full cautious update discarded — masks too aggressively early in training, hurting aux heads most_ | | |
+| 4 | Config validation (no change) | 0.672132 (top1=0.3889, wdl=0.5910, aux=0.4313) | ❌ |

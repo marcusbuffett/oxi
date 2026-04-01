@@ -28,8 +28,8 @@
     },
     {
       "iter": 4,
-      "title": "Muon ns_steps=2 + full cautious AdamW",
-      "ao": 0.642984,
+      "title": "Config validation (no change)",
+      "ao": 0.672132,
       "status": "discarded"
     }
   ],
