@@ -437,7 +437,7 @@ Current best score: {best:.6f} | Baseline: {baseline:.6f} | Iteration {i}
 
 Read the experiment log at research_log.md to see what has been tried. Do not repeat failed ideas.
 
-Explore the codebase (start with src/) to understand the architecture, then make up to 3 related changes. You are free to make architectural changes, hyperparameter changes, ablation tests, loss function modifications, or anything else you think could help. Do not be afraid to make larger, more imaginative changes. Spend the time to really investigate and dig into your ideas before committing to them — an extra few minutes of careful thinking can prevent a wasted 30+ minute training run.
+Explore the codebase to understand the architecture, then make a single targeted change. You are free to make architectural changes, hyperparameter changes, ablation tests, loss function modifications, or anything else you think could help. Do not be afraid to make larger, more imaginative changes. Spend the time to really investigate and dig into your ideas before committing to them — an extra few minutes of careful thinking can prevent a wasted 30+ minute training run.
 
 Verify your change compiles: `cargo check --features "train,backend-tch"`
 
