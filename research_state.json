@@ -37,6 +37,12 @@
       "title": "Deeper policy tower + value FiLM + value weight boost",
       "ao": 0.6647268493433335,
       "status": "discarded"
+    },
+    {
+      "iter": 6,
+      "title": "Nonlinear embedding + square positions + QK-Norm",
+      "ao": 0.2307544163333333,
+      "status": "discarded"
     }
   ],
   "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_3"

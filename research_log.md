@@ -16,3 +16,5 @@
 
 | Iter | Description | Score | Δ vs prev best | Kept |
 |------|-------------|-------|----------------|------|
+| 6 | [ERROR] ERROR: subagent cancelled | 0.000000 | — | ⚠️ |
+| 6 | Nonlinear embedding + square positions + QK-Norm | 0.230754 (top1=0.0582, wdl=0.4961, aux=0.0361) | -0.4420 (top1=+0.0582, wdl=+0.4961, aux=+0.0361) | ❌ |

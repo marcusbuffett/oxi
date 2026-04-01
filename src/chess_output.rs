@@ -10,21 +10,6 @@ use burn::tensor::Transaction;
 use burn::train::metric::{Adaptor, LossInput};
 use burn_train::metric::ItemLazy;
 
-/// Deferred metric tensors that avoid GPU-to-CPU sync during the forward pass.
-/// Call resolve_deferred_metrics() after backward() to extract f32 values.
-#[derive(Debug, Clone)]
-pub struct DeferredAuxTensors<B: Backend> {
-    pub mobility_loss: Tensor<B, 1>,
-    pub material_loss: Tensor<B, 1>,
-    pub mobility_mae: Tensor<B, 1>,
-    pub material_mae: Tensor<B, 1>,
-    pub side_info_loss: Tensor<B, 1>,
-    pub from_square_loss: Tensor<B, 1>,
-    pub to_square_loss: Tensor<B, 1>,
-    pub from_square_accuracy: Tensor<B, 1>,
-    pub to_square_accuracy: Tensor<B, 1>,
-}
-
 /// Custom classification output for chess that includes separate policy and value outputs
 #[derive(Debug, Clone)]
 pub struct ChessOutput<B: Backend> {
@@ -76,9 +61,6 @@ pub struct ChessOutput<B: Backend> {
     pub aux_to_square_loss: f32,
     pub aux_from_square_accuracy: f32,
     pub aux_to_square_accuracy: f32,
-    /// Deferred metric tensors — call resolve_deferred_metrics() after backward()
-    /// to extract f32 values without stalling the GPU during forward pass.
-    pub deferred_aux_tensors: Option<DeferredAuxTensors<B>>,
 }
 
 impl<B: Backend> ChessOutput<B> {
@@ -129,7 +111,6 @@ impl<B: Backend> ChessOutput<B> {
             aux_to_square_loss: 0.0,
             aux_from_square_accuracy: 0.0,
             aux_to_square_accuracy: 0.0,
-            deferred_aux_tensors: None,
         }
     }
 
@@ -163,36 +144,6 @@ impl<B: Backend> ChessOutput<B> {
         self.aux_from_square_accuracy = from_square_accuracy;
         self.aux_to_square_accuracy = to_square_accuracy;
         self
-    }
-
-    /// Sets deferred aux metric tensors (to avoid GPU sync during forward pass)
-    pub fn with_deferred_aux_tensors(mut self, tensors: DeferredAuxTensors<B>) -> Self {
-        self.deferred_aux_tensors = Some(tensors);
-        self
-    }
-
-    /// Resolves deferred aux metric tensors into f32 values.
-    /// Call this AFTER backward() to avoid stalling the GPU during the forward pass.
-    pub fn resolve_deferred_metrics(&mut self) {
-        if let Some(tensors) = self.deferred_aux_tensors.take() {
-            let extract = |t: Tensor<B, 1>| -> f32 {
-                t.into_data()
-                    .to_vec::<f32>()
-                    .unwrap_or_default()
-                    .first()
-                    .copied()
-                    .unwrap_or(0.0)
-            };
-            self.aux_mobility_loss = extract(tensors.mobility_loss);
-            self.aux_material_loss = extract(tensors.material_loss);
-            self.aux_mobility_mae = extract(tensors.mobility_mae);
-            self.aux_material_mae = extract(tensors.material_mae);
-            self.aux_side_info_loss = extract(tensors.side_info_loss);
-            self.aux_from_square_loss = extract(tensors.from_square_loss);
-            self.aux_to_square_loss = extract(tensors.to_square_loss);
-            self.aux_from_square_accuracy = extract(tensors.from_square_accuracy);
-            self.aux_to_square_accuracy = extract(tensors.to_square_accuracy);
-        }
     }
 
     /// Sets the uncertainty values

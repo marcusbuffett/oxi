@@ -24,10 +24,10 @@ STATE_FILE = WORKSPACE / "research_state.json"
 TRAINING_TIMEOUT = 1800  # 30 minutes
 MAX_ITERATIONS = 50
 
-# Research model config (matches production dimensions, fewer layers)
-MODEL_LAYERS = 8
-MODEL_EMBED = 384
-MODEL_BATCH = 512
+# Research model config (12 layers balances capacity vs throughput at ~420 samples/sec)
+MODEL_LAYERS = 12
+MODEL_EMBED = 256
+MODEL_BATCH = 1024
 
 # Composite metric: weighted combination of top-1 accuracy, WDL accuracy, and aux head accuracy
 # All components are averaged over the last METRIC_WINDOW values from their respective log files.
@@ -205,8 +205,8 @@ def run_training(run_name, seed):
         "--disable-tui",
         "--warmup-multiplier=0.1",
         "--log-gradient-breakdown",
-        "--full-metrics-interval=100",
-        "--gradnorm-interval=100",
+        "--full-metrics-interval=200",
+        "--gradnorm-interval=200",
         "--checkpoint-interval=0",
     ]
     try:
@@ -222,9 +222,31 @@ def run_training(run_name, seed):
 
 
 def git_revert():
-    """Revert all uncommitted changes to source files."""
-    subprocess.run(["git", "checkout", "--", "src/"], cwd=WORKSPACE, capture_output=True)
-    subprocess.run(["git", "checkout", "--", "Cargo.toml"], cwd=WORKSPACE, capture_output=True)
+    """Stash any uncommitted changes to source files, then restore to HEAD."""
+    # Check if there are changes to stash
+    result = subprocess.run(
+        ["git", "diff", "--quiet", "src/", "Cargo.toml"],
+        cwd=WORKSPACE, capture_output=True
+    )
+    if result.returncode != 0:
+        # There are changes — stash them so they're recoverable
+        subprocess.run(
+            ["git", "stash", "push", "-m", "research_loop: auto-stash discarded changes",
+             "--", "src/", "Cargo.toml"],
+            cwd=WORKSPACE, capture_output=True
+        )
+    else:
+        # Also check for staged changes
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", "src/", "Cargo.toml"],
+            cwd=WORKSPACE, capture_output=True
+        )
+        if result.returncode != 0:
+            subprocess.run(
+                ["git", "stash", "push", "-m", "research_loop: auto-stash discarded changes",
+                 "--", "src/", "Cargo.toml"],
+                cwd=WORKSPACE, capture_output=True
+            )
 
 
 def git_commit(message):
@@ -421,7 +443,7 @@ Verify your change compiles: `cargo check --features "train,backend-tch"`
 
 The training command that will be run to evaluate your change:
 ```
-cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=100 --gradnorm-interval=100 --checkpoint-interval=0 --seed=<varies> --log-dir=<run_dir> --disable-tui
+cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=200 --gradnorm-interval=200 --checkpoint-interval=0 --seed=<varies> --log-dir=<run_dir> --disable-tui
 ```
 
 ## Acceptance Criteria
