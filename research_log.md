@@ -10,3 +10,7 @@
 | 4 | Config validation (no change) | 0.672132 (top1=0.3889, wdl=0.5910, aux=0.4313) | -0.0006 (top1=+0.0019, wdl=-0.0061, aux=-0.0021) | ❌ |
 | 5 | Deeper policy tower + value FiLM + value weight boost | 0.664727 (top1=0.3796, wdl=0.5995, aux=0.4264) | ❌ |
 | 7 | Residual MLP embedding + value FiLM | 0.182084 (top1=0.0459, wdl=0.4000, aux=0.0142) | -0.4907 (top1=+0.0459, wdl=+0.4000, aux=+0.0142) | ❌ |
+| 12 | LR plateau annealing + value FiLM conditioning | 0.700292 (top1=0.4071, wdl=0.5800, aux=0.4992) | +0.0275 (top1=+0.4071, wdl=+0.5800, aux=+0.4992) | ✅ |
+| 13 | Policy from/to square bias injection | 0.685887 (top1=0.3982, wdl=0.5670, aux=0.4935) | -0.0144 (top1=-0.0089, wdl=-0.0130, aux=-0.0057) | ❌ |
+| 14 | Stochastic depth + full-rank policy head | 0.699780 (top1=0.4055, wdl=0.5840, aux=0.4983) | -0.0005 (top1=-0.0017, wdl=+0.0040, aux=-0.0009) | ❌ |
+| 15 | Higher LR + faster annealing + lower weight decay | 0.697790 (top1=0.4026, wdl=0.5885, aux=0.4953) | -0.0025 (top1=-0.0046, wdl=+0.0085, aux=-0.0038) | ❌ |

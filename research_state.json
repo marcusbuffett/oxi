@@ -1,5 +1,5 @@
 {
-  "best_score": 0.672744,
+  "best_score": 0.7002920177749999,
   "baseline_score": 0.583246713315,
   "results": [
     {
@@ -49,7 +49,60 @@
       "title": "Residual MLP embedding + value FiLM",
       "ao": 0.18208373533333336,
       "status": "discarded"
+    },
+    {
+      "iter": 8,
+      "title": "QK RMSNorm + Value FiLM conditioning",
+      "ao": 0.670152851995,
+      "status": "discarded"
+    },
+    {
+      "iter": 9,
+      "title": "Positional bias + mid-trunk deep supervision",
+      "ao": 0.0,
+      "status": "discarded"
+    },
+    {
+      "iter": 10,
+      "title": "Learned positional bias + value FiLM conditioning",
+      "ao": 0.6718684951116667,
+      "status": "discarded"
+    },
+    {
+      "iter": 11,
+      "title": "Attn soft-cap + value FiLM + mid-trunk supervision",
+      "ao": 0.65760869539,
+      "status": "discarded"
+    },
+    {
+      "iter": 12,
+      "title": "LR plateau annealing + value FiLM conditioning",
+      "ao": 0.7002920177749999,
+      "status": "kept"
+    },
+    {
+      "iter": 13,
+      "title": "Policy from/to square bias injection",
+      "ao": 0.6858872637516668,
+      "status": "discarded"
+    },
+    {
+      "iter": 14,
+      "title": "Stochastic depth + full-rank policy head",
+      "ao": 0.699780464605,
+      "status": "discarded"
+    },
+    {
+      "iter": 15,
+      "title": "Higher LR + faster annealing + lower weight decay",
+      "ao": 0.6977897047416667,
+      "status": "discarded"
     }
   ],
-  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_3"
+  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_12",
+  "best_components": {
+    "top1": 0.40712795529999996,
+    "wdl": 0.579990234375,
+    "aux": 0.49916992174999997
+  }
 }
