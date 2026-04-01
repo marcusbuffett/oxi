@@ -209,12 +209,24 @@ def run_training(run_name, seed):
         "--gradnorm-interval=200",
         "--checkpoint-interval=0",
     ]
-    try:
-        proc = subprocess.Popen(cmd, cwd=WORKSPACE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        proc.wait(timeout=TRAINING_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+    stderr_log = log_dir / "stderr.log"
+    with open(stderr_log, "w") as stderr_file:
+        try:
+            proc = subprocess.Popen(cmd, cwd=WORKSPACE, stdout=subprocess.DEVNULL, stderr=stderr_file)
+            proc.wait(timeout=TRAINING_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    if proc.returncode is not None and proc.returncode != 0:
+        stderr_tail = ""
+        try:
+            stderr_tail = stderr_log.read_text()[-1000:]
+        except Exception:
+            pass
+        print(f"  Training process exited with code {proc.returncode}")
+        if stderr_tail:
+            print(f"  stderr (last 1000 chars):\n{stderr_tail}")
 
     score, components = parse_composite_score(log_dir)
     print(f"  score = {score:.6f} {format_components(components)}")
