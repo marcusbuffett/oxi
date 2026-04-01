@@ -43,6 +43,12 @@
       "title": "Nonlinear embedding + square positions + QK-Norm",
       "ao": 0.2307544163333333,
       "status": "discarded"
+    },
+    {
+      "iter": 7,
+      "title": "Residual MLP embedding + value FiLM",
+      "ao": 0.18208373533333336,
+      "status": "discarded"
     }
   ],
   "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_3"

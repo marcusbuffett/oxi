@@ -9,3 +9,4 @@
 | 3 | Trunk aux supervision + policy FiLM conditioning | 0.672744 (top1=0.3870, wdl=0.5971, aux=0.4334) | +0.0131 (top1=-0.0040, wdl=+0.0092, aux=+0.0702) | ✅ |
 | 4 | Config validation (no change) | 0.672132 (top1=0.3889, wdl=0.5910, aux=0.4313) | -0.0006 (top1=+0.0019, wdl=-0.0061, aux=-0.0021) | ❌ |
 | 5 | Deeper policy tower + value FiLM + value weight boost | 0.664727 (top1=0.3796, wdl=0.5995, aux=0.4264) | ❌ |
+| 7 | Residual MLP embedding + value FiLM | 0.182084 (top1=0.0459, wdl=0.4000, aux=0.0142) | -0.4907 (top1=+0.0459, wdl=+0.4000, aux=+0.0142) | ❌ |

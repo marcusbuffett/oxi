@@ -3128,9 +3128,10 @@ where
 
         // Checkpoint at specified intervals based on items processed
         // Check if we've crossed a checkpoint boundary
-        let prev_checkpoint_num = (iteration - 1) / config.checkpoint_interval;
-        let curr_checkpoint_num = iteration / config.checkpoint_interval;
-        if curr_checkpoint_num > prev_checkpoint_num {
+        if config.checkpoint_interval > 0
+            && iteration / config.checkpoint_interval
+                > (iteration - 1) / config.checkpoint_interval
+        {
             tracing::info!(
                 "Saving checkpoint at iteration {} to {}",
                 iteration,
