@@ -5,10 +5,10 @@ use crate::distribution_utils::beta_log_pdf;
 use crate::factorized_policy::FactorizedPolicyHead;
 use crate::relative_position_transformer::TransformerBlock;
 use crate::smolgen::SmolgenWeightGen;
+use crate::spatial_conv::SpatialConv;
 use burn::module::Param;
-use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig};
-use burn::nn::{Initializer, Linear, LinearConfig, PaddingConfig2d, RmsNorm, RmsNormConfig};
+use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 use burn::tensor::activation::{log_softmax, silu, softmax};
 
@@ -31,7 +31,8 @@ use crate::train_stubs::*;
 #[derive(Module, Debug)]
 pub struct OXIModel<B: Backend> {
     token_embed: Linear<B>,
-    conv_layers: Vec<Conv2d<B>>,
+    square_embed: Param<Tensor<B, 2>>,
+    spatial_conv: Option<SpatialConv<B>>,
     token_norm: RmsNorm<B>,
     smolgen_weight_gen: SmolgenWeightGen<B>,
     blocks: Vec<TransformerBlock<B>>,
@@ -54,8 +55,6 @@ pub struct OXIModel<B: Backend> {
     recency_norm: RmsNorm<B>,
     policy_block: TransformerBlock<B>,
     value_block: TransformerBlock<B>,
-    // Disabled: time_block was unused in forward pass, wastes parameters
-    // time_block: TransformerBlock<B>,
     aux_mobility_head: Linear<B>,
     aux_material_head: Linear<B>,
     aux_from_square_head: Linear<B>,
@@ -86,17 +85,17 @@ impl<B: Backend> OXIModel<B> {
             .with_initializer(std_init.clone())
             .init(device);
 
-        let mut conv_layers = Vec::new();
-        if config.conv_layers() > 0 {
-            for _ in 0..config.conv_layers() {
-                let conv =
-                    Conv2dConfig::new([BOARD_FEATURES_PER_TOKEN, BOARD_FEATURES_PER_TOKEN], [3, 3])
-                        .with_padding(PaddingConfig2d::Same)
-                        .with_initializer(std_init.clone())
-                        .init(device);
-                conv_layers.push(conv);
-            }
-        }
+        // Learnable per-square positional embedding
+        let square_embed = Param::from_tensor(
+            Tensor::random([64, base_embed_dim], burn::tensor::Distribution::Normal(0.0, 0.02), device),
+        );
+
+        // Spatial conv: 3x3 neighbor gather + linear projection (channels-last, no permute)
+        let spatial_conv = if config.conv_layers() > 0 {
+            Some(SpatialConv::new(device, BOARD_FEATURES_PER_TOKEN))
+        } else {
+            None
+        };
 
         let smolgen_weight_gen = SmolgenWeightGen::new(device);
 
@@ -190,7 +189,8 @@ impl<B: Backend> OXIModel<B> {
 
         Self {
             token_embed,
-            conv_layers,
+            square_embed,
+            spatial_conv,
             token_norm,
             smolgen_weight_gen,
             blocks,
@@ -213,7 +213,6 @@ impl<B: Backend> OXIModel<B> {
             recency_norm,
             policy_block,
             value_block,
-            // time_block,
             aux_mobility_head,
             aux_material_head,
             aux_from_square_head,
@@ -265,38 +264,15 @@ impl<B: Backend> OXIModel<B> {
         let mut token_features = main_features.clone();
         log_tensor_stats("embed.token_features_initial", &token_features);
 
-        if !self.conv_layers.is_empty() {
-            let dims = token_features.dims();
-            let batch_size = dims[0];
-            let seq_len = dims[1];
-            debug_assert_eq!(
-                seq_len, 64,
-                "Sequence length must be 64 for 8x8 board when applying convolution layers"
-            );
-            let channels = dims[2];
-            debug_assert_eq!(
-                channels, BOARD_FEATURES_PER_TOKEN,
-                "Convolution stack expects BOARD_FEATURES_PER_TOKEN channels per square"
-            );
-            let mut conv_activations = token_features
-                .reshape([batch_size, 8, 8, channels])
-                .permute([0, 3, 1, 2]);
-            for (layer_idx, conv) in self.conv_layers.iter().enumerate() {
-                log_tensor_stats(&format!("embed.conv{layer_idx}.input"), &conv_activations);
-                conv_activations = conv.forward(conv_activations);
-                log_tensor_stats(&format!("embed.conv{layer_idx}.output"), &conv_activations);
-                conv_activations = silu(conv_activations);
-                log_tensor_stats(&format!("embed.conv{layer_idx}.silu"), &conv_activations);
-            }
-            token_features = conv_activations
-                .permute([0, 2, 3, 1])
-                .reshape([batch_size, seq_len, channels]);
-            log_tensor_stats("embed.token_features_convolved", &token_features);
+        if let Some(ref spatial_conv) = self.spatial_conv {
+            token_features = spatial_conv.forward(token_features);
         }
 
         let token_embeds = {
             let _t = TimingScope::new_with_sync::<B>("token_embed", &device);
-            self.token_embed.forward(token_features)
+            let embeds = self.token_embed.forward(token_features);
+            // Add learnable per-square positional embeddings
+            embeds + self.square_embed.val().unsqueeze_dim::<3>(0)
         };
         log_tensor_stats("embed.token_embeds", &token_embeds);
         debug_assert_eq!(

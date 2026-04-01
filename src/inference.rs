@@ -166,6 +166,10 @@ pub struct GlobalFeatures {
     pub elo_self: i32,
     /// Whether this is a puzzle position
     pub is_puzzle: bool,
+    /// Whether the side to move is in check
+    pub is_in_check: bool,
+    /// Total number of pieces on the board (game phase proxy)
+    pub total_pieces: u32,
 }
 
 /// Internal global features with material imbalance (used for prediction)
@@ -195,6 +199,10 @@ pub struct GlobalFeaturesInternal {
     pub material_imbalance_history: Vec<i32>,
     /// Whether this is a puzzle position
     pub is_puzzle: bool,
+    /// Whether the side to move is in check
+    pub is_in_check: bool,
+    /// Total number of pieces on the board
+    pub total_pieces: u32,
 }
 
 /// Normalized global features ready for model input
@@ -232,6 +240,8 @@ impl GlobalFeatures {
             elo_self: self.elo_self,
             material_imbalance_history,
             is_puzzle: self.is_puzzle,
+            is_in_check: self.is_in_check,
+            total_pieces: self.total_pieces,
         }
     }
 }
@@ -282,6 +292,8 @@ impl GlobalFeaturesInternal {
             normalized.move_count_normalized,
             normalized.elo_normalized,
             if self.is_puzzle { 1.0 } else { 0.0 },
+            normalized.material_imbalance_normalized,
+            (self.total_pieces as f32 / 32.0).clamp(0.0, 1.0),
         ];
         assert_eq!(globals.len(), NUM_GLOBALS);
         globals
@@ -298,6 +310,8 @@ impl Default for GlobalFeatures {
             move_count: 20,
             elo_self: 1500,
             is_puzzle: false,
+            is_in_check: false,
+            total_pieces: 32,
         }
     }
 }

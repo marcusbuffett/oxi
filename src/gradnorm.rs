@@ -204,6 +204,12 @@ impl GradNormState {
             return true;
         }
 
+        // Early adjustment: also fire at step 10 so loss weights stabilize quickly
+        const EARLY_ADJUSTMENT_STEP: usize = 10;
+        if next_optimizer_step == EARLY_ADJUSTMENT_STEP {
+            return true;
+        }
+
         next_optimizer_step % self.interval == 0
     }
 

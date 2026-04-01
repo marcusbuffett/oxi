@@ -14,3 +14,13 @@
 | 13 | Policy from/to square bias injection | 0.685887 (top1=0.3982, wdl=0.5670, aux=0.4935) | -0.0144 (top1=-0.0089, wdl=-0.0130, aux=-0.0057) | ❌ |
 | 14 | Stochastic depth + full-rank policy head | 0.699780 (top1=0.4055, wdl=0.5840, aux=0.4983) | -0.0005 (top1=-0.0017, wdl=+0.0040, aux=-0.0009) | ❌ |
 | 15 | Higher LR + faster annealing + lower weight decay | 0.697790 (top1=0.4026, wdl=0.5885, aux=0.4953) | -0.0025 (top1=-0.0046, wdl=+0.0085, aux=-0.0038) | ❌ |
+| 16 | Attention soft-capping + mid-trunk deep supervision | 0.678972 (top1=0.3903, wdl=0.5719, aux=0.4901) | -0.0213 (top1=-0.0168, wdl=-0.0081, aux=-0.0091) | ❌ |
+
+---
+
+**Architecture reset**: embed_dim 256→192, added learnable square embeddings, full-rank policy factorization (rank=embed_dim), 2 derived globals (material balance, game phase), removed mid-trunk deep supervision. Scores below are not directly comparable to above.
+
+| Iter | Description | Score | Δ vs prev best | Kept |
+|------|-------------|-------|----------------|------|
+| 0 | New baseline (192 embed, square embeds, full-rank policy, derived globals) | 0.728148 (top1=0.4211, wdl=0.6166, aux=0.5075) | — | baseline |
+| 1 | 3x3 spatial conv stem (1 layer) | 0.698223 (top1=0.4009, wdl=0.6067, aux=0.4755) | -0.0299 (top1=-0.0202, wdl=-0.0099, aux=-0.0321) | ❌ |

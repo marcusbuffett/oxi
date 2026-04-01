@@ -73,6 +73,8 @@ mod tests {
             move_count: chess_item.global_features.move_count,
             elo_self: chess_item.elo_self,
             is_puzzle: chess_item.is_puzzle,
+            is_in_check: chess_item.global_features.is_in_check,
+            total_pieces: chess_item.global_features.total_pieces,
         };
 
         // Create inference engine to use the extracted method

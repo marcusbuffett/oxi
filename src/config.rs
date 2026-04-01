@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
 
-pub const NUM_GLOBALS: usize = 8;
+pub const NUM_GLOBALS: usize = 10;
 pub const LEGAL_MOVES: usize = 64 * 76;
 // Per-square features (current position only):
 // - 12 piece one-hots (white/black 6 each)
@@ -115,7 +115,7 @@ pub struct Config {
     #[serde(default = "default_embedding_base_lr")]
     pub embedding_base_lr: f64,
 
-    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size samples
+    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size optimizer steps
     pub warmup_multiplier: f64,
 
     /// Weight for policy loss
@@ -420,7 +420,7 @@ pub struct ConfigOverrides {
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub lr_range_finder: Option<bool>,
 
-    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size samples
+    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size optimizer steps
     #[arg(long)]
     pub warmup_multiplier: Option<f64>,
 

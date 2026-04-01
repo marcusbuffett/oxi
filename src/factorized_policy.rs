@@ -5,7 +5,6 @@ use burn::tensor::backend::Backend;
 
 use crate::config::get_global_config;
 
-const POLICY_RANK: usize = 192;
 const NUM_PROMO_PIECES: usize = 4;
 
 #[derive(Module, Debug)]
@@ -28,10 +27,10 @@ impl<B: Backend> FactorizedPolicyHead<B> {
         };
 
         Self {
-            source_proj: LinearConfig::new(embed_dim, POLICY_RANK)
+            source_proj: LinearConfig::new(embed_dim, embed_dim)
                 .with_initializer(std_init.clone())
                 .init(device),
-            target_proj: LinearConfig::new(embed_dim, POLICY_RANK)
+            target_proj: LinearConfig::new(embed_dim, embed_dim)
                 .with_initializer(std_init.clone())
                 .init(device),
             promo_from_proj: LinearConfig::new(embed_dim, NUM_PROMO_PIECES)

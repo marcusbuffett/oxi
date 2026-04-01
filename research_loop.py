@@ -26,8 +26,8 @@ MAX_ITERATIONS = 50
 
 # Research model config (12 layers balances capacity vs throughput at ~420 samples/sec)
 MODEL_LAYERS = 12
-MODEL_EMBED = 256
-MODEL_BATCH = 1024
+MODEL_EMBED = 192
+MODEL_BATCH = 512
 
 # Composite metric: weighted combination of top-1 accuracy, WDL accuracy, and aux head accuracy
 # All components are averaged over the last METRIC_WINDOW values from their respective log files.
@@ -426,6 +426,8 @@ def main():
             git_revert()
 
             idea_prompt = f"""You are an ML researcher improving a chess move-prediction transformer.
+
+**Start by reading `research/architecture.md`** — it contains a comprehensive reference of the model architecture, input representation, all output heads, loss functions, GradNorm, optimizer config, LR scheduling, data pipeline, metrics logging, and evaluation scoring. This is your primary reference for understanding the codebase.
 
 ## Evaluation Metric
 

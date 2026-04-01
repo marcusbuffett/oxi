@@ -1,108 +1,24 @@
 {
-  "best_score": 0.7002920177749999,
-  "baseline_score": 0.583246713315,
+  "best_score": 0.728148,
+  "baseline_score": 0.728148,
   "results": [
     {
       "iter": 0,
-      "title": "Fix from/to square aux loss: BCE\u2192cross-entropy",
-      "ao": 0.634516,
-      "status": "kept"
+      "title": "New baseline (192 embed, square embeds, full-rank policy, derived globals)",
+      "ao": 0.728148,
+      "status": "baseline"
     },
     {
       "iter": 1,
-      "title": "Enhanced aux heads: hidden layer + policy tokens",
-      "ao": 0.659628,
-      "status": "kept"
-    },
-    {
-      "iter": 2,
-      "title": "Deeper policy tower + FiLM + wider FFN",
-      "ao": 0.654562,
-      "status": "discarded"
-    },
-    {
-      "iter": 3,
-      "title": "Trunk aux supervision + policy FiLM conditioning",
-      "ao": 0.672744,
-      "status": "kept"
-    },
-    {
-      "iter": 4,
-      "title": "Config validation (no change)",
-      "ao": 0.672132,
-      "status": "discarded"
-    },
-    {
-      "iter": 5,
-      "title": "Deeper policy tower + value FiLM + value weight boost",
-      "ao": 0.6647268493433335,
-      "status": "discarded"
-    },
-    {
-      "iter": 6,
-      "title": "Nonlinear embedding + square positions + QK-Norm",
-      "ao": 0.2307544163333333,
-      "status": "discarded"
-    },
-    {
-      "iter": 7,
-      "title": "Residual MLP embedding + value FiLM",
-      "ao": 0.18208373533333336,
-      "status": "discarded"
-    },
-    {
-      "iter": 8,
-      "title": "QK RMSNorm + Value FiLM conditioning",
-      "ao": 0.670152851995,
-      "status": "discarded"
-    },
-    {
-      "iter": 9,
-      "title": "Positional bias + mid-trunk deep supervision",
-      "ao": 0.0,
-      "status": "discarded"
-    },
-    {
-      "iter": 10,
-      "title": "Learned positional bias + value FiLM conditioning",
-      "ao": 0.6718684951116667,
-      "status": "discarded"
-    },
-    {
-      "iter": 11,
-      "title": "Attn soft-cap + value FiLM + mid-trunk supervision",
-      "ao": 0.65760869539,
-      "status": "discarded"
-    },
-    {
-      "iter": 12,
-      "title": "LR plateau annealing + value FiLM conditioning",
-      "ao": 0.7002920177749999,
-      "status": "kept"
-    },
-    {
-      "iter": 13,
-      "title": "Policy from/to square bias injection",
-      "ao": 0.6858872637516668,
-      "status": "discarded"
-    },
-    {
-      "iter": 14,
-      "title": "Stochastic depth + full-rank policy head",
-      "ao": 0.699780464605,
-      "status": "discarded"
-    },
-    {
-      "iter": 15,
-      "title": "Higher LR + faster annealing + lower weight decay",
-      "ao": 0.6977897047416667,
+      "title": "3x3 spatial conv stem (1 layer)",
+      "ao": 0.698223,
       "status": "discarded"
     }
   ],
-  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_12",
+  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/baseline",
   "best_components": {
-    "top1": 0.40712795529999996,
-    "wdl": 0.579990234375,
-    "aux": 0.49916992174999997
+    "top1": 0.421121,
+    "wdl": 0.616563,
+    "aux": 0.507529
   }
 }

@@ -520,6 +520,8 @@ async fn main() -> Result<()> {
                         move_count: pos.ply as usize,
                         elo_self: elo,
                         is_puzzle: false,
+                        is_in_check: chess_pos.is_check(),
+                        total_pieces: chess_pos.board().occupied().count() as u32,
                     };
 
                     match engine.predict_full_policy(&[chess_pos], &globals, 1.0) {
@@ -741,6 +743,8 @@ async fn main() -> Result<()> {
                         move_count: pos.ply as usize,
                         elo_self: elo,
                         is_puzzle: false,
+                        is_in_check: chess_pos.is_check(),
+                        total_pieces: chess_pos.board().occupied().count() as u32,
                     };
 
                     match engine.predict_full_policy(&[chess_pos], &globals, 1.0) {

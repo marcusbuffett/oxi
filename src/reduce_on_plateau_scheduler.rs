@@ -36,16 +36,34 @@ impl PlateauDetector {
             return false;
         }
 
-        let (old_avg, new_avg) = match self.half_window_averages() {
-            Some(avgs) => avgs,
-            None => return false,
-        };
-
-        if old_avg <= 0.0 {
+        // Linear regression: fit loss = a + b*t over the window.
+        // Plateau if the slope is not significantly negative (loss not decreasing fast enough).
+        // We normalize slope by mean loss to get a relative rate of improvement per step.
+        let n = self.window.len() as f64;
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_xy = 0.0;
+        let mut sum_xx = 0.0;
+        for (i, &y) in self.window.iter().enumerate() {
+            let x = i as f64;
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_xx += x * x;
+        }
+        let mean_y = sum_y / n;
+        if mean_y <= 0.0 {
             return false;
         }
+        let denom = sum_xx - sum_x * sum_x / n;
+        if denom.abs() < 1e-12 {
+            return false;
+        }
+        let slope = (sum_xy - sum_x * sum_y / n) / denom;
 
-        let relative_improvement = (old_avg - new_avg) / old_avg;
+        // Relative improvement rate: negative slope means loss is decreasing.
+        // Normalize by mean loss and window size to get "fraction improved over the window".
+        let relative_improvement = -slope * n / mean_y;
         relative_improvement < self.improvement_threshold
     }
 
@@ -69,13 +87,31 @@ impl PlateauDetector {
     }
 
     pub fn relative_improvement(&self) -> Option<f64> {
-        let (old_avg, new_avg) = self.half_window_averages()?;
-
-        if old_avg <= 0.0 {
+        if self.window.len() < 4 {
             return None;
         }
-
-        Some((old_avg - new_avg) / old_avg)
+        let n = self.window.len() as f64;
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_xy = 0.0;
+        let mut sum_xx = 0.0;
+        for (i, &y) in self.window.iter().enumerate() {
+            let x = i as f64;
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_xx += x * x;
+        }
+        let mean_y = sum_y / n;
+        if mean_y <= 0.0 {
+            return None;
+        }
+        let denom = sum_xx - sum_x * sum_x / n;
+        if denom.abs() < 1e-12 {
+            return None;
+        }
+        let slope = (sum_xy - sum_x * sum_y / n) / denom;
+        Some(-slope * n / mean_y)
     }
 
     pub fn oldest_loss(&self) -> Option<f64> {

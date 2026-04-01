@@ -10,6 +10,7 @@ pub mod move_encoding;
 pub mod moves;
 pub mod relative_position_transformer;
 pub mod smolgen;
+pub mod spatial_conv;
 pub mod stockfish;
 pub mod value_tower;
 
