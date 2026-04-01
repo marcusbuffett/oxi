@@ -354,7 +354,7 @@ impl<B: Backend> OXIModel<B> {
         let value_logits = {
             let _stream = StreamScope::enter("value");
             let _timing = TimingScope::new_with_sync::<B>("value_head", &device);
-            let value_tokens = self.value_block.forward(x.clone(), &self.smolgen_weight_gen);
+            let value_tokens = self.value_block.forward_with_film(x.clone(), &self.smolgen_weight_gen, globals.clone());
             log_tensor_stats("value.tokens", &value_tokens);
 
             // Attention pooling: fc1 → silu → fc2 → softmax → weighted sum
