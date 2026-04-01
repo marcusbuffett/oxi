@@ -1773,7 +1773,7 @@ where
     let mut optim_muon = MuonConfig::new()
         .with_weight_decay(muon_weight_decay)
         .with_adjust_lr_fn(muon_lr_adjust)
-        .with_ns_steps(2)
+        .with_ns_steps(3)
         .init();
     println!(
         "  Muon optimizer: enabled={}, lr_adjust={}, weight_decay={}",
