@@ -190,17 +190,18 @@ mod tests {
     use crate::test_backend::{test_device, TestBackend};
 
     fn ensure_config() {
-        let _ = set_global_config(Config::new(128, 2));
+        let _ = set_global_config(Config::new(96, 2));
     }
 
     #[test]
     fn test_factorized_policy_output_shape() {
         ensure_config();
         let device = test_device();
+        let config = get_global_config();
 
         let head = FactorizedPolicyHead::<TestBackend>::new(&device);
         let batch_size = 2usize;
-        let tokens = Tensor::zeros([batch_size, 64, 128], &device);
+        let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
 
         let output = head.forward(tokens);
         assert_eq!(output.dims(), [batch_size, 64, 76]);
@@ -210,10 +211,11 @@ mod tests {
     fn test_base_logits_shape() {
         ensure_config();
         let device = test_device();
+        let config = get_global_config();
 
         let head = FactorizedPolicyHead::<TestBackend>::new(&device);
         let batch_size = 2usize;
-        let tokens = Tensor::zeros([batch_size, 64, 128], &device);
+        let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
 
         let base = head.compute_base_logits(tokens);
         assert_eq!(base.dims(), [batch_size, 64, 64]);
@@ -223,10 +225,11 @@ mod tests {
     fn test_promo_logits_shape() {
         ensure_config();
         let device = test_device();
+        let config = get_global_config();
 
         let head = FactorizedPolicyHead::<TestBackend>::new(&device);
         let batch_size = 2usize;
-        let tokens = Tensor::zeros([batch_size, 64, 128], &device);
+        let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
 
         let promo = head.compute_promotion_logits(tokens);
         assert_eq!(promo.dims(), [batch_size, 16, 16, 4]);

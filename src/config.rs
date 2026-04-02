@@ -1110,7 +1110,7 @@ impl Default for Config {
             value_entropy_weight: 0.0,
             embed_dim: 384,
             num_layers: 24,
-            num_heads: 8,
+            num_heads: 6,
 
             conv_layers: 0,
             max_samples: None,

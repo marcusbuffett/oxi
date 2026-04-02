@@ -167,12 +167,15 @@ pub struct SmolgenAttention<B: Backend> {
     qkv_proj: Linear<B>,
     o_proj: Linear<B>,
     smolgen: Smolgen<B>,
+    q_norm: RmsNorm<B>,
+    k_norm: RmsNorm<B>,
 }
 
 impl<B: Backend> SmolgenAttention<B> {
     pub fn new(device: &Device<B>) -> Self {
         let config = get_global_config();
         let embed_dim = config.embed_dim();
+        let head_dim = config.head_dim();
 
         // Standard initialization: Normal(0, 0.02)
         let std_init = Initializer::Normal {
@@ -196,10 +199,16 @@ impl<B: Backend> SmolgenAttention<B> {
 
         let smolgen = Smolgen::new(device);
 
+        // QK-Norm: per-head RMSNorm on Q and K for stable attention scores
+        let q_norm = RmsNormConfig::new(head_dim).init(device);
+        let k_norm = RmsNormConfig::new(head_dim).init(device);
+
         Self {
             qkv_proj,
             o_proj,
             smolgen,
+            q_norm,
+            k_norm,
         }
     }
 
@@ -247,6 +256,19 @@ impl<B: Backend> SmolgenAttention<B> {
                 .reshape([batch_size, seq_len, num_heads, head_dim])
                 .permute([0, 2, 1, 3]);
             (q, k, v)
+        };
+
+        // QK-Norm: normalize Q and K per-head before computing attention scores
+        // Reshape to [batch*heads*seq, head_dim] for RmsNorm, then reshape back
+        let q = {
+            let q_flat = q.reshape([batch_size * num_heads * seq_len, head_dim]);
+            let q_normed = self.q_norm.forward(q_flat);
+            q_normed.reshape([batch_size, num_heads, seq_len, head_dim])
+        };
+        let k = {
+            let k_flat = k.reshape([batch_size * num_heads * seq_len, head_dim]);
+            let k_normed = self.k_norm.forward(k_flat);
+            k_normed.reshape([batch_size, num_heads, seq_len, head_dim])
         };
 
         let scale = (head_dim as f32).sqrt();
@@ -304,7 +326,7 @@ mod tests {
     use crate::test_backend::{test_device, TestBackend};
 
     fn ensure_config() {
-        let _ = set_global_config(Config::new(128, 2));
+        let _ = set_global_config(Config::new(96, 2));
     }
 
     #[test]

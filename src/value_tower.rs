@@ -150,7 +150,7 @@ mod tests {
     use crate::test_backend::{test_device, TestBackend};
 
     fn ensure_config() {
-        let _ = set_global_config(Config::new(128, 2));
+        let _ = set_global_config(Config::new(96, 2));
     }
 
     #[test]
