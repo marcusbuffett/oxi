@@ -35,3 +35,26 @@
 | Iter | Description | Score | Δ vs prev best | Kept |
 |------|-------------|-------|----------------|------|
 | 0 | New baseline (metric reset: WDL mean-prob, weight 0.5) | 0.822116 (top1=0.4468, wdl=0.5391, aux=0.5285) | — | baseline |
+| 1 | GradNorm value priority + aggressive LR annealing | 0.844156 (top1=0.4411, wdl=0.5967, aux=0.5237) | +0.0220 (top1=-0.0057, wdl=+0.0576, aux=-0.0048) | ✅ |
+| 2 | Smoother LR decay + from/to loss upweighting | 0.851148 (top1=0.4423, wdl=0.6067, aux=0.5278) | +0.0070 (top1=+0.0012, wdl=+0.0100, aux=+0.0041) | ❌ |
+| 3 | Fix value head gradient starvation via loss weight | 0.864733 (top1=0.4468, wdl=0.6237, aux=0.5306) | +0.0206 (top1=+0.0057, wdl=+0.0270, aux=+0.0069) | ✅ |
+| 4 | Apply unused value ply-ramp weights to value loss | 0.846371 (top1=0.4457, wdl=0.5898, aux=0.5286) | -0.0184 (top1=-0.0010, wdl=-0.0338, aux=-0.0020) | ❌ |
+| 5 | Head residual scaling fix + higher LR | 0.852104 (top1=0.4421, wdl=0.6111, aux=0.5226) | -0.0126 (top1=-0.0047, wdl=-0.0126, aux=-0.0080) | ❌ |
+| 6 | Wider aux heads + deeper value MLP + lower decay | 0.856595 (top1=0.4440, wdl=0.6135, aux=0.5293) | -0.0081 (top1=-0.0028, wdl=-0.0102, aux=-0.0013) | ❌ |
+| 7 | OK, I've analyzed the codebase thoroughly. Let me now finalize my approach. | 0.863447 (top1=0.4498, wdl=0.6151, aux=0.5302) | -0.0013 (top1=+0.0031, wdl=-0.0085, aux=-0.0005) | ❌ |
+| 8 | Gentler LR decay + head-specific residual init | 0.879279 (top1=0.4558, wdl=0.6310, aux=0.5398) | +0.0145 (top1=+0.0091, wdl=+0.0073, aux=+0.0092) | ✅ |
+| 9 | [ERROR] ERROR: subagent cancelled | 0.000000 | — | ⚠️ |
+| 10 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 11 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 12 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 13 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 14 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 15 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 16 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 17 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 18 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 19 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 20 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 21 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 22 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
+| 23 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |

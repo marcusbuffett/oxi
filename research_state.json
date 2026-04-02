@@ -1,11 +1,11 @@
 {
-  "best_score": 0.822116,
+  "best_score": 0.8792786052149999,
   "baseline_score": 0.822116,
-  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/baseline_v2",
+  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_8",
   "best_components": {
-    "top1": 0.4468,
-    "wdl": 0.5391,
-    "aux": 0.5285
+    "top1": 0.45582352709999996,
+    "wdl": 0.63099609375,
+    "aux": 0.5397851562
   },
   "results": [
     {
@@ -13,6 +13,144 @@
       "title": "New baseline (metric reset: WDL mean-prob, weight 0.5)",
       "ao": 0.822116,
       "status": "baseline"
+    },
+    {
+      "iter": 1,
+      "title": "GradNorm value priority + aggressive LR annealing",
+      "ao": 0.844156469665,
+      "status": "kept"
+    },
+    {
+      "iter": 2,
+      "title": "Smoother LR decay + from/to loss upweighting",
+      "ao": 0.851147784925,
+      "status": "discarded"
+    },
+    {
+      "iter": 3,
+      "title": "Fix value head gradient starvation via loss weight",
+      "ao": 0.8647334337899999,
+      "status": "kept"
+    },
+    {
+      "iter": 4,
+      "title": "Apply unused value ply-ramp weights to value loss",
+      "ao": 0.84637130113,
+      "status": "discarded"
+    },
+    {
+      "iter": 5,
+      "title": "Head residual scaling fix + higher LR",
+      "ao": 0.8521036137800001,
+      "status": "discarded"
+    },
+    {
+      "iter": 6,
+      "title": "Wider aux heads + deeper value MLP + lower decay",
+      "ao": 0.8565948721200001,
+      "status": "discarded"
+    },
+    {
+      "iter": 7,
+      "title": "OK, I've analyzed the codebase thoroughly. Let me now finalize my approach.",
+      "ao": 0.8634466071350001,
+      "status": "discarded"
+    },
+    {
+      "iter": 8,
+      "title": "Gentler LR decay + head-specific residual init",
+      "ao": 0.8792786052149999,
+      "status": "kept"
+    },
+    {
+      "iter": 9,
+      "title": "[ERROR] ERROR: subagent cancelled",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 10,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 11,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 12,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 13,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 14,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 15,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 16,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 17,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 18,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 19,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 20,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 21,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 22,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
+    },
+    {
+      "iter": 23,
+      "title": "[ERROR] ERROR: error sending request for url (https://open",
+      "ao": 0.0,
+      "status": "error"
     }
   ]
 }
