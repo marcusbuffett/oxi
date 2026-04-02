@@ -1098,7 +1098,7 @@ impl Default for Config {
             lr_min: 0.000001,
             lr_window_size: 120,
             lr_improvement_threshold: 0.015,
-            lr_reduction_factor: 0.5,
+            lr_reduction_factor: 0.7,
             lr_multiplier: 1.0,
             muon_base_lr: default_muon_base_lr(),
             adamw_base_lr: default_adamw_base_lr(),

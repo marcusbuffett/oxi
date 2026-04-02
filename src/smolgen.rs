@@ -226,6 +226,52 @@ impl<B: Backend> SmolgenAttention<B> {
         }
     }
 
+    /// Create SmolgenAttention for a single-block head with depth=1 residual scaling.
+    pub fn new_for_head(device: &Device<B>) -> Self {
+        let config = get_global_config();
+        let embed_dim = config.embed_dim();
+        let head_dim = config.head_dim();
+        let num_heads = config.num_heads();
+
+        let std_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
+        // Residual scaling for a single block: 1/sqrt(2*1) = 1/sqrt(2)
+        let residual_std = 0.02 / (2.0_f64).sqrt();
+        let residual_init = Initializer::Normal {
+            mean: 0.0,
+            std: residual_std,
+        };
+
+        let qkv_proj = LinearConfig::new(embed_dim, 3 * embed_dim)
+            .with_initializer(std_init)
+            .init(device);
+        let o_proj = LinearConfig::new(embed_dim, embed_dim)
+            .with_initializer(residual_init)
+            .init(device);
+
+        let smolgen = Smolgen::new(device);
+
+        let q_norm = RmsNormConfig::new(head_dim).init(device);
+        let k_norm = RmsNormConfig::new(head_dim).init(device);
+
+        let init_log_temp = -0.5 * (head_dim as f64).ln();
+        let log_temperature = Param::from_tensor(
+            Tensor::full([num_heads], init_log_temp as f32, device),
+        );
+
+        Self {
+            qkv_proj,
+            o_proj,
+            smolgen,
+            q_norm,
+            k_norm,
+            log_temperature,
+        }
+    }
+
     /// Forward pass with shared weight generator.
     /// The SmolgenWeightGen must be passed from the model level (shared across all layers).
     pub fn forward(

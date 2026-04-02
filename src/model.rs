@@ -150,8 +150,8 @@ impl<B: Backend> OXIModel<B> {
         let side_info_uncertainty = Param::from_tensor(Tensor::zeros([1], device));
         let time_usage_uncertainty = Param::from_tensor(Tensor::zeros([1], device));
 
-        let policy_block = TransformerBlock::new(device);
-        let value_block = TransformerBlock::new(device);
+        let policy_block = TransformerBlock::new_for_head(device);
+        let value_block = TransformerBlock::new_for_head(device);
         // Disabled: time_block was unused in forward pass, wastes parameters
         // let time_block = TransformerBlock::new(device);
 

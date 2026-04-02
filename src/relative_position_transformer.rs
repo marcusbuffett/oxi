@@ -83,6 +83,22 @@ impl<B: Backend> TransformerBlock<B> {
         }
     }
 
+    /// Create a TransformerBlock for a single-block head (policy/value).
+    /// Uses depth=1 residual scaling instead of depth=num_layers.
+    pub fn new_for_head(device: &Device<B>) -> Self {
+        let config = get_global_config();
+        let attention = SmolgenAttention::new_for_head(device);
+        let norm1 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
+        let norm2 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
+        let mlp = MLP::new_for_head(device);
+        Self {
+            attention,
+            norm1,
+            norm2,
+            mlp,
+        }
+    }
+
     /// Forward pass without FiLM conditioning (pre-norm)
     pub fn forward(
         &self,
@@ -206,6 +222,34 @@ impl<B: Backend> MLP<B> {
         };
 
         // Fused projection outputs 2*hidden_dim, which we split into gate and up
+        let fused_gate_up = LinearConfig::new(config.embed_dim(), 2 * hidden_dim)
+            .with_initializer(std_init)
+            .init(device);
+        let down_proj = LinearConfig::new(hidden_dim, config.embed_dim())
+            .with_initializer(residual_init)
+            .init(device);
+        Self {
+            fused_gate_up,
+            down_proj,
+        }
+    }
+
+    pub fn new_for_head(device: &Device<B>) -> Self {
+        let config = get_global_config();
+        let hidden_dim = (config.embed_dim() as f32 * 2.5) as usize;
+
+        let std_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
+        // Residual scaling for a single block: 1/sqrt(2*1) = 1/sqrt(2)
+        let residual_std = 0.02 / (2.0_f64).sqrt();
+        let residual_init = Initializer::Normal {
+            mean: 0.0,
+            std: residual_std,
+        };
+
         let fused_gate_up = LinearConfig::new(config.embed_dim(), 2 * hidden_dim)
             .with_initializer(std_init)
             .init(device);
