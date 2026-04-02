@@ -24,3 +24,5 @@
 |------|-------------|-------|----------------|------|
 | 0 | New baseline (192 embed, square embeds, full-rank policy, derived globals) | 0.728148 (top1=0.4211, wdl=0.6166, aux=0.5075) | — | baseline |
 | 1 | 3x3 spatial conv stem (1 layer) | 0.698223 (top1=0.4009, wdl=0.6067, aux=0.4755) | -0.0299 (top1=-0.0202, wdl=-0.0099, aux=-0.0321) | ❌ |
+| 2 | Reduce attention heads 8→6 for larger head_dim | 0.737124 (top1=0.4326, wdl=0.6050, aux=0.5143) | +0.0090 (top1=+0.0115, wdl=-0.0116, aux=+0.0068) | ❌ |
+| 3 | 6 attention heads + QK-Norm for stable training | 0.757333 (top1=0.4496, wdl=0.6036, aux=0.5327) | +0.0292 (top1=+0.0285, wdl=-0.0129, aux=+0.0252) | ✅ |

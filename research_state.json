@@ -1,5 +1,5 @@
 {
-  "best_score": 0.728148,
+  "best_score": 0.7573334130233333,
   "baseline_score": 0.728148,
   "results": [
     {
@@ -13,12 +13,30 @@
       "title": "3x3 spatial conv stem (1 layer)",
       "ao": 0.698223,
       "status": "discarded"
+    },
+    {
+      "iter": 2,
+      "title": "Reduce attention heads 8\u21926 for larger head_dim",
+      "ao": 0.7371244753433335,
+      "status": "discarded"
+    },
+    {
+      "iter": 3,
+      "title": "6 attention heads + QK-Norm for stable training",
+      "ao": 0.7573334130233333,
+      "status": "kept"
+    },
+    {
+      "iter": 4,
+      "title": "[ERROR] ERROR: model call timed out after 180000ms",
+      "ao": 0.0,
+      "status": "error"
     }
   ],
-  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/baseline",
+  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_3",
   "best_components": {
-    "top1": 0.421121,
-    "wdl": 0.616563,
-    "aux": 0.507529
+    "top1": 0.44958992340000004,
+    "wdl": 0.60361328125,
+    "aux": 0.5326953127
   }
 }
