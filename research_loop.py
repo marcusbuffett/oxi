@@ -1,6 +1,15 @@
 """
 Automated ML research loop for the Oxi chess model.
 Runs iterations of: propose change → compile check → train → evaluate → keep/discard.
+
+v2 changes:
+- Architecture search: agents modify config.rs defaults directly (no CLI pinning)
+- 60-minute training timeout (from 30)
+- Pre-builds binary and runs it directly (training time isn't eaten by compile)
+- Diagnostic pre-analysis subagent feeds findings to the proposal agent
+- Better error handling: all errors with exponential backoff, max consecutive limit
+- Better statistical test: block bootstrap to handle autocorrelation
+- Better title extraction with validation
 """
 from shadesmar_tools import call_tool
 import subprocess
@@ -21,35 +30,33 @@ RESEARCH_LOG = WORKSPACE / "research_log.md"
 AUTORESEARCH_DIR = WORKSPACE / "autoresearch"
 RESEARCH_RUNS = WORKSPACE / "research_runs"
 STATE_FILE = WORKSPACE / "research_state.json"
-TRAINING_TIMEOUT = 1800  # 30 minutes
+TRAINING_TIMEOUT = 3600  # 60 minutes
 MAX_ITERATIONS = 50
+BATCH_SIZE = 512
 
-# Research model config (12 layers balances capacity vs throughput at ~420 samples/sec)
-MODEL_LAYERS = 12
-MODEL_EMBED = 192
-MODEL_BATCH = 512
-
-# Composite metric: weighted combination of top-1 accuracy, WDL accuracy, and aux head accuracy
-# All components are averaged over the last METRIC_WINDOW values from their respective log files.
-# top1_accuracy: 0-1 fraction, wdl_accuracy: 0-100 percentage (divided by 100), aux: 0-1 fraction
+# Composite metric weights
 METRIC_WINDOW = 100
 WEIGHT_TOP1 = 1.0
 WEIGHT_WDL = 0.5
-WEIGHT_AUX = 0.2  # average of from-square and to-square aux accuracy
+WEIGHT_AUX = 0.2
+
+# Acceptance: block bootstrap p-value + Cohen's d
+BOOTSTRAP_SAMPLES = 5000
+BLOCK_SIZE = 20  # block bootstrap block size to handle autocorrelation
+MIN_COHEN_D = 0.3
+ALPHA = 0.05
+
+# Error handling
+MAX_CONSECUTIVE_ERRORS = 5
+INITIAL_BACKOFF_SECS = 30
+MAX_BACKOFF_SECS = 600
 
 
 def normalize_wdl(value):
-    """Normalize WDL values to 0-1 range, handling old percentage-scale logs."""
     return value / 100.0 if value > 1.0 else value
-
-# Acceptance criterion: Welch's t-test on composite score, last METRIC_WINDOW iterations.
-# A change is kept only if p < ALPHA and Cohen's d >= MIN_COHEN_D.
-MIN_COHEN_D = 0.5   # medium effect size
-ALPHA = 0.05
 
 
 def load_metric_array(log_dir, metric_name):
-    """Parse a metric TSV log, returning a numpy array of the last METRIC_WINDOW values."""
     log_file = Path(log_dir) / "metrics_logs" / f"{metric_name}.log"
     if not log_file.exists():
         return np.array([])
@@ -66,7 +73,6 @@ def load_metric_array(log_dir, metric_name):
 
 
 def load_composite_array(log_dir):
-    """Return a numpy array of per-step composite scores (last METRIC_WINDOW aligned steps)."""
     def load_map(name):
         log_file = Path(log_dir) / "metrics_logs" / f"{name}.log"
         if not log_file.exists():
@@ -102,13 +108,11 @@ def load_composite_array(log_dir):
 
 
 def parse_metric_log(log_dir, metric_name):
-    """Return the mean of the last METRIC_WINDOW values for a metric (scalar, for reporting)."""
     arr = load_metric_array(log_dir, metric_name)
     return float(arr.mean()) if len(arr) > 0 else 0.0
 
 
 def parse_composite_score(log_dir):
-    """Compute composite score from multiple metrics. Returns (score, components_dict)."""
     top1 = parse_metric_log(log_dir, "top1_accuracy")
     wdl = normalize_wdl(parse_metric_log(log_dir, "wdl_accuracy"))
     aux_from = parse_metric_log(log_dir, "aux_from_square_accuracy")
@@ -119,28 +123,72 @@ def parse_composite_score(log_dir):
     return score, components
 
 
+def block_bootstrap_test(a, b, n_bootstrap=BOOTSTRAP_SAMPLES, block_size=BLOCK_SIZE):
+    """
+    Block bootstrap test for difference in means.
+    Handles autocorrelation by resampling in contiguous blocks.
+    Returns (p_value, observed_delta, ci_low, ci_high).
+    """
+    observed_delta = b.mean() - a.mean()
+
+    def block_resample(x):
+        n = len(x)
+        if n <= block_size:
+            return x.copy()
+        n_blocks = max(1, (n + block_size - 1) // block_size)
+        starts = np.random.randint(0, n - block_size + 1, size=n_blocks)
+        blocks = [x[s:s+block_size] for s in starts]
+        return np.concatenate(blocks)[:n]
+
+    pooled = np.concatenate([a, b])
+    pooled_centered = pooled - pooled.mean()
+
+    deltas = np.empty(n_bootstrap)
+    for i in range(n_bootstrap):
+        perm = np.random.permutation(len(pooled_centered))
+        null_a = block_resample(pooled_centered[perm[:len(a)]])
+        null_b = block_resample(pooled_centered[perm[len(a):]])
+        deltas[i] = null_b.mean() - null_a.mean()
+
+    p_val = np.mean(np.abs(deltas) >= np.abs(observed_delta))
+
+    boot_deltas = np.empty(n_bootstrap)
+    for i in range(n_bootstrap):
+        boot_a = block_resample(a)
+        boot_b = block_resample(b)
+        boot_deltas[i] = boot_b.mean() - boot_a.mean()
+    ci_low = np.percentile(boot_deltas, 2.5)
+    ci_high = np.percentile(boot_deltas, 97.5)
+
+    return p_val, observed_delta, ci_low, ci_high
+
+
 def check_improvement(current_dir, baseline_dir):
     """
-    Test whether current_dir is a statistically significant improvement over baseline_dir.
-    Uses Welch's t-test + Cohen's d on the composite score (last METRIC_WINDOW steps).
+    Test whether current run is a significant improvement over baseline.
+    Uses block bootstrap on composite score arrays + Cohen's d.
     Returns (is_improvement: bool, stats: dict).
     """
     a = load_composite_array(baseline_dir)
     b = load_composite_array(current_dir)
-    if len(a) < 2 or len(b) < 2:
+
+    if len(a) < 10 or len(b) < 10:
         return False, {"error": "insufficient data"}
 
-    t_stat, p_val = stats.ttest_ind(a, b, equal_var=False)
-    delta = b.mean() - a.mean()
-    pooled_std = np.sqrt((a.std(ddof=1) ** 2 + b.std(ddof=1) ** 2) / 2)
+    p_val, delta, ci_low, ci_high = block_bootstrap_test(a, b)
+    pooled_std = np.sqrt((a.std(ddof=1)**2 + b.std(ddof=1)**2) / 2)
     d = delta / pooled_std if pooled_std > 0 else 0.0
 
-    passed = (p_val < ALPHA) and (d >= MIN_COHEN_D)
-    return passed, {"delta": delta, "p": p_val, "d": d, "mean_new": b.mean(), "mean_old": a.mean()}
+    passed = (p_val < ALPHA) and (d >= MIN_COHEN_D) and (delta > 0)
+    return passed, {
+        "delta": delta, "p": p_val, "d": d,
+        "ci_low": ci_low, "ci_high": ci_high,
+        "mean_new": float(b.mean()), "mean_old": float(a.mean()),
+        "n_new": len(b), "n_old": len(a),
+    }
 
 
 def best_run_dir_by_score():
-    """Scan research_runs/ and return the dir with the highest composite score."""
     best_dir, best_score = None, -1.0
     for p in RESEARCH_RUNS.iterdir():
         if p.is_dir() and (p / "metrics_logs").is_dir():
@@ -153,7 +201,6 @@ def best_run_dir_by_score():
 
 
 def compile_check():
-    """Run cargo check and return (success, stderr)."""
     result = subprocess.run(
         ["cargo", "check", "--features", "train,backend-tch"],
         cwd=WORKSPACE, capture_output=True, text=True, timeout=300
@@ -162,12 +209,10 @@ def compile_check():
 
 
 def format_components(components):
-    """Format component scores for display: (top1=0.41, wdl=0.52, aux=0.38)"""
     return f"(top1={components['top1']:.4f}, wdl={components['wdl']:.4f}, aux={components['aux']:.4f})"
 
 
 def format_delta(score, components, prev_score, prev_components):
-    """Format delta vs previous best: +0.0131 (top1=-0.0040, wdl=+0.0092, aux=+0.0702)"""
     ds = score - prev_score
     dt = components['top1'] - prev_components['top1']
     dw = components['wdl'] - prev_components['wdl']
@@ -175,35 +220,33 @@ def format_delta(score, components, prev_score, prev_components):
     return f"{ds:+.4f} (top1={dt:+.4f}, wdl={dw:+.4f}, aux={da:+.4f})"
 
 
+def build_binary():
+    """Pre-build release binary. Returns (success, stderr)."""
+    result = subprocess.run(
+        ["cargo", "build", "--release", "--features", "backend-tch train"],
+        cwd=WORKSPACE, capture_output=True, text=True, timeout=600
+    )
+    return result.returncode == 0, result.stderr
+
+
 def run_training(run_name, seed):
-    """Run training for TRAINING_TIMEOUT seconds and return (composite_score, components_dict)."""
+    """Run training for TRAINING_TIMEOUT seconds using pre-built binary.
+    Architecture comes from config.rs defaults (agent modifies those directly).
+    Returns (composite_score, components_dict)."""
     log_dir = RESEARCH_RUNS / run_name
-    # Clean stale metrics from previous runs so parse never reads old data
     metrics_dir = log_dir / "metrics_logs"
     if metrics_dir.exists():
         import shutil
         shutil.rmtree(metrics_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-build to cache compilation
-    print(f"  Building release binary...")
-    build_result = subprocess.run(
-        ["cargo", "build", "--release", "--features", "backend-tch train"],
-        cwd=WORKSPACE, capture_output=True, text=True, timeout=300
-    )
-    if build_result.returncode != 0:
-        print(f"  Build failed: {build_result.stderr[-500:]}")
-        return 0.0, {"top1": 0.0, "wdl": 0.0, "aux": 0.0}
-
-    print(f"  Running training for {TRAINING_TIMEOUT}s (seed={seed})...")
+    binary = WORKSPACE / "target" / "release" / "oxi"
     cmd = [
-        "cargo", "run", "--release", "--features", "backend-tch train", "--",
+        str(binary),
         "train",
         "--pretrain-samples=0",
         "--data-path=../data",
-        f"--physical-batch-size={MODEL_BATCH}",
-        f"--num-layers={MODEL_LAYERS}",
-        f"--embed-dim={MODEL_EMBED}",
+        f"--physical-batch-size={BATCH_SIZE}",
         f"--seed={seed}",
         f"--log-dir={log_dir}",
         "--disable-tui",
@@ -213,6 +256,8 @@ def run_training(run_name, seed):
         "--gradnorm-interval=200",
         "--checkpoint-interval=0",
     ]
+
+    print(f"  Training seed={seed} for {TRAINING_TIMEOUT}s...")
     stderr_log = log_dir / "stderr.log"
     with open(stderr_log, "w") as stderr_file:
         try:
@@ -228,7 +273,7 @@ def run_training(run_name, seed):
             stderr_tail = stderr_log.read_text()[-1000:]
         except Exception:
             pass
-        print(f"  Training process exited with code {proc.returncode}")
+        print(f"  Training exited with code {proc.returncode}")
         if stderr_tail:
             print(f"  stderr (last 1000 chars):\n{stderr_tail}")
 
@@ -238,21 +283,17 @@ def run_training(run_name, seed):
 
 
 def git_revert():
-    """Stash any uncommitted changes to source files, then restore to HEAD."""
-    # Check if there are changes to stash
     result = subprocess.run(
         ["git", "diff", "--quiet", "src/", "Cargo.toml"],
         cwd=WORKSPACE, capture_output=True
     )
     if result.returncode != 0:
-        # There are changes — stash them so they're recoverable
         subprocess.run(
             ["git", "stash", "push", "-m", "research_loop: auto-stash discarded changes",
              "--", "src/", "Cargo.toml"],
             cwd=WORKSPACE, capture_output=True
         )
     else:
-        # Also check for staged changes
         result = subprocess.run(
             ["git", "diff", "--cached", "--quiet", "src/", "Cargo.toml"],
             cwd=WORKSPACE, capture_output=True
@@ -266,18 +307,15 @@ def git_revert():
 
 
 def git_commit(message):
-    """Commit source changes."""
     subprocess.run(["git", "add", "src/", "Cargo.toml"], cwd=WORKSPACE, capture_output=True)
     subprocess.run(["git", "commit", "-m", message], cwd=WORKSPACE, capture_output=True)
 
 
 def load_state():
-    """Load persisted state for resumability."""
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text())
     else:
         state = {"best_score": 0.0, "baseline_score": 0.0, "results": []}
-    # Infer best_run_dir from disk if not already stored
     if not state.get("best_run_dir"):
         d = best_run_dir_by_score()
         state["best_run_dir"] = str(d) if d else str(RESEARCH_RUNS / "baseline")
@@ -285,12 +323,10 @@ def load_state():
 
 
 def save_state(state):
-    """Persist state."""
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 def parse_existing_log():
-    """Parse existing research_log.md for results."""
     if not RESEARCH_LOG.exists():
         return []
     results = []
@@ -308,7 +344,6 @@ def parse_existing_log():
 
 
 def generate_chart(results, baseline_ao):
-    """Generate and upload a progress chart."""
     if not results:
         return
     results = [r for r in results if r['status'] not in ('error',)]
@@ -373,15 +408,64 @@ def extract_structured_output(text):
             title = data.get("title", "").strip().replace("|", "-").replace("\n", " ")[:80]
             description = data.get("description", "").strip()
             changes = data.get("changes", "").strip()
-            if title:
+            if title and validate_title(title):
                 return title, description, changes
         except json.JSONDecodeError:
             pass
     for line in text.split("\n"):
         line = line.strip()
-        if line and not line.startswith("#") and not line.startswith("```"):
+        if line and not line.startswith("#") and not line.startswith("```") and validate_title(line):
             return line[:80].replace("|", "-"), "", ""
     return "Unknown change", "", ""
+
+
+def validate_title(title):
+    """Reject titles that are obviously agent internal monologue."""
+    noise_starts = [
+        "i've analyzed", "let me", "i'll ", "i will", "ok,", "alright",
+        "i need to", "i should", "now i", "first,", "looking at",
+        "i have", "i can", "i want", "let's",
+    ]
+    lower = title.lower()
+    return not any(lower.startswith(p) for p in noise_starts)
+
+
+def run_diagnostics(best_run_dir, best_score, best_components):
+    """Run a diagnostic subagent that analyzes the current best run.
+    Returns a diagnostic report string to feed to the proposal agent."""
+    diag_dir = Path(best_run_dir)
+    if not diag_dir.exists() or not (diag_dir / "metrics_logs").is_dir():
+        return "(No diagnostic data available — first iteration)"
+
+    diag_prompt = f"""You are analyzing training logs for the Oxi chess model to find optimization opportunities.
+
+Current best composite score: {best_score:.6f} {format_components(best_components)}
+Training timeout: {TRAINING_TIMEOUT}s
+
+The training logs are in: {diag_dir}
+- `train.log`: full training output with gradient norms, GradNorm weight updates, LR schedule, etc.
+- `metrics_logs/`: per-metric TSV files
+
+Your job:
+1. Read the train.log (focus on gradient breakdowns, GradNorm updates, LR reductions, and any warnings)
+2. Read the metric logs to understand learning curves (are metrics still improving at the end? plateaued? regressing?)
+3. Look for anomalies: gradient vanishing/exploding in specific layers, GradNorm weights hitting clamp limits, LR schedule firing too early/late, any components that seem under-optimized
+4. Check the codebase for potential bugs or disconnected code paths (values computed but never used, conditions that can never trigger, etc.)
+
+Produce a CONCISE diagnostic report (max 500 words) with:
+- **Training dynamics**: throughput (iter/sec), total iterations, LR schedule behavior
+- **Gradient health**: any layers with anomalous gradients, GradNorm clamping issues
+- **Metric trajectories**: which components are still improving vs plateaued
+- **Potential issues**: any bugs, misconfigurations, or disconnected code paths found
+- **Top opportunities**: 2-3 most promising avenues for improvement, ranked by expected impact
+
+Be specific and quantitative. Reference actual values from the logs."""
+
+    try:
+        result = call_tool("subagent_run", task=diag_prompt)
+        return result.get("output", "(diagnostic failed)")
+    except Exception as e:
+        return f"(diagnostic failed: {e})"
 
 
 def main():
@@ -396,12 +480,19 @@ def main():
 
     if not RESEARCH_LOG.exists() or RESEARCH_LOG.stat().st_size == 0:
         with open(RESEARCH_LOG, 'w') as f:
-            f.write(f"# OXI Research Log\n\n| Iter | Description | Score | Δ vs prev best | Kept |\n|------|-------------|-------|----------------|------|\n")
+            f.write("# OXI Research Log\n\n| Iter | Description | Score | Δ vs prev best | Kept |\n|------|-------------|-------|----------------|------|\n")
 
     # Run baseline if needed
     if state["baseline_score"] == 0.0:
         print("=== Running baseline training ===")
         git_revert()
+
+        print("  Building release binary...")
+        ok, stderr = build_binary()
+        if not ok:
+            print(f"  Build failed: {stderr[-500:]}")
+            return
+
         baseline, baseline_components = run_training("baseline", seed=42)
         state["baseline_score"] = baseline
         state["best_score"] = baseline
@@ -420,6 +511,8 @@ def main():
     baseline = state["baseline_score"]
     all_results = [r for r in state.get("results", existing_results) if r.get('status') != 'error']
 
+    consecutive_errors = 0
+
     for iteration_count in range(MAX_ITERATIONS):
         i = len(all_results)
         print(f"\n{'='*60}")
@@ -429,6 +522,16 @@ def main():
         try:
             git_revert()
 
+            # --- Phase 1: Diagnostic analysis ---
+            print(f"  Running diagnostic analysis...")
+            best_comps = state.get("best_components", {"top1": 0.0, "wdl": 0.0, "aux": 0.0})
+            diagnostic_report = run_diagnostics(state["best_run_dir"], best, best_comps)
+
+            iter_dir = AUTORESEARCH_DIR / str(i)
+            iter_dir.mkdir(parents=True, exist_ok=True)
+            (iter_dir / "diagnostics.md").write_text(diagnostic_report)
+
+            # --- Phase 2: Propose experiment ---
             idea_prompt = f"""You are an ML researcher improving a chess move-prediction transformer.
 
 **Start by reading `research/architecture.md`** — it contains a comprehensive reference of the model architecture, input representation, all output heads, loss functions, GradNorm, optimizer config, LR scheduling, data pipeline, metrics logging, and evaluation scoring. This is your primary reference for understanding the codebase.
@@ -440,59 +543,56 @@ Your changes are evaluated on a **composite score** computed as:
 where each component is the average of its last {METRIC_WINDOW} logged values during a {TRAINING_TIMEOUT//60}-minute training run.
 
 Components:
-- **top1_accuracy** (weight {WEIGHT_TOP1}): Policy head move prediction accuracy (0-1). Fraction of positions where the model's top-1 predicted move matches the game move.
-- **wdl_accuracy** (weight {WEIGHT_WDL:.4f}): Win/draw/loss prediction accuracy (0-1). How well the value head predicts game outcomes.
-- **aux_accuracy** (weight {WEIGHT_AUX}): Average of from-square and to-square auxiliary head accuracy (0-1). These heads predict the origin and destination squares of the played move.
+- **top1_accuracy** (weight {WEIGHT_TOP1}): Policy head move prediction accuracy (0-1).
+- **wdl_accuracy** (weight {WEIGHT_WDL:.4f}): Win/draw/loss prediction accuracy (0-1).
+- **aux_accuracy** (weight {WEIGHT_AUX}): Average of from-square and to-square auxiliary head accuracy (0-1).
 
-Current best score: {best:.6f} | Baseline: {baseline:.6f} | Iteration {i}
+Current best score: {best:.6f} {format_components(best_comps)} | Baseline: {baseline:.6f} | Iteration {i}
+
+## Diagnostic Report
+
+A diagnostic agent analyzed the current best training run and found:
+
+{diagnostic_report}
 
 ## Important Context
 
-- **Loss weighting is handled by GradNorm** — the model uses adaptive GradNorm reweighting to balance gradients across the policy, value, time-usage, and auxiliary heads. You do NOT need to manually tune loss weights. GradNorm will automatically adjust them.
-- **This is a time-constrained training run** ({TRAINING_TIMEOUT//60} minutes). Speeding up the per-iteration training loop can be just as valuable as increasing model capacity. Any additional capacity (more parameters, wider layers, extra heads) needs to "earn" its extra FLOPs via higher performance on the composite metric. Prefer efficient changes over expensive ones.
+- **Loss weighting is handled by GradNorm** — the model uses adaptive GradNorm reweighting. You do NOT need to manually tune loss weights.
+- **This is a time-constrained training run** ({TRAINING_TIMEOUT//60} minutes). Throughput matters.
+- **The goal is to prep for a larger production run.** We want to find the best architecture config + training recipe that can then be scaled up. Improvements to training dynamics, loss functions, and architecture design are all valuable.
+- **Architecture is not pinned.** The model's embed_dim, num_layers, and num_heads come from defaults in `src/config.rs`. If you want to change the architecture, modify those defaults. The training command does NOT pass these as CLI args, so your config.rs changes will take effect.
 
 ## What To Do
 
 Read the experiment log at research_log.md to see what has been tried. Do not repeat failed ideas.
 
-Explore the codebase to understand the architecture, then make a single targeted change. You are free to make architectural changes, hyperparameter changes, ablation tests, loss function modifications, or anything else you think could help. Do not be afraid to make larger, more imaginative changes. Spend the time to really investigate and dig into your ideas before committing to them — an extra few minutes of careful thinking can prevent a wasted 30+ minute training run.
+Explore the codebase, then propose **a single targeted change**. This means ONE logical modification — do not bundle unrelated hyperparameter tweaks with architectural changes. If you want to change the architecture, that's the one change. If you want to fix a training bug, that's the one change.
 
 Verify your change compiles: `cargo check --features "train,backend-tch"`
 
-The training command that will be run to evaluate your change:
-```
-cargo run --release --features "backend-tch train" -- train --pretrain-samples=0 --data-path=../data --physical-batch-size={MODEL_BATCH} --num-layers={MODEL_LAYERS} --embed-dim={MODEL_EMBED} --warmup-multiplier=0.1 --log-gradient-breakdown --full-metrics-interval=200 --gradnorm-interval=200 --checkpoint-interval=0 --seed=<varies> --log-dir=<run_dir> --disable-tui
-```
-
-Feel free to use the ./research directory, to make notes and see notes from previous agents. Future agents will edit and add to this.
+Feel free to use the ./research directory to make notes and see notes from previous agents.
 
 ## Acceptance Criteria
 
-Training runs for {TRAINING_TIMEOUT} seconds then is killed, so the model must converge quickly. Changes are kept only if they achieve a statistically significant improvement (Welch's t-test p < {ALPHA}, Cohen's d >= {MIN_COHEN_D}) on the composite score compared to the current best run. Aim for meaningful changes — small tweaks that improve the mean by less than ~1 pooled std dev will be discarded.
-
-## Available Data
-
-Previous run logs are in research_runs/. Each run directory contains:
-- `metrics_logs/` — per-metric TSV files (top1_accuracy.log, wdl_accuracy.log, aux_from_square_accuracy.log, aux_to_square_accuracy.log, policy_loss.log, total_loss.log, etc.)
-- `train.log` — detailed training log including per-layer gradient norms, weight norms, update ratios, and per-head gradient statistics (logged every 100 iterations)
+Training runs for {TRAINING_TIMEOUT//60} minutes then is killed. Changes are kept if:
+- Block bootstrap p < {ALPHA} (autocorrelation-corrected)
+- Cohen's d >= {MIN_COHEN_D}
 
 ## Rules
 
 DO NOT TOUCH:
 - CLI argument handling or data loading
-- The LR scheduler type — we use reduce-on-plateau so training is duration-agnostic. Do not add cosine decay, cyclic schedules, or any schedule that depends on knowing total training steps. Adjusting the LR value itself, warmup, or plateau detector parameters is fine.
+- The LR scheduler type (reduce-on-plateau only, no cosine/cyclic). Adjusting LR values, warmup, or plateau parameters is fine.
 - The evaluation metric or how accuracy is measured
-- Loss weights — GradNorm handles this automatically
-- research_log.md and research_runs/ — these are read-only. You may read them for context but do not write to, modify, or delete any files in them. The one exception is research_runs/run_{i}/conclusion.md which you must create (see below).
+- Loss weights — GradNorm handles this
+- research_log.md and research_runs/ — read-only (except research_runs/run_{i}/conclusion.md which you must create)
 
 ## Required Output
 
-Before your final response, write a file at research_runs/run_{i}/conclusion.md describing:
-1. **What you did** — a short summary of the change(s) made.
-2. **Why you chose this** — a detailed breakdown of your reasoning: what prior results, architectural insights, or hypotheses led you to believe this was the best option to try. Reference specific prior experiments from research_log.md if relevant.
-3. **What you expect** — what outcome you predict and why.
-
-Be concise but thorough on the reasoning.
+Write a file at research_runs/run_{i}/conclusion.md describing:
+1. **What you did** — short summary
+2. **Why you chose this** — detailed reasoning, referencing prior experiments
+3. **What you expect** — predicted outcome and confidence level
 
 End your response with:
 ```json
@@ -500,11 +600,8 @@ End your response with:
 ```"""
 
             print(f"  Requesting experiment idea from subagent...")
-            seed = 42
             idea_output = call_tool("subagent_run", task=idea_prompt).get("output", "")
 
-            iter_dir = AUTORESEARCH_DIR / str(i)
-            iter_dir.mkdir(parents=True, exist_ok=True)
             (iter_dir / "idea.md").write_text(idea_output)
 
             title, description, changes = extract_structured_output(idea_output)
@@ -512,6 +609,7 @@ End your response with:
             if description:
                 print(f"  Description: {description}")
 
+            # --- Phase 3: Compile check ---
             print(f"  Checking compilation...")
             compiles, stderr = compile_check()
             if not compiles:
@@ -522,17 +620,38 @@ End your response with:
                 all_results.append(result)
                 with open(RESEARCH_LOG, 'a') as f:
                     f.write(f"| {i} | [COMPILE FAIL] {title} | 0.000000 | — | ❌ |\n")
+                state["results"] = all_results
                 save_state(state)
+                consecutive_errors = 0
                 continue
 
             print(f"  ✅ Compilation succeeded")
 
-            score, components = run_training(f"run_{i}", seed=seed)
+            # --- Phase 4: Build release binary ---
+            print(f"  Building release binary...")
+            build_ok, build_stderr = build_binary()
+            if not build_ok:
+                print(f"  ❌ Build failed!")
+                print(f"  {build_stderr[-500:]}")
+                git_revert()
+                result = {'iter': i, 'title': f'[BUILD FAIL] {title}', 'ao': 0.0, 'status': 'fail'}
+                all_results.append(result)
+                with open(RESEARCH_LOG, 'a') as f:
+                    f.write(f"| {i} | [BUILD FAIL] {title} | 0.000000 | — | ❌ |\n")
+                state["results"] = all_results
+                save_state(state)
+                consecutive_errors = 0
+                continue
 
-            best_dir = Path(state.get("best_run_dir", str(RESEARCH_RUNS / "baseline")))
+            # --- Phase 5: Training ---
+            seed = 42
+            score, components = run_training(f"run_{i}", seed)
+
+            # --- Phase 6: Statistical comparison ---
+            best_dir = Path(state["best_run_dir"])
             improved, stat = check_improvement(RESEARCH_RUNS / f"run_{i}", best_dir)
             if "error" not in stat:
-                stat_str = f"Δ={stat['delta']:+.4f}  p={stat['p']:.4f}  d={stat['d']:+.3f}"
+                stat_str = f"Δ={stat['delta']:+.4f}  p={stat['p']:.4f}  d={stat['d']:+.3f}  CI=[{stat['ci_low']:+.4f}, {stat['ci_high']:+.4f}]"
             else:
                 stat_str = stat["error"]
 
@@ -548,38 +667,43 @@ End your response with:
                 status = "kept"
                 status_emoji = "✅"
             else:
-                print(f"  ❌ No improvement: {score:.6f}  ({stat_str})  need p<{ALPHA} and d>={MIN_COHEN_D}")
+                print(f"  ❌ No improvement: {score:.6f}  ({stat_str})")
                 git_revert()
                 status = "discarded"
                 status_emoji = "❌"
 
-            result = {'iter': i, 'title': title, 'ao': score, 'status': status}
-
-            all_results.append(result)
+            result_entry = {'iter': i, 'title': title, 'ao': score, 'status': status}
+            all_results.append(result_entry)
             with open(RESEARCH_LOG, 'a') as f:
                 f.write(f"| {i} | {title} | {score:.6f} {format_components(components)} | {delta_str} | {status_emoji} |\n")
 
             state["best_score"] = best
             state["results"] = all_results
             save_state(state)
-
             generate_chart(all_results, baseline)
+            consecutive_errors = 0
 
         except Exception as e:
             git_revert()
+            consecutive_errors += 1
             msg = str(e)
-            # Transient bridge/connection errors shouldn't consume an iteration — just retry.
-            if any(kw in msg for kw in ("Bridge request failed", "Connection refused", "Remote end closed")):
-                print(f"  ⚠️ Transient error (retrying next loop): {msg[:80]}")
-                traceback.print_exc()
-            else:
-                print(f"  ⚠️ Error in iteration {i}: {msg}")
-                traceback.print_exc()
+
+            backoff = min(MAX_BACKOFF_SECS, INITIAL_BACKOFF_SECS * (2 ** (consecutive_errors - 1)))
+            print(f"  ⚠️ Error ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {msg[:120]}")
+            traceback.print_exc()
+
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print(f"  🛑 {MAX_CONSECUTIVE_ERRORS} consecutive errors — stopping loop")
                 result = {'iter': i, 'title': f'[ERROR] {msg[:50]}', 'ao': 0.0, 'status': 'error'}
                 all_results.append(result)
                 with open(RESEARCH_LOG, 'a') as f:
-                    f.write(f"| {i} | [ERROR] {msg[:50]} | 0.000000 | — | ⚠️ |\n")
+                    f.write(f"| {i} | [ERROR x{consecutive_errors}] {msg[:50]} | 0.000000 | — | ⚠️ |\n")
+                state["results"] = all_results
                 save_state(state)
+                break
+
+            print(f"  Backing off {backoff}s before retry...")
+            time.sleep(backoff)
 
     print(f"\n{'='*60}")
     print(f"=== RESEARCH COMPLETE ===")

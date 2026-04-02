@@ -1108,8 +1108,8 @@ impl Default for Config {
             policy_label_smoothing: 0.005,
             value_loss_weight: 0.10,
             value_entropy_weight: 0.0,
-            embed_dim: 384,
-            num_layers: 24,
+            embed_dim: 192,
+            num_layers: 12,
             num_heads: 6,
 
             conv_layers: 0,

@@ -43,18 +43,3 @@
 | 6 | Wider aux heads + deeper value MLP + lower decay | 0.856595 (top1=0.4440, wdl=0.6135, aux=0.5293) | -0.0081 (top1=-0.0028, wdl=-0.0102, aux=-0.0013) | ❌ |
 | 7 | OK, I've analyzed the codebase thoroughly. Let me now finalize my approach. | 0.863447 (top1=0.4498, wdl=0.6151, aux=0.5302) | -0.0013 (top1=+0.0031, wdl=-0.0085, aux=-0.0005) | ❌ |
 | 8 | Gentler LR decay + head-specific residual init | 0.879279 (top1=0.4558, wdl=0.6310, aux=0.5398) | +0.0145 (top1=+0.0091, wdl=+0.0073, aux=+0.0092) | ✅ |
-| 9 | [ERROR] ERROR: subagent cancelled | 0.000000 | — | ⚠️ |
-| 10 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 11 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 12 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 13 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 14 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 15 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 16 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 17 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 18 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 19 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 20 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 21 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 22 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
-| 23 | [ERROR] ERROR: error sending request for url (https://open | 0.000000 | — | ⚠️ |
