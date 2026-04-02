@@ -1,4 +1,5 @@
 use burn::module::Module;
+use burn::module::Param;
 use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::{backend::Backend, Device, Tensor};
@@ -169,6 +170,10 @@ pub struct SmolgenAttention<B: Backend> {
     smolgen: Smolgen<B>,
     q_norm: RmsNorm<B>,
     k_norm: RmsNorm<B>,
+    /// Learnable per-head log-temperature for attention scaling.
+    /// With QK-norm, Q and K have fixed norms, removing per-head sharpness freedom.
+    /// This parameter restores that freedom. Initialized so exp(log_temp) = 1/sqrt(head_dim).
+    log_temperature: Param<Tensor<B, 1>>,
 }
 
 impl<B: Backend> SmolgenAttention<B> {
@@ -176,6 +181,7 @@ impl<B: Backend> SmolgenAttention<B> {
         let config = get_global_config();
         let embed_dim = config.embed_dim();
         let head_dim = config.head_dim();
+        let num_heads = config.num_heads();
 
         // Standard initialization: Normal(0, 0.02)
         let std_init = Initializer::Normal {
@@ -203,12 +209,20 @@ impl<B: Backend> SmolgenAttention<B> {
         let q_norm = RmsNormConfig::new(head_dim).init(device);
         let k_norm = RmsNormConfig::new(head_dim).init(device);
 
+        // Initialize log_temperature so exp(log_temp) = 1/sqrt(head_dim)
+        // i.e., log_temp = -0.5 * ln(head_dim)
+        let init_log_temp = -0.5 * (head_dim as f64).ln();
+        let log_temperature = Param::from_tensor(
+            Tensor::full([num_heads], init_log_temp as f32, device),
+        );
+
         Self {
             qkv_proj,
             o_proj,
             smolgen,
             q_norm,
             k_norm,
+            log_temperature,
         }
     }
 
@@ -271,8 +285,11 @@ impl<B: Backend> SmolgenAttention<B> {
             k_normed.reshape([batch_size, num_heads, seq_len, head_dim])
         };
 
-        let scale = (head_dim as f32).sqrt();
-        let q_scaled = q.clone().div_scalar(scale);
+        // Learnable per-head temperature: scale Q by exp(log_temperature) per head
+        // Shape: [num_heads] -> [1, num_heads, 1, 1] for broadcasting
+        let temperature = self.log_temperature.val().exp()
+            .reshape([1, num_heads, 1, 1]);
+        let q_scaled = q * temperature;
 
         let attn_scores = {
             let _t = TimingScope::new_with_sync::<B>("smolgen_attn_qk_matmul", &device);

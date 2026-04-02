@@ -228,6 +228,8 @@ impl<B: AutodiffBackend> WeightDecayClassifier<B> {
             || path_contains(path, "time_usage_uncertainty")
         {
             WeightDecayGroup::NoDecay
+        } else if path_contains(path, "log_temperature") {
+            WeightDecayGroup::NoDecay
         } else {
             WeightDecayGroup::Decay
         };
