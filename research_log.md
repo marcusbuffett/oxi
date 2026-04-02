@@ -26,3 +26,12 @@
 | 1 | 3x3 spatial conv stem (1 layer) | 0.698223 (top1=0.4009, wdl=0.6067, aux=0.4755) | -0.0299 (top1=-0.0202, wdl=-0.0099, aux=-0.0321) | ❌ |
 | 2 | Reduce attention heads 8→6 for larger head_dim | 0.737124 (top1=0.4326, wdl=0.6050, aux=0.5143) | +0.0090 (top1=+0.0115, wdl=-0.0116, aux=+0.0068) | ❌ |
 | 3 | 6 attention heads + QK-Norm for stable training | 0.757333 (top1=0.4496, wdl=0.6036, aux=0.5327) | +0.0292 (top1=+0.0285, wdl=-0.0129, aux=+0.0252) | ✅ |
+| 4 | Wider MLP (8/3x) + nonlinear token embedding | 0.741547 (top1=0.4299, wdl=0.6233, aux=0.5194) | -0.0158 (top1=-0.0197, wdl=+0.0196, aux=-0.0133) | ❌ |
+
+---
+
+**Metric reset**: WDL metric changed from argmax accuracy (0-100%) to mean probability of correct class (0-1). WDL weight in composite changed from 1/3 to 0.5. Composite formula is now: `1.0*top1 + 0.5*wdl + 0.2*aux`. Scores below are not directly comparable to above.
+
+| Iter | Description | Score | Δ vs prev best | Kept |
+|------|-------------|-------|----------------|------|
+| 0 | New baseline (metric reset: WDL mean-prob, weight 0.5) | 0.822116 (top1=0.4468, wdl=0.5391, aux=0.5285) | — | baseline |

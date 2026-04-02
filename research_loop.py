@@ -34,8 +34,13 @@ MODEL_BATCH = 512
 # top1_accuracy: 0-1 fraction, wdl_accuracy: 0-100 percentage (divided by 100), aux: 0-1 fraction
 METRIC_WINDOW = 100
 WEIGHT_TOP1 = 1.0
-WEIGHT_WDL = 1.0 / 3.0
+WEIGHT_WDL = 0.5
 WEIGHT_AUX = 0.2  # average of from-square and to-square aux accuracy
+
+
+def normalize_wdl(value):
+    """Normalize WDL values to 0-1 range, handling old percentage-scale logs."""
+    return value / 100.0 if value > 1.0 else value
 
 # Acceptance criterion: Welch's t-test on composite score, last METRIC_WINDOW iterations.
 # A change is kept only if p < ALPHA and Cohen's d >= MIN_COHEN_D.
@@ -89,7 +94,7 @@ def load_composite_array(log_dir):
     values = []
     for s in common:
         aux = (from_map[s] + to_map[s]) / 2.0
-        score = WEIGHT_TOP1 * top1_map[s] + WEIGHT_WDL * (wdl_map[s] / 100.0) + WEIGHT_AUX * aux
+        score = WEIGHT_TOP1 * top1_map[s] + WEIGHT_WDL * normalize_wdl(wdl_map[s]) + WEIGHT_AUX * aux
         values.append(score)
 
     arr = np.array(values)
@@ -105,8 +110,7 @@ def parse_metric_log(log_dir, metric_name):
 def parse_composite_score(log_dir):
     """Compute composite score from multiple metrics. Returns (score, components_dict)."""
     top1 = parse_metric_log(log_dir, "top1_accuracy")
-    wdl_raw = parse_metric_log(log_dir, "wdl_accuracy")
-    wdl = wdl_raw / 100.0
+    wdl = normalize_wdl(parse_metric_log(log_dir, "wdl_accuracy"))
     aux_from = parse_metric_log(log_dir, "aux_from_square_accuracy")
     aux_to = parse_metric_log(log_dir, "aux_to_square_accuracy")
     aux = (aux_from + aux_to) / 2.0
