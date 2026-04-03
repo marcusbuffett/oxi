@@ -250,7 +250,7 @@ def run_training(run_name, seed):
         f"--seed={seed}",
         f"--log-dir={log_dir}",
         "--disable-tui",
-        "--warmup-multiplier=0.1",
+        "--warmup-multiplier=1.0",
         "--log-gradient-breakdown",
         "--full-metrics-interval=200",
         "--gradnorm-interval=200",

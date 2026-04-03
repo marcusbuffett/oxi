@@ -335,7 +335,14 @@ impl<B: Backend> OXIModel<B> {
 
             // Attention pooling: fc1 → silu → fc2 → softmax → weighted sum
             let pool_hidden = silu(self.value_pool_fc1.forward(value_tokens.clone()));
-            let pool_weights = softmax(self.value_pool_fc2.forward(pool_hidden).reshape([aux_batch_size, 64]), 1)
+            let pool_logits = self.value_pool_fc2.forward(pool_hidden).reshape([aux_batch_size, 64]);
+            // Scale logits by 1/sqrt(embed_dim) to prevent softmax saturation
+            // Without scaling, the fc2 dot product over embed_dim dimensions produces
+            // logits whose variance grows with embed_dim, causing the softmax to
+            // concentrate on a single position and killing gradients through fc1/fc2.
+            let scale = (embed_dim as f64).sqrt();
+            let pool_logits = pool_logits / scale;
+            let pool_weights = softmax(pool_logits, 1)
                 .reshape([aux_batch_size, 64, 1]);
             let pooled = (value_tokens * pool_weights).sum_dim(1).reshape([aux_batch_size, embed_dim]);
             log_tensor_stats("value.pooled", &pooled);
