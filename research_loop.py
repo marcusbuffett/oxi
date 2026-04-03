@@ -462,7 +462,7 @@ Produce a CONCISE diagnostic report (max 500 words) with:
 Be specific and quantitative. Reference actual values from the logs."""
 
     try:
-        result = call_tool("subagent_run", task=diag_prompt)
+        result = call_tool("subagent_run", task=diag_prompt, role="full")
         return result.get("output", "(diagnostic failed)")
     except Exception as e:
         return f"(diagnostic failed: {e})"
@@ -600,7 +600,7 @@ End your response with:
 ```"""
 
             print(f"  Requesting experiment idea from subagent...")
-            idea_output = call_tool("subagent_run", task=idea_prompt).get("output", "")
+            idea_output = call_tool("subagent_run", task=idea_prompt, role="full").get("output", "")
 
             (iter_dir / "idea.md").write_text(idea_output)
 

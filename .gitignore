@@ -12,3 +12,5 @@ models
 train.log
 metrics_logs
 .shadesmar/runs
+__pycache__
+research_runs
