@@ -4,6 +4,7 @@
 [build]
 # Default features for local development (macOS with LibTorch)
 # Override with --no-default-features --features "..." if needed
+rustflags = ["-C", "link-arg=-Wl,-rpath,/opt/homebrew/opt/pytorch/lib"]
 
 [alias]
 # Convenient aliases for common commands

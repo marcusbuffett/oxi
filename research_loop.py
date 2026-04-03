@@ -316,6 +316,9 @@ def load_state():
         state = json.loads(STATE_FILE.read_text())
     else:
         state = {"best_score": 0.0, "baseline_score": 0.0, "results": []}
+    state.setdefault("best_score", 0.0)
+    state.setdefault("baseline_score", 0.0)
+    state.setdefault("results", [])
     if not state.get("best_run_dir"):
         d = best_run_dir_by_score()
         state["best_run_dir"] = str(d) if d else str(RESEARCH_RUNS / "baseline")
