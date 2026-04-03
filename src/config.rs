@@ -270,10 +270,6 @@ pub struct Config {
     #[serde(default = "default_value_tower_layers")]
     pub value_tower_layers: usize,
 
-    /// Whether to backpropagate value gradients to trunk (false = stop_grad)
-    #[serde(default)]
-    pub value_backprop_to_trunk: Option<bool>,
-
     /// Starting ply for value example weighting ramp (positions before this get 0 weight)
     #[serde(default = "default_value_ply_ramp_start")]
     pub value_ply_ramp_start: usize,
@@ -612,10 +608,6 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub value_tower_layers: Option<usize>,
 
-    /// Whether to backpropagate value gradients to trunk
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
-    pub value_backprop_to_trunk: Option<bool>,
-
     /// Starting ply for value example weighting ramp
     #[arg(long)]
     pub value_ply_ramp_start: Option<usize>,
@@ -853,9 +845,6 @@ impl Config {
         if let Some(v) = overrides.value_tower_layers {
             config.value_tower_layers = v;
         }
-        if let Some(v) = overrides.value_backprop_to_trunk {
-            config.value_backprop_to_trunk = Some(v);
-        }
         if let Some(v) = overrides.value_ply_ramp_start {
             config.value_ply_ramp_start = v;
         }
@@ -1024,10 +1013,6 @@ impl Config {
         self.value_tower_layers
     }
 
-    pub fn value_backprop_to_trunk(&self) -> bool {
-        self.value_backprop_to_trunk.unwrap_or(false)
-    }
-
     pub fn value_ply_ramp_start(&self) -> usize {
         self.value_ply_ramp_start
     }
@@ -1141,7 +1126,6 @@ impl Default for Config {
             puzzle_sampling_ratio: 0.05,
             puzzle_path: None,
             value_tower_layers: 2,
-            value_backprop_to_trunk: Some(false),
             value_ply_ramp_start: 10,
             value_ply_ramp_full: 30,
             value_train_on_puzzles: Some(false),
