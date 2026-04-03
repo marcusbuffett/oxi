@@ -327,13 +327,21 @@ impl GradNormState {
         }
 
         for (index, new_weight) in updated_weights {
-            // Clamp weight to [0.1x, 10x] of initial value to prevent collapse
-            let initial = self.tasks[index].initial_weight.max(EPS);
-            let clamped = new_weight.clamp(initial * 0.1, initial * 10.0);
-            self.tasks[index].weight = clamped;
+            self.tasks[index].weight = new_weight;
         }
 
         self.renormalize_weights();
+
+        // Clamp weights AFTER renormalization to enforce hard floors/ceilings.
+        // Previously clamping happened before renorm, which allowed renorm to
+        // push weights below their clamp floors (e.g., aux weight ending up at
+        // 0.005 despite a 0.006 floor when policy weight was at its ceiling).
+        for task in &mut self.tasks {
+            if task.enabled {
+                let initial = task.initial_weight.max(EPS);
+                task.weight = task.weight.clamp(initial * 0.1, initial * 10.0);
+            }
+        }
 
         let final_weights: Vec<String> = self.tasks.iter()
             .filter(|t| t.enabled)
