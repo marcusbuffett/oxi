@@ -1,1 +1,36 @@
-{"best_score": 0.0, "baseline_score": 0.0, "results": []}
+{
+  "best_score": 0.9459557905999998,
+  "baseline_score": 0.91587424665,
+  "results": [
+    {
+      "iter": 0,
+      "title": "Fix GradNorm clamp-then-renormalize ordering bug",
+      "ao": 0.9459557905999998,
+      "status": "kept"
+    },
+    {
+      "iter": 1,
+      "title": "Scale factorized policy logits by 1/sqrt(embed_dim)",
+      "ao": 0.9298105190000002,
+      "status": "discarded"
+    },
+    {
+      "iter": 2,
+      "title": "Composite plateau loss prevents premature LR reduction",
+      "ao": 0.94045933658,
+      "status": "discarded"
+    },
+    {
+      "iter": 3,
+      "title": "Connect value_weights to value loss computation",
+      "ao": 0.9358771623350001,
+      "status": "discarded"
+    }
+  ],
+  "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_0",
+  "best_components": {
+    "top1": 0.4935495405999999,
+    "wdl": 0.6823046875,
+    "aux": 0.55626953125
+  }
+}

@@ -34,7 +34,7 @@ WEIGHT_TOP1 = 1.0
 WEIGHT_WDL  = 0.5
 WEIGHT_AUX  = 0.2
 
-TRAINING_TIMEOUT = 1800  # seconds — assumed duration of a completed comparison run
+TRAINING_TIMEOUT = 3600  # seconds — assumed duration of a completed comparison run
 
 # Must match research_loop.py acceptance criterion
 MIN_COHEN_D = 0.5

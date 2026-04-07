@@ -15,3 +15,9 @@
 ---
 
 **New baseline (2026-04-03):** Warmup was 0.1x (51 steps) — likely causing run-to-run instability due to insufficient warmup with Muon. Bumped to 1.0x (512 steps). Also includes value head attention pooling sqrt scaling fix from run_7. Previous best was run_4 (0.9357).
+| 7 | Scale value head attention pooling to fix dead layers | 0.930480 (top1=0.4702, wdl=0.7038, aux=0.5418) | -0.0052 (top1=-0.0227, wdl=+0.0408, aux=-0.0147) | ❌ |
+| 8 | [ERROR x5] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | — | ⚠️ |
+| 0 | Fix GradNorm clamp-then-renormalize ordering bug | 0.945956 (top1=0.4935, wdl=0.6823, aux=0.5563) | +0.0301 (top1=+0.0322, wdl=-0.0121, aux=+0.0195) | ✅ |
+| 1 | Scale factorized policy logits by 1/sqrt(embed_dim) | 0.929811 (top1=0.4842, wdl=0.6710, aux=0.5506) | -0.0161 (top1=-0.0094, wdl=-0.0113, aux=-0.0056) | ❌ |
+| 2 | Composite plateau loss prevents premature LR reduction | 0.940459 (top1=0.4860, wdl=0.6881, aux=0.5518) | -0.0055 (top1=-0.0075, wdl=+0.0058, aux=-0.0045) | ❌ |
+| 3 | Connect value_weights to value loss computation | 0.935877 (top1=0.4879, wdl=0.6759, aux=0.5501) | -0.0101 (top1=-0.0056, wdl=-0.0064, aux=-0.0062) | ❌ |
