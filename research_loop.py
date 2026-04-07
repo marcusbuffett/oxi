@@ -254,7 +254,7 @@ def run_training(run_name, seed):
         "--log-gradient-breakdown",
         "--full-metrics-interval=200",
         "--gradnorm-interval=200",
-        "--checkpoint-interval=0",
+        "--checkpoint-interval=400",
     ]
 
     print(f"  Training seed={seed} for {TRAINING_TIMEOUT}s...")
@@ -563,7 +563,7 @@ A diagnostic agent analyzed the current best training run and found:
 - **Loss weighting is handled by GradNorm** — the model uses adaptive GradNorm reweighting. You do NOT need to manually tune loss weights.
 - **This is a time-constrained training run** ({TRAINING_TIMEOUT//60} minutes). Throughput matters.
 - **The goal is to prep for a larger production run.** We want to find the best architecture config + training recipe that can then be scaled up. Improvements to training dynamics, loss functions, and architecture design are all valuable.
-- **Architecture is not pinned.** The model's embed_dim, num_layers, and num_heads come from defaults in `src/config.rs`. If you want to change the architecture, modify those defaults. The training command does NOT pass these as CLI args, so your config.rs changes will take effect.
+- **Architecture is not pinned.** The model's embed_dim, num_layers, and head_dim come from defaults in `src/config.rs`. If you want to change the architecture, modify those defaults. The training command does NOT pass these as CLI args, so your config.rs changes will take effect.
 
 ## What To Do
 

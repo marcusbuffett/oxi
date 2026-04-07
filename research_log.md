@@ -21,3 +21,5 @@
 | 1 | Scale factorized policy logits by 1/sqrt(embed_dim) | 0.929811 (top1=0.4842, wdl=0.6710, aux=0.5506) | -0.0161 (top1=-0.0094, wdl=-0.0113, aux=-0.0056) | ❌ |
 | 2 | Composite plateau loss prevents premature LR reduction | 0.940459 (top1=0.4860, wdl=0.6881, aux=0.5518) | -0.0055 (top1=-0.0075, wdl=+0.0058, aux=-0.0045) | ❌ |
 | 3 | Connect value_weights to value loss computation | 0.935877 (top1=0.4879, wdl=0.6759, aux=0.5501) | -0.0101 (top1=-0.0056, wdl=-0.0064, aux=-0.0062) | ❌ |
+| 4 | Increase attention heads from 6 to 8 | 0.870675 (top1=0.4296, wdl=0.6784, aux=0.5093) | -0.0753 (top1=-0.0639, wdl=-0.0039, aux=-0.0470) | ❌ |
+| 5 | [ERROR x5] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | — | ⚠️ |

@@ -38,7 +38,7 @@ The research loop (`research_loop.py`) spawns subagents to propose code changes,
 | `--log-gradient-breakdown` | yes | no |
 | Training duration | 3600s per seed × 2 seeds (killed via SIGKILL) | unlimited |
 
-**Architecture is NOT pinned via CLI.** The model's `embed_dim`, `num_layers`, and `num_heads` come from defaults in `src/config.rs` (currently 192, 12, 6). If you want to change the architecture, modify those defaults directly. The training command does not pass `--embed-dim`, `--num-layers`, or `--num-heads`.
+**Architecture is NOT pinned via CLI.** The model's `embed_dim`, `num_layers`, and `head_dim` come from defaults in `src/config.rs` (currently 192, 12, 24). If you want to change the architecture, modify those defaults directly. The training command does not pass `--embed-dim`, `--num-layers`, or `--head-dim`.
 
 Everything else uses code defaults. The training command is:
 ```
@@ -216,7 +216,7 @@ Multi-head attention with dynamic position-dependent bias:
 
 The weight_gen linear is shared across all transformer layers. Initialized with 0.01 std to keep initial biases small.
 
-Research config Smolgen dimensions: `smolgen_hidden=24, smolgen_global_dim=128, smolgen_gen_size=128`.
+Smolgen dimensions are derived from model geometry: `smolgen_hidden=head_dim` (24), `smolgen_global_dim=embed_dim/3` (64), `smolgen_gen_size=embed_dim/4` (48). These are not independently configurable.
 
 #### SwiGLU MLP
 
@@ -675,11 +675,9 @@ The test pools per-step composite score arrays across both seeds, then compares 
 # Architecture
 embed_dim               = 384          # ⚠️ RESEARCH: 192
 num_layers              = 24           # ⚠️ RESEARCH: 12
-num_heads               = 8
+head_dim                = 24           # num_heads = embed_dim / head_dim
 conv_layers             = 0
-smolgen_hidden          = 24
-smolgen_global_dim      = 128
-smolgen_gen_size        = 128
+# smolgen dims are derived: hidden=head_dim, global=embed_dim/3, gen=embed_dim/4
 value_tower_layers      = 2
 
 # Training

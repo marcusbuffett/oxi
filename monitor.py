@@ -289,8 +289,8 @@ def render(run_dir: Path, window: int, smooth_k: int, best_ever: dict) -> None:
     # ------------------------------------------------------------------
     # Load comparison run data (x-axis = times, clipped to [min_time, max_time])
     # ------------------------------------------------------------------
-    base = run_dir.parent
-    cmp_dir = find_best_comparison_run(base, run_dir)
+    cmp_base = Path(__file__).parent / "research_runs"
+    cmp_dir = find_best_comparison_run(cmp_base, run_dir)
     cmp_metrics = cmp_dir / "metrics_logs" if cmp_dir else None
 
     def load_cmp(name, min_t, max_t):

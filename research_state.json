@@ -25,6 +25,18 @@
       "title": "Connect value_weights to value loss computation",
       "ao": 0.9358771623350001,
       "status": "discarded"
+    },
+    {
+      "iter": 4,
+      "title": "Increase attention heads from 6 to 8",
+      "ao": 0.8706746309050001,
+      "status": "discarded"
+    },
+    {
+      "iter": 5,
+      "title": "[ERROR] Bridge request failed: <urlopen error [Errno 61] C",
+      "ao": 0.0,
+      "status": "error"
     }
   ],
   "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_0",
