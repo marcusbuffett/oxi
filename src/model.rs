@@ -876,7 +876,7 @@ impl<B: Backend> OXIModel<B> {
                         let abs_error = (policy_expected_cp_values[idx]
                             - target_cp_values.get(idx).copied().unwrap_or(0.0))
                         .abs();
-                        let bounded = (1.0 - (abs_error.min(200.0) / 200.0)).max(0.0);
+                        let bounded = (-abs_error / 15.0f32).exp();
                         total_score += bounded;
                         total_count += 1;
                     }

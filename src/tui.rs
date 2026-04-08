@@ -240,6 +240,7 @@ struct TuiApp {
     metric_groups: Vec<MetricGroup>,
     group_lookup: HashMap<String, usize>,
     series_lookup: HashMap<String, (usize, usize)>,
+    display_order: Vec<usize>,
     selected: usize,
     expanded: bool,
     should_exit: bool,
@@ -256,6 +257,7 @@ impl TuiApp {
             metric_groups: Vec::new(),
             group_lookup: HashMap::new(),
             series_lookup: HashMap::new(),
+            display_order: Vec::new(),
             selected: 0,
             expanded: false,
             should_exit: false,
@@ -330,6 +332,7 @@ impl TuiApp {
                 base_name.clone(),
                 split.clone(),
             ));
+            self.rebuild_display_order();
             index
         };
 
@@ -351,8 +354,8 @@ impl TuiApp {
 
             self.dirty = true;
 
-            if self.selected >= self.metric_groups.len() {
-                self.selected = self.metric_groups.len().saturating_sub(1);
+            if self.selected >= self.display_count() {
+                self.selected = self.display_count().saturating_sub(1);
             }
             return;
         }
@@ -403,9 +406,29 @@ impl TuiApp {
 
         self.dirty = true;
 
-        if self.selected >= self.metric_groups.len() {
-            self.selected = self.metric_groups.len().saturating_sub(1);
+        if self.selected >= self.display_count() {
+            self.selected = self.display_count().saturating_sub(1);
         }
+    }
+
+    fn rebuild_display_order(&mut self) {
+        self.display_order = (0..self.metric_groups.len()).collect();
+        self.display_order.sort_by_key(|&idx| {
+            let group = &self.metric_groups[idx];
+            metric_display_priority(&group.name, &group.split)
+        });
+    }
+
+    /// Map from display position to internal group index.
+    fn display_index(&self, display_pos: usize) -> usize {
+        self.display_order
+            .get(display_pos)
+            .copied()
+            .unwrap_or(display_pos)
+    }
+
+    fn display_count(&self) -> usize {
+        self.display_order.len()
     }
 
     fn request_exit_confirmation(&mut self) {
@@ -447,20 +470,20 @@ impl TuiApp {
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if !self.metric_groups.is_empty() && self.selected > 0 {
+                if !self.display_order.is_empty() && self.selected > 0 {
                     self.selected -= 1;
                     self.dirty = true;
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if self.selected + 1 < self.metric_groups.len() {
+                if self.selected + 1 < self.display_count() {
                     self.selected += 1;
                     self.dirty = true;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if !self.metric_groups.is_empty() {
-                    let cols = grid_columns(self.metric_groups.len());
+                if !self.display_order.is_empty() {
+                    let cols = grid_columns(self.display_count());
                     if self.selected >= cols {
                         self.selected -= cols;
                         self.dirty = true;
@@ -468,17 +491,17 @@ impl TuiApp {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.metric_groups.is_empty() {
-                    let cols = grid_columns(self.metric_groups.len());
+                if !self.display_order.is_empty() {
+                    let cols = grid_columns(self.display_count());
                     let next = self.selected + cols;
-                    if next < self.metric_groups.len() {
+                    if next < self.display_count() {
                         self.selected = next;
                         self.dirty = true;
                     }
                 }
             }
             KeyCode::Char(' ') => {
-                if !self.metric_groups.is_empty() {
+                if !self.display_order.is_empty() {
                     self.expanded = !self.expanded;
                     self.dirty = true;
                 }
@@ -510,7 +533,7 @@ impl TuiApp {
     }
 
     fn draw_grid(&self, frame: &mut Frame, area: Rect) {
-        if self.metric_groups.is_empty() {
+        if self.display_order.is_empty() {
             let block = Block::default()
                 .title("Metrics")
                 .borders(Borders::ALL)
@@ -528,7 +551,7 @@ impl TuiApp {
             return;
         }
 
-        let count = self.metric_groups.len();
+        let count = self.display_count();
         let cols = grid_columns(count);
         let rows = (count + cols - 1) / cols;
 
@@ -540,9 +563,9 @@ impl TuiApp {
             .constraints(row_constraints)
             .split(area);
 
-        let mut index = 0;
+        let mut display_pos = 0;
         for &row_area in row_chunks.iter() {
-            if index >= count {
+            if display_pos >= count {
                 break;
             }
             let col_constraints = (0..cols)
@@ -554,17 +577,19 @@ impl TuiApp {
                 .split(row_area);
 
             for &col_area in col_chunks.iter() {
-                if index >= count {
+                if display_pos >= count {
                     break;
                 }
-                self.draw_chart(frame, col_area, index, false);
-                index += 1;
+                let group_idx = self.display_index(display_pos);
+                let is_selected = display_pos == self.selected;
+                self.draw_chart(frame, col_area, group_idx, false, is_selected);
+                display_pos += 1;
             }
         }
     }
 
     fn draw_expanded(&self, frame: &mut Frame, area: Rect) {
-        if self.metric_groups.is_empty() {
+        if self.display_order.is_empty() {
             self.draw_grid(frame, area);
             return;
         }
@@ -585,30 +610,47 @@ impl TuiApp {
             .constraints([main_width, details_width])
             .split(area);
 
-        self.draw_chart(frame, chunks[0], self.selected, true);
+        let group_idx = self.display_index(self.selected);
+        self.draw_chart(frame, chunks[0], group_idx, true, true);
 
         if chunks.len() > 1 && chunks[1].width > 0 {
-            self.draw_details(frame, chunks[1], self.selected);
+            self.draw_details(frame, chunks[1], group_idx);
         }
     }
 
-    fn draw_chart(&self, frame: &mut Frame, area: Rect, index: usize, expanded: bool) {
+    fn draw_chart(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        index: usize,
+        expanded: bool,
+        is_selected: bool,
+    ) {
         if index >= self.metric_groups.len() {
             return;
         }
         match self.metric_groups[index].kind {
-            MetricGroupKind::Line => self.draw_line_chart(frame, area, index, expanded),
+            MetricGroupKind::Line => {
+                self.draw_line_chart(frame, area, index, expanded, is_selected)
+            }
             MetricGroupKind::Bar => {
                 if self.metric_groups[index].predictions.is_some() {
-                    self.draw_prediction_bars(frame, area, index, expanded);
+                    self.draw_prediction_bars(frame, area, index, expanded, is_selected);
                 } else {
-                    self.draw_bar_chart(frame, area, index, expanded);
+                    self.draw_bar_chart(frame, area, index, expanded, is_selected);
                 }
             }
         }
     }
 
-    fn draw_line_chart(&self, frame: &mut Frame, area: Rect, index: usize, expanded: bool) {
+    fn draw_line_chart(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        index: usize,
+        expanded: bool,
+        is_selected: bool,
+    ) {
         if index >= self.metric_groups.len() {
             return;
         }
@@ -645,7 +687,7 @@ impl TuiApp {
             .title(group.display_name())
             .borders(Borders::ALL);
 
-        if index == self.selected {
+        if is_selected {
             block = block.border_style(
                 Style::default()
                     .fg(if expanded { Color::Yellow } else { Color::Cyan })
@@ -712,7 +754,14 @@ impl TuiApp {
         frame.render_widget(chart, area);
     }
 
-    fn draw_bar_chart(&self, frame: &mut Frame, area: Rect, index: usize, expanded: bool) {
+    fn draw_bar_chart(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        index: usize,
+        expanded: bool,
+        is_selected: bool,
+    ) {
         if index >= self.metric_groups.len() {
             return;
         }
@@ -722,7 +771,7 @@ impl TuiApp {
             .title(group.display_name())
             .borders(Borders::ALL);
 
-        if index == self.selected {
+        if is_selected {
             block = block.border_style(
                 Style::default()
                     .fg(if expanded { Color::Yellow } else { Color::Cyan })
@@ -793,7 +842,14 @@ impl TuiApp {
         frame.render_widget(chart, area);
     }
 
-    fn draw_prediction_bars(&self, frame: &mut Frame, area: Rect, index: usize, expanded: bool) {
+    fn draw_prediction_bars(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        index: usize,
+        expanded: bool,
+        is_selected: bool,
+    ) {
         if index >= self.metric_groups.len() {
             return;
         }
@@ -803,7 +859,7 @@ impl TuiApp {
             .title(group.display_name())
             .borders(Borders::ALL);
 
-        if index == self.selected {
+        if is_selected {
             block = block.border_style(
                 Style::default()
                     .fg(if expanded { Color::Yellow } else { Color::Cyan })
@@ -1193,6 +1249,66 @@ fn grid_columns(count: usize) -> usize {
     cols.max(1)
 }
 
+/// Returns a sort key for metric display order.
+/// Lower values appear first. Groups:
+///   0xx - Losses (total, policy, value, aux)
+///   1xx - Accuracy metrics (top-1, top-5, WDL, puzzle, elo/stage breakdowns)
+///   2xx - Calibration metrics
+///   3xx - Training diagnostics (gradient norm, learning rate, iteration speed)
+///   9xx - Unknown / other
+fn metric_display_priority(base_name: &str, split: &MetricSplit) -> u32 {
+    // Split prefix: train < valid < test
+    let split_offset = match split {
+        MetricSplit::Train => 0,
+        MetricSplit::Valid => 10000,
+        MetricSplit::Test(_) => 20000,
+    };
+
+    let name_lower = base_name.to_lowercase();
+
+    let priority = if name_lower == "loss" || name_lower == "total loss" {
+        0
+    } else if name_lower.contains("policy") && name_lower.contains("loss") {
+        10
+    } else if name_lower.contains("value") && name_lower.contains("loss") {
+        20
+    } else if name_lower == "aux loss" {
+        30
+    } else if name_lower.contains("aux") && name_lower.contains("loss") {
+        40
+    } else if name_lower.contains("move top-1 accuracy by elo") {
+        110
+    } else if name_lower.contains("move top-1 accuracy by game stage") {
+        120
+    } else if name_lower.contains("move top-1") || name_lower.contains("top-1") {
+        100
+    } else if name_lower.contains("move top-5") || name_lower.contains("top-5") {
+        130
+    } else if name_lower.contains("wdl") {
+        140
+    } else if name_lower.contains("puzzle") {
+        150
+    } else if name_lower.contains("aux") && name_lower.contains("accuracy") {
+        160
+    } else if name_lower.contains("aux") && name_lower.contains("mae") {
+        170
+    } else if name_lower.contains("cp loss calibration by elo") || name_lower.contains("centipawn") && name_lower.contains("by elo") {
+        210
+    } else if name_lower.contains("centipawn") || name_lower.contains("calibration") {
+        200
+    } else if name_lower.contains("gradient") || name_lower.contains("grad norm") {
+        300
+    } else if name_lower.contains("learning rate") || name_lower == "lr" {
+        310
+    } else if name_lower.contains("iteration speed") {
+        320
+    } else {
+        900
+    };
+
+    split_offset + priority
+}
+
 fn split_metric_name(name: &str) -> (String, Option<String>) {
     if let Some((base, series)) = name.split_once('|') {
         (base.trim().to_string(), Some(series.trim().to_string()))
@@ -1214,9 +1330,41 @@ const COLOR_PALETTE: [Color; 10] = [
     Color::LightBlue,
 ];
 
+/// Fixed colors for well-known series labels (elo bands, game stages, etc.)
+fn fixed_series_color(label: &str) -> Option<Color> {
+    match label {
+        // Elo bands - consistent warm-to-cool gradient
+        "Beginner" => Some(Color::Green),
+        "Intermediate" => Some(Color::Yellow),
+        "Advanced" => Some(Color::Cyan),
+        "Expert" => Some(Color::Magenta),
+        // Game stages
+        "Opening" => Some(Color::LightCyan),
+        "Middlegame" => Some(Color::Yellow),
+        "Endgame" => Some(Color::LightMagenta),
+        // Aux heads
+        "Mobility" => Some(Color::Cyan),
+        "Material" => Some(Color::Yellow),
+        // Aux square heads
+        "From Sq" => Some(Color::LightCyan),
+        "To Sq" => Some(Color::LightYellow),
+        "Side Info" => Some(Color::LightGreen),
+        // Calibration
+        "Policy MAE" => Some(Color::Cyan),
+        "Head MAE" => Some(Color::Yellow),
+        "Head CE" => Some(Color::Magenta),
+        "Labeled Fraction" => Some(Color::Green),
+        "Overall" => Some(Color::LightCyan),
+        _ => None,
+    }
+}
+
 fn assign_series_color(group: &MetricGroup, label: &str) -> Color {
     if label.is_empty() {
         return Color::White;
+    }
+    if let Some(color) = fixed_series_color(label) {
+        return color;
     }
     let mut index = (stable_hash(label) % COLOR_PALETTE.len() as u64) as usize;
     for _ in 0..COLOR_PALETTE.len() {

@@ -3191,9 +3191,11 @@ where
 
         let t_misc = Instant::now();
         let iteration_speed_entry = iteration_speed_metric.update(&output.adapt(), &metadata);
-        renderer.update_train(MetricState::Generic {
+        let iteration_speed_value = Numeric::value(&iteration_speed_metric);
+        renderer.update_train(MetricState::Numeric {
             name: iteration_speed_metric.name().to_string(),
             entry: iteration_speed_entry,
+            value: iteration_speed_value,
         });
 
         let lr_plateau_input = LrPlateauInput::new(

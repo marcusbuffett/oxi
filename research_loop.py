@@ -39,9 +39,7 @@ WEIGHT_TOP1 = 1.0
 WEIGHT_WDL = 0.5
 WEIGHT_AUX = 0.2
 WEIGHT_CALIBRATION = 0.4
-CALIBRATION_MIN_LABELED_FRACTION = 0.05
-CALIBRATION_TARGET_FRACTION = 0.10
-CALIBRATION_MIN_VALID_STEPS = 20
+CALIBRATION_MIN_LABELED_FRACTION = 0.01
 
 # Acceptance: block bootstrap p-value + Cohen's d
 BOOTSTRAP_SAMPLES = 5000
@@ -102,23 +100,11 @@ def load_composite_array(log_dir):
     if not common:
         return np.array([])
 
-    valid_calibration_steps = {
-        step for step in common
-        if labeled_fraction_map.get(step, 0.0) >= CALIBRATION_MIN_LABELED_FRACTION
-        and step in calibration_map
-    }
-    if valid_calibration_steps:
-        mean_labeled_fraction = float(np.mean([labeled_fraction_map[s] for s in valid_calibration_steps]))
-        coverage_factor = min(1.0, len(valid_calibration_steps) / CALIBRATION_MIN_VALID_STEPS) * min(
-            1.0, mean_labeled_fraction / CALIBRATION_TARGET_FRACTION
-        )
-    else:
-        coverage_factor = 0.0
-
     values = []
     for s in common:
         aux = (from_map[s] + to_map[s]) / 2.0
-        calibration = calibration_map.get(s, 0.0) * coverage_factor
+        labeled = labeled_fraction_map.get(s, 0.0)
+        calibration = calibration_map.get(s, 0.0) if labeled >= CALIBRATION_MIN_LABELED_FRACTION else 0.0
         score = (
             WEIGHT_TOP1 * top1_map[s]
             + WEIGHT_WDL * normalize_wdl(wdl_map[s])
@@ -144,15 +130,14 @@ def parse_composite_score(log_dir):
     aux = (aux_from + aux_to) / 2.0
     calibration = parse_metric_log(log_dir, "cp_loss_calibration_overall")
     labeled_fraction = parse_metric_log(log_dir, "cp_loss_labeled_fraction")
-    calibration_coverage = min(1.0, labeled_fraction / CALIBRATION_TARGET_FRACTION) if labeled_fraction >= CALIBRATION_MIN_LABELED_FRACTION else 0.0
-    calibration_weighted = calibration * calibration_coverage
-    score = WEIGHT_TOP1 * top1 + WEIGHT_WDL * wdl + WEIGHT_AUX * aux + WEIGHT_CALIBRATION * calibration_weighted
+    if labeled_fraction < CALIBRATION_MIN_LABELED_FRACTION:
+        calibration = 0.0
+    score = WEIGHT_TOP1 * top1 + WEIGHT_WDL * wdl + WEIGHT_AUX * aux + WEIGHT_CALIBRATION * calibration
     components = {
         "top1": top1,
         "wdl": wdl,
         "aux": aux,
         "calibration": calibration,
-        "calibration_cov": calibration_coverage,
     }
     return score, components
 
@@ -245,8 +230,7 @@ def compile_check():
 def format_components(components):
     return (
         f"(top1={components['top1']:.4f}, wdl={components['wdl']:.4f}, "
-        f"aux={components['aux']:.4f}, cal={components['calibration']:.4f}, "
-        f"cal_cov={components['calibration_cov']:.4f})"
+        f"aux={components['aux']:.4f}, cal={components['calibration']:.4f})"
     )
 
 
@@ -528,7 +512,7 @@ def main():
 
             best_comps = state.get(
                 "best_components",
-                {"top1": 0.0, "wdl": 0.0, "aux": 0.0, "calibration": 0.0, "calibration_cov": 0.0},
+                {"top1": 0.0, "wdl": 0.0, "aux": 0.0, "calibration": 0.0},
             )
 
             iter_dir = AUTORESEARCH_DIR / str(i)
@@ -549,10 +533,9 @@ Components:
 - **top1_accuracy** (weight {WEIGHT_TOP1}): Policy head move prediction accuracy (0-1).
 - **wdl_accuracy** (weight {WEIGHT_WDL:.4f}): Win/draw/loss prediction accuracy (0-1, normalized if logged as percentages).
 - **aux_accuracy** (weight {WEIGHT_AUX}): Average of from-square and to-square auxiliary head accuracy (0-1).
-- **calibration** (weight {WEIGHT_CALIBRATION:.4f}): `cp_loss_calibration_overall`, coverage-gated by `cp_loss_labeled_fraction`. This rewards matching the human centipawn-loss profile, not just predicting the exact move.
+- **calibration** (weight {WEIGHT_CALIBRATION:.4f}): `cp_loss_calibration_overall` — computed as `exp(-abs_cpl_error / 15)`, so it's very sensitive to centipawn-loss accuracy. This rewards matching the human centipawn-loss profile, not just predicting the exact move.
 
 Important calibration details:
-- Calibration only counts when labeled coverage is high enough. Runs with sparse calibration labels get little or no calibration credit.
 - The main human-facing diagnostics are the signed Elo-band CPL calibration metrics, but the loop score uses the bounded overall calibration metric.
 - A change that improves top-1 while harming human-strength calibration can lose overall.
 

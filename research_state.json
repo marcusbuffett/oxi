@@ -1,50 +1,49 @@
 {
-  "best_score": 1.116929964368375,
-  "baseline_score": 4.11824348721,
+  "best_score": 1.082571,
+  "baseline_score": 1.000508,
   "results": [
     {
       "iter": 0,
       "title": "Value tower mean-pool skip connection",
-      "ao": 1.08775010452076,
+      "ao": 1.046771,
       "status": "kept"
     },
     {
       "iter": 1,
       "title": "Lower LR plateau threshold 0.8% to 0.5%",
-      "ao": 1.116929964368375,
+      "ao": 1.082571,
       "status": "kept"
     },
     {
       "iter": 2,
       "title": "Fix GradNorm bootstrap stuck on missing calibration probes",
-      "ao": 1.1037582906554688,
+      "ao": 1.059239,
       "status": "discarded"
     },
     {
       "iter": 3,
       "title": "Raise GradNorm weight floor to prevent aux/cal starvation",
-      "ao": 1.1049573723327655,
+      "ao": 1.075259,
       "status": "discarded"
     },
     {
       "iter": 4,
       "title": "Disable broken GradNorm to eliminate probe overhead",
-      "ao": 1.070749624829113,
+      "ao": 1.055493,
       "status": "discarded"
     },
     {
       "iter": 5,
       "title": "Lower LR plateau threshold from 0.5% to 0.3%",
-      "ao": 1.1067940671451408,
+      "ao": 1.076957,
       "status": "discarded"
     }
   ],
   "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_1",
   "best_components": {
-    "top1": 0.4607876492,
-    "wdl": 0.70958984375,
-    "aux": 0.52398437485,
-    "calibration": 0.9304166495,
-    "calibration_cov": 0.5281250030000001
+    "top1": 0.4608,
+    "wdl": 0.7096,
+    "aux": 0.524,
+    "calibration": 0.4055
   }
 }
