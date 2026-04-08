@@ -23,3 +23,25 @@
 | 3 | Connect value_weights to value loss computation | 0.935877 (top1=0.4879, wdl=0.6759, aux=0.5501) | -0.0101 (top1=-0.0056, wdl=-0.0064, aux=-0.0062) | ❌ |
 | 4 | Increase attention heads from 6 to 8 | 0.870675 (top1=0.4296, wdl=0.6784, aux=0.5093) | -0.0753 (top1=-0.0639, wdl=-0.0039, aux=-0.0470) | ❌ |
 | 5 | [ERROR x5] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | — | ⚠️ |
+
+---
+
+**Research Loop Reset (2026-04-07):**
+The scoring regime has changed and previous baseline scores are no longer directly comparable.
+
+What changed:
+- Training now includes Stockfish-backed centipawn-loss calibration on labeled human positions.
+- The model has a new CPL auxiliary head, but the policy itself is also trained against policy-implied expected CPL.
+- New calibration metrics are logged, including:
+  `cp_loss_calibration_overall`
+  `cp_loss_labeled_fraction`
+  `cp_loss_calibration_beginner`
+  `cp_loss_calibration_intermediate`
+  `cp_loss_calibration_expert`
+- `research_loop.py` now includes calibration in its composite score, with coverage gating based on labeled fraction so sparse calibration batches do not dominate.
+
+State reset performed:
+- removed `research_state.json`
+- removed `research_runs/baseline`
+
+The next research-loop baseline should be treated as the start of a new series under the calibration-aware objective.

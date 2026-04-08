@@ -39,6 +39,10 @@ METRIC_WINDOW = 100
 WEIGHT_TOP1 = 1.0
 WEIGHT_WDL = 0.5
 WEIGHT_AUX = 0.2
+WEIGHT_CALIBRATION = 0.4
+CALIBRATION_MIN_LABELED_FRACTION = 0.05
+CALIBRATION_TARGET_FRACTION = 0.10
+CALIBRATION_MIN_VALID_STEPS = 20
 
 # Acceptance: block bootstrap p-value + Cohen's d
 BOOTSTRAP_SAMPLES = 5000
@@ -92,15 +96,36 @@ def load_composite_array(log_dir):
     wdl_map  = load_map("wdl_accuracy")
     from_map = load_map("aux_from_square_accuracy")
     to_map   = load_map("aux_to_square_accuracy")
+    calibration_map = load_map("cp_loss_calibration_overall")
+    labeled_fraction_map = load_map("cp_loss_labeled_fraction")
 
     common = sorted(set(top1_map) & set(wdl_map) & set(from_map) & set(to_map))
     if not common:
         return np.array([])
 
+    valid_calibration_steps = {
+        step for step in common
+        if labeled_fraction_map.get(step, 0.0) >= CALIBRATION_MIN_LABELED_FRACTION
+        and step in calibration_map
+    }
+    if valid_calibration_steps:
+        mean_labeled_fraction = float(np.mean([labeled_fraction_map[s] for s in valid_calibration_steps]))
+        coverage_factor = min(1.0, len(valid_calibration_steps) / CALIBRATION_MIN_VALID_STEPS) * min(
+            1.0, mean_labeled_fraction / CALIBRATION_TARGET_FRACTION
+        )
+    else:
+        coverage_factor = 0.0
+
     values = []
     for s in common:
         aux = (from_map[s] + to_map[s]) / 2.0
-        score = WEIGHT_TOP1 * top1_map[s] + WEIGHT_WDL * normalize_wdl(wdl_map[s]) + WEIGHT_AUX * aux
+        calibration = calibration_map.get(s, 0.0) * coverage_factor
+        score = (
+            WEIGHT_TOP1 * top1_map[s]
+            + WEIGHT_WDL * normalize_wdl(wdl_map[s])
+            + WEIGHT_AUX * aux
+            + WEIGHT_CALIBRATION * calibration
+        )
         values.append(score)
 
     arr = np.array(values)
@@ -118,8 +143,18 @@ def parse_composite_score(log_dir):
     aux_from = parse_metric_log(log_dir, "aux_from_square_accuracy")
     aux_to = parse_metric_log(log_dir, "aux_to_square_accuracy")
     aux = (aux_from + aux_to) / 2.0
-    score = WEIGHT_TOP1 * top1 + WEIGHT_WDL * wdl + WEIGHT_AUX * aux
-    components = {"top1": top1, "wdl": wdl, "aux": aux}
+    calibration = parse_metric_log(log_dir, "cp_loss_calibration_overall")
+    labeled_fraction = parse_metric_log(log_dir, "cp_loss_labeled_fraction")
+    calibration_coverage = min(1.0, labeled_fraction / CALIBRATION_TARGET_FRACTION) if labeled_fraction >= CALIBRATION_MIN_LABELED_FRACTION else 0.0
+    calibration_weighted = calibration * calibration_coverage
+    score = WEIGHT_TOP1 * top1 + WEIGHT_WDL * wdl + WEIGHT_AUX * aux + WEIGHT_CALIBRATION * calibration_weighted
+    components = {
+        "top1": top1,
+        "wdl": wdl,
+        "aux": aux,
+        "calibration": calibration,
+        "calibration_cov": calibration_coverage,
+    }
     return score, components
 
 
@@ -209,7 +244,11 @@ def compile_check():
 
 
 def format_components(components):
-    return f"(top1={components['top1']:.4f}, wdl={components['wdl']:.4f}, aux={components['aux']:.4f})"
+    return (
+        f"(top1={components['top1']:.4f}, wdl={components['wdl']:.4f}, "
+        f"aux={components['aux']:.4f}, cal={components['calibration']:.4f}, "
+        f"cal_cov={components['calibration_cov']:.4f})"
+    )
 
 
 def format_delta(score, components, prev_score, prev_components):
@@ -217,7 +256,8 @@ def format_delta(score, components, prev_score, prev_components):
     dt = components['top1'] - prev_components['top1']
     dw = components['wdl'] - prev_components['wdl']
     da = components['aux'] - prev_components['aux']
-    return f"{ds:+.4f} (top1={dt:+.4f}, wdl={dw:+.4f}, aux={da:+.4f})"
+    dc = components['calibration'] - prev_components['calibration']
+    return f"{ds:+.4f} (top1={dt:+.4f}, wdl={dw:+.4f}, aux={da:+.4f}, cal={dc:+.4f})"
 
 
 def build_binary():
