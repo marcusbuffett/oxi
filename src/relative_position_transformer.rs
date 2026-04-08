@@ -188,7 +188,6 @@ impl<B: Backend> TransformerBlock<B> {
 
         output
     }
-
 }
 
 /// SwiGLU MLP with fused gate+up projection for memory efficiency.

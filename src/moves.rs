@@ -129,7 +129,9 @@ pub fn get_side_info(pos: &Chess, uci_move: &str) -> Vec<i32> {
     let mut side_info = vec![0i32; 141];
 
     match &mv {
-        Move::Normal { from, to, capture, .. } => {
+        Move::Normal {
+            from, to, capture, ..
+        } => {
             // Moving piece type
             if let Some(piece) = pos.board().piece_at(*from) {
                 let piece_idx = match piece.role {
@@ -188,7 +190,11 @@ pub fn get_side_info(pos: &Chess, uci_move: &str) -> Vec<i32> {
             // Use king's from/to for the squares (king is the primary piece)
             let from_sq = king.file() as usize * 8 + king.rank() as usize;
             // Determine king's destination based on rook position
-            let to_file = if rook.file() as usize > king.file() as usize { 6 } else { 2 };
+            let to_file = if rook.file() as usize > king.file() as usize {
+                6
+            } else {
+                2
+            };
             let to_sq = to_file * 8 + king.rank() as usize;
             side_info[13 + from_sq] = 1;
             side_info[13 + 64 + to_sq] = 1;

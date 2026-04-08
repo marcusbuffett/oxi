@@ -42,13 +42,13 @@ use crate::gradnorm::{GradNormProbeResult, GradNormState, GradNormTask};
 use crate::lr_plateau_metric::{LrPlateauInput, LrPlateauMetric};
 use crate::model::OXIModel;
 use crate::move_accuracy_metric::MoveTopKAccuracyMetric;
-use crate::pgn_processor::process_pgn_directory_iter;
 use crate::pgn_processor::process_tcec_directory_iter;
 use crate::policy_loss_metric::{PolicyLossInput, PolicyLossMetric};
 use crate::puzzle_processor::{process_puzzle_file_iter, MixedExampleIterator};
 use crate::reduce_on_plateau_scheduler::ReduceOnPlateauScheduler;
 use crate::time_usage_loss_metric::{TimeUsageLossInput, TimeUsageLossMetric};
 use crate::training_stage_metric::{TrainingStage, TrainingStageInput, TrainingStageMetric};
+use crate::training_stream::build_human_training_stream;
 use crate::tui::OxiTuiRenderer;
 use crate::value_loss_metric::{ValueLossInput, ValueLossMetric};
 use crate::wdl_accuracy_metric::WdlAccuracyMetric;
@@ -422,6 +422,7 @@ struct GradNormWeights {
     value: f32,
     time: f32,
     aux: f32,
+    calibration: f32,
 }
 
 impl GradNormWeights {
@@ -431,6 +432,7 @@ impl GradNormWeights {
             value: state.weight_for(GradNormTask::Value),
             time: state.weight_for(GradNormTask::TimeUsage),
             aux: state.weight_for(GradNormTask::Auxiliary),
+            calibration: state.weight_for(GradNormTask::Calibration),
         }
     }
 
@@ -441,6 +443,7 @@ impl GradNormWeights {
             value: state.weight_for(GradNormTask::Value),
             time: 0.0,
             aux: 0.0,
+            calibration: 0.0,
         }
     }
 }
@@ -452,10 +455,12 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         value_loss: output.value_loss.to_device(device),
         time_usage_loss: output.time_usage_loss.to_device(device),
         aux_loss: output.aux_loss.to_device(device),
+        calibration_loss: output.calibration_loss.to_device(device),
         base_policy_loss: output.base_policy_loss.to_device(device),
         base_value_loss: output.base_value_loss.to_device(device),
         base_time_usage_loss: output.base_time_usage_loss.to_device(device),
         base_aux_loss: output.base_aux_loss.to_device(device),
+        base_calibration_loss: output.base_calibration_loss.to_device(device),
         policy_output: output.policy_output.to_device(device),
         policy_targets: output.policy_targets.to_device(device),
         value_output: output.value_output.to_device(device),
@@ -478,6 +483,12 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         aux_to_square_loss: output.aux_to_square_loss,
         aux_from_square_accuracy: output.aux_from_square_accuracy,
         aux_to_square_accuracy: output.aux_to_square_accuracy,
+        calibration_head_loss: output.calibration_head_loss,
+        calibration_policy_mae: output.calibration_policy_mae,
+        calibration_head_mae: output.calibration_head_mae,
+        calibration_labeled_fraction: output.calibration_labeled_fraction,
+        calibration_overall_score: output.calibration_overall_score,
+        calibration_policy_signed_error_by_elo: output.calibration_policy_signed_error_by_elo,
     }
     .detach()
 }
@@ -490,10 +501,12 @@ fn apply_gradnorm_weights_to_output<B: Backend>(
     output.value_loss = output.base_value_loss.clone() * weights.value;
     output.time_usage_loss = output.base_time_usage_loss.clone() * weights.time;
     output.aux_loss = output.base_aux_loss.clone() * weights.aux;
+    output.calibration_loss = output.base_calibration_loss.clone() * weights.calibration;
     output.loss = output.policy_loss.clone()
         + output.value_loss.clone()
         + output.time_usage_loss.clone()
-        + output.aux_loss.clone();
+        + output.aux_loss.clone()
+        + output.calibration_loss.clone();
 }
 
 fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -> ChessOutput<B> {
@@ -508,10 +521,12 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_value_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_time_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_aux_loss = Tensor::<B, 1>::zeros([1], device);
+    let mut sum_calibration_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_policy_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_value_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_time_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_aux_loss = Tensor::<B, 1>::zeros([1], device);
+    let mut sum_base_calibration_loss = Tensor::<B, 1>::zeros([1], device);
 
     let mut sum_aux_mobility_loss = 0.0f32;
     let mut sum_aux_material_loss = 0.0f32;
@@ -522,6 +537,11 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_aux_to_square_loss = 0.0f32;
     let mut sum_aux_from_square_accuracy = 0.0f32;
     let mut sum_aux_to_square_accuracy = 0.0f32;
+    let mut sum_calibration_head_loss = 0.0f32;
+    let mut sum_calibration_policy_mae = 0.0f32;
+    let mut sum_calibration_head_mae = 0.0f32;
+    let mut sum_calibration_labeled_fraction = 0.0f32;
+    let mut sum_calibration_overall_score = 0.0f32;
 
     let all_raw_policy = outputs.iter().all(|o| o.raw_policy_loss.is_some());
     let all_raw_value = outputs.iter().all(|o| o.raw_value_loss.is_some());
@@ -547,6 +567,8 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_value_loss = sum_value_loss + output.value_loss.clone() * batch_scalar;
         sum_time_loss = sum_time_loss + output.time_usage_loss.clone() * batch_scalar;
         sum_aux_loss = sum_aux_loss + output.aux_loss.clone() * batch_scalar;
+        sum_calibration_loss =
+            sum_calibration_loss + output.calibration_loss.clone() * batch_scalar;
 
         sum_base_policy_loss =
             sum_base_policy_loss + output.base_policy_loss.clone() * batch_scalar;
@@ -554,6 +576,8 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_base_time_loss =
             sum_base_time_loss + output.base_time_usage_loss.clone() * batch_scalar;
         sum_base_aux_loss = sum_base_aux_loss + output.base_aux_loss.clone() * batch_scalar;
+        sum_base_calibration_loss =
+            sum_base_calibration_loss + output.base_calibration_loss.clone() * batch_scalar;
 
         sum_aux_mobility_loss += output.aux_mobility_loss * batch_scalar;
         sum_aux_material_loss += output.aux_material_loss * batch_scalar;
@@ -564,6 +588,11 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_aux_to_square_loss += output.aux_to_square_loss * batch_scalar;
         sum_aux_from_square_accuracy += output.aux_from_square_accuracy * batch_scalar;
         sum_aux_to_square_accuracy += output.aux_to_square_accuracy * batch_scalar;
+        sum_calibration_head_loss += output.calibration_head_loss * batch_scalar;
+        sum_calibration_policy_mae += output.calibration_policy_mae * batch_scalar;
+        sum_calibration_head_mae += output.calibration_head_mae * batch_scalar;
+        sum_calibration_labeled_fraction += output.calibration_labeled_fraction * batch_scalar;
+        sum_calibration_overall_score += output.calibration_overall_score * batch_scalar;
 
         if let Some(sum) = sum_raw_policy_loss.as_mut() {
             if let Some(raw) = output.raw_policy_loss.as_ref() {
@@ -598,11 +627,13 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let value_loss = sum_value_loss / total_scalar;
     let time_usage_loss = sum_time_loss / total_scalar;
     let aux_loss = sum_aux_loss / total_scalar;
+    let calibration_loss = sum_calibration_loss / total_scalar;
 
     let base_policy_loss = sum_base_policy_loss / total_scalar;
     let base_value_loss = sum_base_value_loss / total_scalar;
     let base_time_usage_loss = sum_base_time_loss / total_scalar;
     let base_aux_loss = sum_base_aux_loss / total_scalar;
+    let base_calibration_loss = sum_base_calibration_loss / total_scalar;
 
     let raw_policy_loss = sum_raw_policy_loss.map(|sum| sum / total_scalar);
     let raw_value_loss = sum_raw_value_loss.map(|sum| sum / total_scalar);
@@ -615,6 +646,21 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let legal_moves_mask = Tensor::cat(legal_masks, 0);
 
     let uncertainties = outputs.iter().find_map(|output| output.uncertainties);
+    let mut calibration_policy_error_by_elo =
+        std::collections::BTreeMap::<String, (f32, usize)>::new();
+    for output in outputs {
+        for (bucket, signed_error) in &output.calibration_policy_signed_error_by_elo {
+            let entry = calibration_policy_error_by_elo
+                .entry(bucket.clone())
+                .or_insert((0.0, 0));
+            entry.0 += *signed_error;
+            entry.1 += 1;
+        }
+    }
+    let calibration_policy_signed_error_by_elo = calibration_policy_error_by_elo
+        .into_iter()
+        .filter_map(|(bucket, (sum, count))| (count > 0).then_some((bucket, sum / count as f32)))
+        .collect::<Vec<_>>();
 
     ChessOutput {
         loss,
@@ -622,10 +668,12 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         value_loss,
         time_usage_loss,
         aux_loss,
+        calibration_loss,
         base_policy_loss,
         base_value_loss,
         base_time_usage_loss,
         base_aux_loss,
+        base_calibration_loss,
         policy_output,
         policy_targets,
         value_output,
@@ -644,6 +692,12 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         aux_to_square_loss: sum_aux_to_square_loss / total_scalar,
         aux_from_square_accuracy: sum_aux_from_square_accuracy / total_scalar,
         aux_to_square_accuracy: sum_aux_to_square_accuracy / total_scalar,
+        calibration_head_loss: sum_calibration_head_loss / total_scalar,
+        calibration_policy_mae: sum_calibration_policy_mae / total_scalar,
+        calibration_head_mae: sum_calibration_head_mae / total_scalar,
+        calibration_labeled_fraction: sum_calibration_labeled_fraction / total_scalar,
+        calibration_overall_score: sum_calibration_overall_score / total_scalar,
+        calibration_policy_signed_error_by_elo,
     }
     .detach()
 }
@@ -664,6 +718,7 @@ where
         (GradNormTask::Value, weights.value),
         (GradNormTask::TimeUsage, weights.time),
         (GradNormTask::Auxiliary, weights.aux),
+        (GradNormTask::Calibration, weights.calibration),
     ];
 
     for (task, weight) in tasks {
@@ -672,11 +727,15 @@ where
         }
 
         let output = model.forward_classification(batch.clone());
+        if task == GradNormTask::Calibration && output.calibration_labeled_fraction <= 0.0 {
+            continue;
+        }
         let base_loss_tensor = match task {
             GradNormTask::Policy => output.base_policy_loss.clone(),
             GradNormTask::Value => output.base_value_loss.clone(),
             GradNormTask::TimeUsage => output.base_time_usage_loss.clone(),
             GradNormTask::Auxiliary => output.base_aux_loss.clone(),
+            GradNormTask::Calibration => output.base_calibration_loss.clone(),
         };
         let base_loss_value = base_loss_tensor.clone().into_scalar().elem::<f32>();
         // Use base (unweighted) loss for gradient norm measurement.
@@ -902,15 +961,17 @@ struct ShuffleBuffer<I: Iterator<Item = ChessExample>> {
     buffer: Vec<ChessExample>,
     capacity: usize,
     exhausted: bool,
+    shuffle_enabled: bool,
 }
 
 impl<I: Iterator<Item = ChessExample>> ShuffleBuffer<I> {
-    fn new(iter: I, capacity: usize) -> Self {
+    fn new(iter: I, capacity: usize, shuffle_enabled: bool) -> Self {
         Self {
             iter,
             buffer: Vec::with_capacity(capacity),
             capacity,
             exhausted: false,
+            shuffle_enabled,
         }
     }
 
@@ -952,7 +1013,9 @@ impl<I: Iterator<Item = ChessExample>> ShuffleBuffer<I> {
             return Vec::new();
         }
 
-        self.buffer.shuffle(rng);
+        if self.shuffle_enabled {
+            self.buffer.shuffle(rng);
+        }
         let take_count = batch_size.min(self.buffer.len());
         self.buffer.drain(..take_count).collect()
     }
@@ -1612,12 +1675,11 @@ where
 
     // Set up streaming iterator for human games
     let pgn_iter: Box<dyn Iterator<Item = ChessExample>> = if data_path.is_dir() {
-        tracing::info!("Setting up streaming from PGN directory: {:?}", data_path);
         println!(
             "Streaming data from PGN directory: {:?} (shuffle buffer: {})",
             data_path, config.shuffle_buffer_size
         );
-        Box::new(process_pgn_directory_iter(data_path)?)
+        build_human_training_stream(data_path)?
     } else {
         anyhow::bail!(
             "Streaming mode requires a directory path, got file: {:?}",
@@ -1671,15 +1733,18 @@ where
         pgn_iter
     };
 
-    let mut shuffle_buffer = ShuffleBuffer::new(examples_iter, config.shuffle_buffer_size);
+    let shuffle_enabled = !config.disable_training_shuffle.unwrap_or(false);
+    let mut shuffle_buffer =
+        ShuffleBuffer::new(examples_iter, config.shuffle_buffer_size, shuffle_enabled);
 
     println!(
-        "Streaming mode enabled with shuffle buffer size: {}",
-        config.shuffle_buffer_size
+        "Streaming mode enabled with shuffle buffer size: {} (shuffle enabled: {})",
+        config.shuffle_buffer_size, shuffle_enabled
     );
     tracing::info!(
-        "Streaming mode enabled with shuffle buffer size: {}",
-        config.shuffle_buffer_size
+        "Streaming mode enabled with shuffle buffer size: {} (shuffle enabled: {})",
+        config.shuffle_buffer_size,
+        shuffle_enabled
     );
 
     println!("Pre-filling shuffle buffer...");
@@ -1689,6 +1754,16 @@ where
         shuffle_buffer.len(),
         shuffle_buffer.is_exhausted()
     );
+    for (idx, example) in shuffle_buffer.buffer.iter().take(10).enumerate() {
+        tracing::info!(
+            "shuffle_buffer_example[{idx}]: fen={} move={} elo_self={} elo_oppo={} ply={}",
+            example.fen,
+            example.move_uci,
+            example.elo_self,
+            example.elo_oppo,
+            example.move_count
+        );
+    }
     if shuffle_buffer.len() == 0 {
         anyhow::bail!("No examples found in shuffle buffer after initial fill. Check that your data directory contains valid PGN files.");
     }
@@ -2390,6 +2465,21 @@ where
             continue;
         }
 
+        let calibration_labeled_count = items_all
+            .iter()
+            .filter(|item| item.calibration_label.is_some())
+            .count();
+        if iteration < 20 || iteration % 100 == 0 || calibration_labeled_count == 0 {
+            tracing::info!(
+                "calibration_batch_stats: iter={} batch_size={} labeled={} unlabeled={} labeled_fraction={:.4}",
+                iteration,
+                items_all.len(),
+                calibration_labeled_count,
+                items_all.len().saturating_sub(calibration_labeled_count),
+                calibration_labeled_count as f64 / items_all.len().max(1) as f64
+            );
+        }
+
         let current_batch_size = items_all.len();
         items_processed += current_batch_size;
 
@@ -2861,6 +2951,79 @@ where
             metric_logger.log("aux_to_square_accuracy", iteration, to_acc);
         }
 
+        if output.calibration_labeled_fraction > 0.0 {
+            let calibration_policy_mae = output.calibration_policy_mae as f64;
+            let calibration_head_mae = output.calibration_head_mae as f64;
+            let calibration_head_loss = output.calibration_head_loss as f64;
+            let labeled_fraction = output.calibration_labeled_fraction as f64;
+            let calibration_overall_score = output.calibration_overall_score as f64;
+
+            renderer.update_train(MetricState::Numeric {
+                name: "Centipawn Loss Calibration|Policy MAE".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Policy MAE: {calibration_policy_mae:.2} cp"),
+                    format!("{calibration_policy_mae:.4}"),
+                ),
+                value: NumericEntry::Value(calibration_policy_mae),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Centipawn Loss Calibration|Head MAE".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Head MAE: {calibration_head_mae:.2} cp"),
+                    format!("{calibration_head_mae:.4}"),
+                ),
+                value: NumericEntry::Value(calibration_head_mae),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Centipawn Loss Calibration|Head CE".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Head CE: {calibration_head_loss:.4}"),
+                    format!("{calibration_head_loss:.4}"),
+                ),
+                value: NumericEntry::Value(calibration_head_loss),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Centipawn Loss Calibration|Labeled Fraction".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Labeled: {:.1}%", labeled_fraction * 100.0),
+                    format!("{labeled_fraction:.4}"),
+                ),
+                value: NumericEntry::Value(labeled_fraction),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Centipawn Loss Calibration|Overall".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Overall: {calibration_overall_score:.4}"),
+                    format!("{calibration_overall_score:.4}"),
+                ),
+                value: NumericEntry::Value(calibration_overall_score),
+            });
+
+            metric_logger.log("cp_loss_policy_mae", iteration, calibration_policy_mae);
+            metric_logger.log("cp_loss_head_mae", iteration, calibration_head_mae);
+            metric_logger.log("cp_loss_head_ce", iteration, calibration_head_loss);
+            metric_logger.log("cp_loss_labeled_fraction", iteration, labeled_fraction);
+            metric_logger.log(
+                "cp_loss_calibration_overall",
+                iteration,
+                calibration_overall_score,
+            );
+
+            for (bucket, signed_error_cp) in &output.calibration_policy_signed_error_by_elo {
+                let signed_error_cp = (*signed_error_cp as f64).clamp(-200.0, 200.0);
+                renderer.update_train(MetricState::Numeric {
+                    name: format!("CP Loss Calibration By Elo|{bucket}"),
+                    entry: SerializedEntry::new(
+                        format!("{bucket}: {signed_error_cp:+.2} cp"),
+                        format!("{signed_error_cp:.4}"),
+                    ),
+                    value: NumericEntry::Value(signed_error_cp),
+                });
+                let metric_name = format!("cp_loss_calibration_{}", bucket.to_lowercase());
+                metric_logger.log(&metric_name, iteration, signed_error_cp);
+            }
+        }
+
         let t_top1 = Instant::now();
         let _move_top1_entry = move_top1_metric.update(&output.adapt(), &metadata);
         let top1_metric_time = t_top1.elapsed();
@@ -3129,8 +3292,7 @@ where
         // Checkpoint at specified intervals based on items processed
         // Check if we've crossed a checkpoint boundary
         if config.checkpoint_interval > 0
-            && iteration / config.checkpoint_interval
-                > (iteration - 1) / config.checkpoint_interval
+            && iteration / config.checkpoint_interval > (iteration - 1) / config.checkpoint_interval
         {
             tracing::info!(
                 "Saving checkpoint at iteration {} to {}",

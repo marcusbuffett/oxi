@@ -13,6 +13,7 @@ pub enum GradNormTask {
     Value = 1,
     TimeUsage = 2,
     Auxiliary = 3,
+    Calibration = 4,
 }
 
 impl GradNormTask {
@@ -22,6 +23,7 @@ impl GradNormTask {
             GradNormTask::Value,
             GradNormTask::TimeUsage,
             GradNormTask::Auxiliary,
+            GradNormTask::Calibration,
         ]
         .into_iter()
     }
@@ -32,6 +34,7 @@ impl GradNormTask {
             GradNormTask::Value => "value",
             GradNormTask::TimeUsage => "time_usage",
             GradNormTask::Auxiliary => "auxiliary",
+            GradNormTask::Calibration => "calibration",
         }
     }
 }
@@ -132,6 +135,10 @@ impl GradNormState {
                     GradNormTask::Auxiliary => {
                         (config.aux_loss_weight, config.gradnorm_aux_priority())
                     }
+                    GradNormTask::Calibration => (
+                        config.calibration_loss_weight(),
+                        config.gradnorm_calibration_priority(),
+                    ),
                 };
                 TaskState::new(task, weight, priority)
             })
@@ -172,6 +179,7 @@ impl GradNormState {
                 GradNormTask::Value => config.value_loss_weight,
                 GradNormTask::TimeUsage => config.time_usage_loss_weight,
                 GradNormTask::Auxiliary => config.aux_loss_weight,
+                GradNormTask::Calibration => config.calibration_loss_weight(),
             };
             task_state.weight = weight;
             task_state.enabled = weight > 0.0;
@@ -220,6 +228,10 @@ impl GradNormState {
                 GradNormTask::Value => (&output.base_value_loss, true),
                 GradNormTask::TimeUsage => (&output.base_time_usage_loss, true),
                 GradNormTask::Auxiliary => (&output.base_aux_loss, true),
+                GradNormTask::Calibration => (
+                    &output.base_calibration_loss,
+                    output.calibration_labeled_fraction > 0.0,
+                ),
             };
 
             let base_loss = if enabled_by_output {
@@ -248,15 +260,18 @@ impl GradNormState {
         let value_weight = self.weight_for(GradNormTask::Value);
         let time_weight = self.weight_for(GradNormTask::TimeUsage);
         let aux_weight = self.weight_for(GradNormTask::Auxiliary);
+        let calibration_weight = self.weight_for(GradNormTask::Calibration);
 
         output.policy_loss = output.base_policy_loss.clone() * policy_weight;
         output.value_loss = output.base_value_loss.clone() * value_weight;
         output.time_usage_loss = output.base_time_usage_loss.clone() * time_weight;
         output.aux_loss = output.base_aux_loss.clone() * aux_weight;
+        output.calibration_loss = output.base_calibration_loss.clone() * calibration_weight;
         output.loss = output.policy_loss.clone()
             + output.value_loss.clone()
             + output.time_usage_loss.clone()
-            + output.aux_loss.clone();
+            + output.aux_loss.clone()
+            + output.calibration_loss.clone();
     }
 
     pub fn apply_probe_results(
@@ -343,7 +358,9 @@ impl GradNormState {
             }
         }
 
-        let final_weights: Vec<String> = self.tasks.iter()
+        let final_weights: Vec<String> = self
+            .tasks
+            .iter()
             .filter(|t| t.enabled)
             .map(|t| format!("{}={:.6}", t.task.name(), t.weight))
             .collect();

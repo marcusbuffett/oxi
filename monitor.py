@@ -28,11 +28,15 @@ METRICS = [
     ("wdl_accuracy",            "WDL Accuracy"),
     ("aux_from_square_accuracy","From-Sq Accuracy"),
     ("aux_to_square_accuracy",  "To-Sq Accuracy"),
+    ("cp_loss_calibration_overall", "CPL Calibration"),
 ]
 
 WEIGHT_TOP1 = 1.0
 WEIGHT_WDL  = 0.5
 WEIGHT_AUX  = 0.2
+WEIGHT_CALIBRATION = 0.4
+CALIBRATION_MIN_LABELED_FRACTION = 0.05
+CALIBRATION_TARGET_FRACTION = 0.10
 
 TRAINING_TIMEOUT = 3600  # seconds — assumed duration of a completed comparison run
 
@@ -54,17 +58,19 @@ def steps_to_times(steps, total_steps, duration_secs):
 def best_score_from_log(base: Path) -> dict:
     """Parse research_log.md and return the highest value seen for each tracked metric."""
     log_path = base.parent / "research_log.md"
-    bests = {"composite": 0.0, "top1": 0.0, "wdl": 0.0, "aux": 0.0}
+    bests = {"composite": 0.0, "top1": 0.0, "wdl": 0.0, "aux": 0.0, "calibration": 0.0}
     try:
         with open(log_path) as f:
             for line in f:
-                m = re.search(r"\|\s*([\d.]+)\s*\(top1=([\d.]+),\s*wdl=([\d.]+),\s*aux=([\d.]+)", line)
+                m = re.search(r"\|\s*([\d.]+)\s*\(top1=([\d.]+),\s*wdl=([\d.]+),\s*aux=([\d.]+)(?:,\s*cal=([\d.]+))?", line)
                 if m:
                     try:
                         bests["composite"] = max(bests["composite"], float(m.group(1)))
                         bests["top1"]      = max(bests["top1"],      float(m.group(2)))
                         bests["wdl"]       = max(bests["wdl"],       float(m.group(3)))
                         bests["aux"]       = max(bests["aux"],        float(m.group(4)))
+                        if m.group(5) is not None:
+                            bests["calibration"] = max(bests["calibration"], float(m.group(5)))
                     except ValueError:
                         pass
     except FileNotFoundError:
@@ -81,7 +87,19 @@ def ao100_composite(metrics_dir: Path) -> float:
     top1 = ao100("top1_accuracy")
     wdl  = normalize_wdl(ao100("wdl_accuracy"))
     aux  = (ao100("aux_from_square_accuracy") + ao100("aux_to_square_accuracy")) / 2.0
-    return WEIGHT_TOP1 * top1 + WEIGHT_WDL * wdl + WEIGHT_AUX * aux
+    calibration = ao100("cp_loss_calibration_overall")
+    labeled_fraction = ao100("cp_loss_labeled_fraction")
+    calibration_cov = (
+        min(1.0, labeled_fraction / CALIBRATION_TARGET_FRACTION)
+        if labeled_fraction >= CALIBRATION_MIN_LABELED_FRACTION
+        else 0.0
+    )
+    return (
+        WEIGHT_TOP1 * top1
+        + WEIGHT_WDL * wdl
+        + WEIGHT_AUX * aux
+        + WEIGHT_CALIBRATION * calibration * calibration_cov
+    )
 
 
 def find_best_comparison_run(base: Path, current_run_dir: Path):
@@ -170,6 +188,8 @@ def compute_composite(metrics_dir: Path):
     wdl_map   = load("wdl_accuracy")
     from_map  = load("aux_from_square_accuracy")
     to_map    = load("aux_to_square_accuracy")
+    calibration_map = load("cp_loss_calibration_overall")
+    labeled_fraction_map = load("cp_loss_labeled_fraction")
 
     common = sorted(set(top1_map) & set(wdl_map) & set(from_map) & set(to_map))
     if not common:
@@ -178,7 +198,19 @@ def compute_composite(metrics_dir: Path):
     steps, values = [], []
     for s in common:
         aux = (from_map[s] + to_map[s]) / 2.0
-        score = WEIGHT_TOP1 * top1_map[s] + WEIGHT_WDL * normalize_wdl(wdl_map[s]) + WEIGHT_AUX * aux
+        calibration = calibration_map.get(s, 0.0)
+        labeled_fraction = labeled_fraction_map.get(s, 0.0)
+        calibration_cov = (
+            min(1.0, labeled_fraction / CALIBRATION_TARGET_FRACTION)
+            if labeled_fraction >= CALIBRATION_MIN_LABELED_FRACTION
+            else 0.0
+        )
+        score = (
+            WEIGHT_TOP1 * top1_map[s]
+            + WEIGHT_WDL * normalize_wdl(wdl_map[s])
+            + WEIGHT_AUX * aux
+            + WEIGHT_CALIBRATION * calibration * calibration_cov
+        )
         steps.append(s)
         values.append(score)
     return steps, values
@@ -418,7 +450,8 @@ def report(run_dir: Path, cmp_dir: Path | None) -> None:
 
     # For each metric + composite, show current ao100 vs comparison ao100 at same wall-clock time
     all_metrics = [("top1_accuracy", "Top-1 Accuracy"), ("wdl_accuracy", "WDL Accuracy"),
-                   ("aux_from_square_accuracy", "From-Sq Acc"), ("aux_to_square_accuracy", "To-Sq Acc")]
+                   ("aux_from_square_accuracy", "From-Sq Acc"), ("aux_to_square_accuracy", "To-Sq Acc"),
+                   ("cp_loss_calibration_overall", "CPL Calibration")]
 
     for metric_name, label in all_metrics:
         # Current run

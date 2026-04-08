@@ -37,6 +37,10 @@ pub struct ChessOutput<B: Backend> {
     pub aux_loss: Tensor<B, 1>,
     /// Base (unweighted) auxiliary loss (mobility + material)
     pub base_aux_loss: Tensor<B, 1>,
+    /// The centipawn-loss calibration component (after GradNorm weighting)
+    pub calibration_loss: Tensor<B, 1>,
+    /// Base (unweighted) centipawn-loss calibration loss
+    pub base_calibration_loss: Tensor<B, 1>,
     /// The policy output (masked move logits)
     pub policy_output: Tensor<B, 2>,
     /// The policy targets (for move accuracy)
@@ -61,6 +65,12 @@ pub struct ChessOutput<B: Backend> {
     pub aux_to_square_loss: f32,
     pub aux_from_square_accuracy: f32,
     pub aux_to_square_accuracy: f32,
+    pub calibration_head_loss: f32,
+    pub calibration_policy_mae: f32,
+    pub calibration_head_mae: f32,
+    pub calibration_labeled_fraction: f32,
+    pub calibration_overall_score: f32,
+    pub calibration_policy_signed_error_by_elo: Vec<(String, f32)>,
 }
 
 impl<B: Backend> ChessOutput<B> {
@@ -72,6 +82,7 @@ impl<B: Backend> ChessOutput<B> {
         value_loss: Tensor<B, 1>,
         time_usage_loss: Tensor<B, 1>,
         aux_loss: Tensor<B, 1>,
+        calibration_loss: Tensor<B, 1>,
         policy_output: Tensor<B, 2>,
         policy_targets: Tensor<B, 1, Int>,
         value_output: Tensor<B, 2>,
@@ -82,6 +93,7 @@ impl<B: Backend> ChessOutput<B> {
         let base_value_loss = value_loss.clone();
         let base_time_usage_loss = time_usage_loss.clone();
         let base_aux_loss = aux_loss.clone();
+        let base_calibration_loss = calibration_loss.clone();
 
         Self {
             loss,
@@ -90,6 +102,8 @@ impl<B: Backend> ChessOutput<B> {
             time_usage_loss,
             aux_loss,
             base_aux_loss,
+            calibration_loss,
+            base_calibration_loss,
             base_policy_loss,
             base_value_loss,
             base_time_usage_loss,
@@ -111,6 +125,12 @@ impl<B: Backend> ChessOutput<B> {
             aux_to_square_loss: 0.0,
             aux_from_square_accuracy: 0.0,
             aux_to_square_accuracy: 0.0,
+            calibration_head_loss: 0.0,
+            calibration_policy_mae: 0.0,
+            calibration_head_mae: 0.0,
+            calibration_labeled_fraction: 0.0,
+            calibration_overall_score: 0.0,
+            calibration_policy_signed_error_by_elo: Vec::new(),
         }
     }
 
@@ -186,6 +206,29 @@ impl<B: Backend> ChessOutput<B> {
         self
     }
 
+    pub fn with_calibration_metrics(
+        mut self,
+        calibration_head_loss: f32,
+        calibration_policy_mae: f32,
+        calibration_head_mae: f32,
+        calibration_labeled_fraction: f32,
+        calibration_overall_score: f32,
+        calibration_policy_signed_error_by_elo: Vec<(String, f32)>,
+    ) -> Self {
+        self.calibration_head_loss = calibration_head_loss;
+        self.calibration_policy_mae = calibration_policy_mae;
+        self.calibration_head_mae = calibration_head_mae;
+        self.calibration_labeled_fraction = calibration_labeled_fraction;
+        self.calibration_overall_score = calibration_overall_score;
+        self.calibration_policy_signed_error_by_elo = calibration_policy_signed_error_by_elo;
+        self
+    }
+
+    pub fn with_base_calibration_loss(mut self, base_calibration_loss: Tensor<B, 1>) -> Self {
+        self.base_calibration_loss = base_calibration_loss;
+        self
+    }
+
     /// Get the total loss used for metrics display (sum of raw losses if available)
     /// This is the same calculation used by LossMetric
     pub fn total_loss(&self) -> Tensor<B, 1> {
@@ -195,7 +238,11 @@ impl<B: Backend> ChessOutput<B> {
             &self.raw_time_usage_loss,
         ) {
             // Use raw losses if available (same as LossMetric)
-            raw_policy.clone() + raw_value.clone() + raw_time.clone() + self.aux_loss.clone()
+            raw_policy.clone()
+                + raw_value.clone()
+                + raw_time.clone()
+                + self.aux_loss.clone()
+                + self.calibration_loss.clone()
         } else {
             // Fallback to combined loss
             self.loss.clone()
@@ -214,6 +261,8 @@ impl<B: Backend> ChessOutput<B> {
             base_value_loss: self.base_value_loss.detach(),
             base_time_usage_loss: self.base_time_usage_loss.detach(),
             base_aux_loss: self.base_aux_loss.detach(),
+            calibration_loss: self.calibration_loss.detach(),
+            base_calibration_loss: self.base_calibration_loss.detach(),
             policy_output: self.policy_output.detach(),
             policy_targets: self.policy_targets,
             value_output: self.value_output.detach(),
@@ -232,6 +281,12 @@ impl<B: Backend> ChessOutput<B> {
             aux_to_square_loss: self.aux_to_square_loss,
             aux_from_square_accuracy: self.aux_from_square_accuracy,
             aux_to_square_accuracy: self.aux_to_square_accuracy,
+            calibration_head_loss: self.calibration_head_loss,
+            calibration_policy_mae: self.calibration_policy_mae,
+            calibration_head_mae: self.calibration_head_mae,
+            calibration_labeled_fraction: self.calibration_labeled_fraction,
+            calibration_overall_score: self.calibration_overall_score,
+            calibration_policy_signed_error_by_elo: self.calibration_policy_signed_error_by_elo,
         }
     }
 }
@@ -323,17 +378,24 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
         let aux_to_square_loss = self.aux_to_square_loss;
         let aux_from_square_accuracy = self.aux_from_square_accuracy;
         let aux_to_square_accuracy = self.aux_to_square_accuracy;
+        let calibration_head_loss = self.calibration_head_loss;
+        let calibration_policy_mae = self.calibration_policy_mae;
+        let calibration_head_mae = self.calibration_head_mae;
+        let calibration_labeled_fraction = self.calibration_labeled_fraction;
+        let calibration_overall_score = self.calibration_overall_score;
+        let calibration_policy_signed_error_by_elo = self.calibration_policy_signed_error_by_elo;
         let raw_policy_loss = self.raw_policy_loss;
         let raw_value_loss = self.raw_value_loss;
         let raw_time_usage_loss = self.raw_time_usage_loss;
 
-        let [loss, policy_loss, value_loss, time_usage_loss, aux_loss, policy_output, policy_targets, value_output, value_targets, legal_moves_mask] =
+        let [loss, policy_loss, value_loss, time_usage_loss, aux_loss, calibration_loss, policy_output, policy_targets, value_output, value_targets, legal_moves_mask] =
             Transaction::default()
                 .register(self.loss)
                 .register(self.policy_loss)
                 .register(self.value_loss)
                 .register(self.time_usage_loss)
                 .register(self.aux_loss)
+                .register(self.calibration_loss)
                 .register(self.policy_output)
                 .register(self.policy_targets)
                 .register(self.value_output)
@@ -378,10 +440,12 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             value_loss: Tensor::from_data(value_loss.clone(), device),
             time_usage_loss: Tensor::from_data(time_usage_loss.clone(), device),
             aux_loss: Tensor::from_data(aux_loss.clone(), device),
+            calibration_loss: Tensor::from_data(calibration_loss.clone(), device),
             base_policy_loss: Tensor::from_data(policy_loss, device),
             base_value_loss: Tensor::from_data(value_loss, device),
             base_time_usage_loss: Tensor::from_data(time_usage_loss, device),
             base_aux_loss: Tensor::from_data(aux_loss, device),
+            base_calibration_loss: Tensor::from_data(calibration_loss, device),
             policy_output: Tensor::from_data(policy_output, device),
             policy_targets: Tensor::from_data(policy_targets, device),
             value_output: Tensor::from_data(value_output, device),
@@ -400,6 +464,12 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             aux_to_square_loss,
             aux_from_square_accuracy,
             aux_to_square_accuracy,
+            calibration_head_loss,
+            calibration_policy_mae,
+            calibration_head_mae,
+            calibration_labeled_fraction,
+            calibration_overall_score,
+            calibration_policy_signed_error_by_elo,
         }
     }
 }

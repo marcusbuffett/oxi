@@ -25,6 +25,27 @@ use crate::{
     moves::{mirror_fen, mirror_move},
 };
 
+fn is_pgn_path(path: &std::path::Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("pgn")
+        || path
+            .to_str()
+            .map(|s| s.ends_with(".pgn.zst"))
+            .unwrap_or(false)
+}
+
+fn list_pgn_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut pgn_files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if is_pgn_path(&path) {
+            pgn_files.push(path);
+        }
+    }
+    pgn_files.sort();
+    Ok(pgn_files)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BySide<T> {
     pub white: T,
@@ -100,6 +121,13 @@ impl PgnVisitor {
         };
 
         let config = get_global_config();
+        tracing::info!(
+            "pgn_visitor_config: seed={} enable_ply_sampling={:?} enable_elo_sampling={:?} skip={:?}",
+            config.seed,
+            config.enable_ply_sampling,
+            config.enable_elo_sampling,
+            config.skip
+        );
         let rng = StdRng::seed_from_u64(config.seed);
 
         Self {
@@ -659,23 +687,7 @@ pub fn process_pgn_directory_parallel(
     dir: &std::path::Path,
     max_samples: Option<usize>,
 ) -> Result<Vec<ChessExample>> {
-    // Get list of PGN files
-    let mut pgn_files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Process both .pgn and .pgn.zst files
-        let is_pgn = path.extension().and_then(|s| s.to_str()) == Some("pgn")
-            || (path
-                .to_str()
-                .map(|s| s.ends_with(".pgn.zst"))
-                .unwrap_or(false));
-
-        if is_pgn {
-            pgn_files.push(path);
-        }
-    }
+    let pgn_files = list_pgn_files(dir)?;
 
     if pgn_files.is_empty() {
         tracing::info!("No PGN files found in directory: {:?}", dir);
@@ -993,23 +1005,7 @@ fn process_single_file_for_worker(
 pub fn process_pgn_directory_iter(
     dir: &std::path::Path,
 ) -> Result<impl Iterator<Item = ChessExample>> {
-    // Get list of PGN files
-    let mut pgn_files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Process both .pgn and .pgn.zst files
-        let is_pgn = path.extension().and_then(|s| s.to_str()) == Some("pgn")
-            || (path
-                .to_str()
-                .map(|s| s.ends_with(".pgn.zst"))
-                .unwrap_or(false));
-
-        if is_pgn {
-            pgn_files.push(path);
-        }
-    }
+    let pgn_files = list_pgn_files(dir)?;
 
     if pgn_files.is_empty() {
         tracing::info!("No PGN files found in directory: {:?}", dir);
@@ -1029,6 +1025,7 @@ pub fn process_pgn_directory_iter(
         current_reader: None,
         current_visitor: PgnVisitor::with_position_counts(),
         pending_examples: Vec::new(),
+        yielded_examples: 0,
     })
 }
 
@@ -1039,6 +1036,7 @@ struct PgnDirectoryIterator {
     current_reader: Option<BufferedReader<Box<dyn std::io::Read>>>,
     current_visitor: PgnVisitor,
     pending_examples: Vec<ChessExample>,
+    yielded_examples: usize,
 }
 
 impl Iterator for PgnDirectoryIterator {
@@ -1048,6 +1046,18 @@ impl Iterator for PgnDirectoryIterator {
         loop {
             // Return pending examples first
             if let Some(example) = self.pending_examples.pop() {
+                if self.yielded_examples < 10 {
+                    tracing::info!(
+                        "pgn_directory_iter_example[{}]: fen={} move={} elo_self={} elo_oppo={} ply={}",
+                        self.yielded_examples,
+                        example.fen,
+                        example.move_uci,
+                        example.elo_self,
+                        example.elo_oppo,
+                        example.move_count
+                    );
+                }
+                self.yielded_examples += 1;
                 return Some(example);
             }
 
@@ -1144,43 +1154,31 @@ pub fn process_pgn_directory_serial(
     let position_counts = Arc::new(Mutex::new(HashMap::new()));
     let max_per_position = 10;
 
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
+    for path in list_pgn_files(dir)? {
+        tracing::info!("Processing PGN file: {:?}", path);
 
-        // Process both .pgn and .pgn.zst files
-        let is_pgn = path.extension().and_then(|s| s.to_str()) == Some("pgn")
-            || (path
-                .to_str()
-                .map(|s| s.ends_with(".pgn.zst"))
-                .unwrap_or(false));
+        // Calculate remaining samples
+        let remaining = max_samples.map(|max| max.saturating_sub(all_examples.len()));
 
-        if is_pgn {
-            tracing::info!("Processing PGN file: {:?}", path);
-
-            // Calculate remaining samples
-            let remaining = max_samples.map(|max| max.saturating_sub(all_examples.len()));
-
-            // Stop if we've reached the limit
-            if remaining == Some(0) {
-                tracing::info!("Reached max samples limit, stopping directory processing");
-                break;
-            }
-
-            let examples = process_pgn_file_with_dedup(
-                &path,
-                position_counts.clone(),
-                max_per_position,
-                remaining,
-            )?;
-            let unique_positions = position_counts.lock().unwrap().len();
-            tracing::info!(
-                "  Found {} examples, {} unique positions so far",
-                examples.len(),
-                unique_positions
-            );
-            all_examples.extend(examples);
+        // Stop if we've reached the limit
+        if remaining == Some(0) {
+            tracing::info!("Reached max samples limit, stopping directory processing");
+            break;
         }
+
+        let examples = process_pgn_file_with_dedup(
+            &path,
+            position_counts.clone(),
+            max_per_position,
+            remaining,
+        )?;
+        let unique_positions = position_counts.lock().unwrap().len();
+        tracing::info!(
+            "  Found {} examples, {} unique positions so far",
+            examples.len(),
+            unique_positions
+        );
+        all_examples.extend(examples);
     }
 
     let final_unique = position_counts.lock().unwrap().len();
@@ -1260,21 +1258,7 @@ fn parse_clock_time(clock_str: &str) -> Option<u32> {
 pub fn process_tcec_directory_iter(
     dir: &std::path::Path,
 ) -> Result<impl Iterator<Item = ChessExample>> {
-    let mut pgn_files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        let is_pgn = path.extension().and_then(|s| s.to_str()) == Some("pgn")
-            || (path
-                .to_str()
-                .map(|s| s.ends_with(".pgn.zst"))
-                .unwrap_or(false));
-
-        if is_pgn {
-            pgn_files.push(path);
-        }
-    }
+    let pgn_files = list_pgn_files(dir)?;
 
     if pgn_files.is_empty() {
         tracing::info!("No TCEC PGN files found in directory: {:?}", dir);

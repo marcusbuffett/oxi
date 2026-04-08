@@ -5,7 +5,12 @@ use crossterm::{
     terminal::{disable_raw_mode, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
+#[cfg(feature = "train")]
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use shakmaty::Position;
+#[cfg(feature = "train")]
+use std::collections::HashSet;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -14,12 +19,22 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, task};
 
+use oxi::calibration::{label_sampled_position, CalibrationDb, RegretBin};
 use oxi::config::{set_global_config, Config, ConfigOverrides};
 use oxi::constants::{LICHESS_PUZZLE_URL, TCEC_DOWNLOAD_URL};
 #[cfg(feature = "train")]
 use oxi::custom_training::train_custom;
+#[cfg(feature = "train")]
+use oxi::dataset::ChessExample;
 use oxi::eval_dataset::{sample_positions_from_pgn, EvalDataset};
 use oxi::inference::{GlobalFeatures, InferenceEngine};
+#[cfg(feature = "train")]
+use oxi::pgn_processor::{process_pgn_directory_with_limit, process_pgn_file_with_limit};
+use oxi::stockfish::StockfishEngine;
+#[cfg(feature = "train")]
+use oxi::training_stream::{
+    calibration_stream_config, sample_positions_from_human_training_stream,
+};
 
 #[cfg(all(target_os = "linux", feature = "backend-cuda"))]
 use burn_cuda::{Cuda, CudaDevice};
@@ -96,6 +111,9 @@ enum Commands {
 
     /// Quick one-shot evaluation: sample positions, run Stockfish, evaluate model, print report
     QuickEval(QuickEvalCli),
+
+    /// Create a SQLite cache of Stockfish-labeled positions for calibrated-strength training
+    CreateCalibrationDb(CreateCalibrationDbCli),
 
     /// Download TCEC (Top Chess Engine Championship) games for pretraining
     DownloadTcec {
@@ -278,6 +296,112 @@ struct QuickEvalCli {
     stockfish_path: Option<String>,
 }
 
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
+struct CreateCalibrationDbCli {
+    /// Directory containing PGN files to sample from
+    #[arg(long)]
+    pgn_dir: PathBuf,
+
+    /// Output path for the SQLite DB
+    #[arg(long, default_value = "./data/calibration.db")]
+    output: PathBuf,
+
+    /// Path to Stockfish binary (defaults to "stockfish" in PATH)
+    #[arg(long)]
+    stockfish_path: Option<String>,
+
+    /// Stockfish search depth
+    #[arg(long, default_value = "10")]
+    depth: u32,
+
+    /// Number of threads for Stockfish
+    #[arg(long, default_value = "1")]
+    threads: u32,
+
+    /// Total number of positions to sample before labeling
+    #[arg(long, default_value = "10000")]
+    num_positions: usize,
+
+    /// Preserve training-stream order instead of shuffling/stratifying sampled positions
+    #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+    preserve_order: Option<bool>,
+}
+
+#[cfg(feature = "train")]
+fn sample_training_positions_for_calibration(
+    pgn_path: &PathBuf,
+    num_positions: usize,
+    elo_buckets: &[(i32, i32)],
+    preserve_order: bool,
+) -> Result<Vec<oxi::eval_dataset::SampledPosition>> {
+    if preserve_order {
+        return sample_positions_from_human_training_stream(pgn_path.as_path(), num_positions);
+    }
+
+    let candidate_target = (num_positions * 8).max(num_positions);
+    let mut examples = if pgn_path.is_dir() {
+        process_pgn_directory_with_limit(pgn_path.as_path(), Some(candidate_target))?
+    } else {
+        process_pgn_file_with_limit(pgn_path.as_path(), Some(candidate_target))?
+    };
+
+    if examples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut rng = rand::rng();
+    examples.shuffle(&mut rng);
+
+    let per_bucket = (num_positions / elo_buckets.len()).max(1);
+    let mut selected = Vec::with_capacity(num_positions);
+    let mut remaining_examples: Vec<ChessExample> = Vec::new();
+
+    for &(elo_min, elo_max) in elo_buckets {
+        let mut bucket_examples: Vec<ChessExample> = Vec::new();
+        for example in examples.drain(..) {
+            if example.elo_self >= elo_min && example.elo_self < elo_max {
+                bucket_examples.push(example);
+            } else {
+                remaining_examples.push(example);
+            }
+        }
+
+        bucket_examples.shuffle(&mut rng);
+        selected.extend(bucket_examples.into_iter().take(per_bucket).map(|example| {
+            oxi::eval_dataset::SampledPosition {
+                fen: example.fen,
+                human_move: example.move_uci,
+                player_elo: example.elo_self,
+                opponent_elo: example.elo_oppo,
+                ply: example.move_count as u32,
+                game_result: example.outcome,
+            }
+        }));
+
+        examples = remaining_examples;
+        remaining_examples = Vec::new();
+    }
+
+    if selected.len() < num_positions {
+        examples.shuffle(&mut rng);
+        selected.extend(
+            examples
+                .into_iter()
+                .take(num_positions - selected.len())
+                .map(|example| oxi::eval_dataset::SampledPosition {
+                    fen: example.fen,
+                    human_move: example.move_uci,
+                    player_elo: example.elo_self,
+                    opponent_elo: example.elo_oppo,
+                    ply: example.move_count as u32,
+                    game_result: example.outcome,
+                }),
+        );
+    }
+
+    Ok(selected)
+}
+
 /// Minimal model architecture params — mirrors what the production bot uses.
 /// Only reads the fields needed to construct the model, ignoring training-only config.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -293,9 +417,15 @@ struct ModelParams {
     pub smolgen_gen_size: usize,
 }
 
-fn default_smolgen_hidden() -> usize { 24 }
-fn default_smolgen_global_dim() -> usize { 128 }
-fn default_smolgen_gen_size() -> usize { 128 }
+fn default_smolgen_hidden() -> usize {
+    24
+}
+fn default_smolgen_global_dim() -> usize {
+    128
+}
+fn default_smolgen_gen_size() -> usize {
+    128
+}
 
 /// Load a Config from a model directory's params.json file.
 /// Only reads architecture params, fills the rest with defaults — same approach as the production bot.
@@ -341,20 +471,20 @@ async fn main() -> Result<()> {
                 #[cfg(target_os = "macos")]
                 {
                     type Backend = Autodiff<LibTorch<f32>>;
-                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-                        (0..config.num_devices)
-                            .map(|_| LibTorchDevice::Mps)
-                            .collect();
+                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0
+                        ..config.num_devices)
+                        .map(|_| LibTorchDevice::Mps)
+                        .collect();
                     train_custom::<Backend>(config.clone(), devices)?;
                 }
 
                 #[cfg(all(target_os = "linux", feature = "backend-cuda"))]
                 {
                     type Backend = Autodiff<Cuda>;
-                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
-                        (0..config.num_devices)
-                            .map(|i| CudaDevice::new(i))
-                            .collect();
+                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0
+                        ..config.num_devices)
+                        .map(|i| CudaDevice::new(i))
+                        .collect();
                     println!("Using burn-cuda backend with fusion + autotune");
                     train_custom::<Backend>(config.clone(), devices)?;
                 }
@@ -453,7 +583,10 @@ async fn main() -> Result<()> {
             tracing::info!("Evaluating model with config: {:?}", config);
 
             // Load eval dataset
-            println!("Loading eval dataset from {}...", config.data_path.display());
+            println!(
+                "Loading eval dataset from {}...",
+                config.data_path.display()
+            );
             let eval_dataset = EvalDataset::load(&config.data_path)?;
             println!(
                 "Loaded {} positions (depth {}, Elo range {}-{})",
@@ -482,10 +615,12 @@ async fn main() -> Result<()> {
                     device,
                 )?;
 
-                println!("Model loaded. Running inference on {} positions...", eval_dataset.positions.len());
+                println!(
+                    "Model loaded. Running inference on {} positions...",
+                    eval_dataset.positions.len()
+                );
 
-                let mut model_policies =
-                    std::collections::HashMap::new();
+                let mut model_policies = std::collections::HashMap::new();
                 let total = eval_dataset.positions.len();
 
                 for (i, pos) in eval_dataset.positions.iter().enumerate() {
@@ -500,15 +635,14 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
-                    let chess_pos: shakmaty::Chess = match parsed_fen
-                        .into_position(shakmaty::CastlingMode::Standard)
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("Skipping invalid position {}: {}", pos.fen, e);
-                            continue;
-                        }
-                    };
+                    let chess_pos: shakmaty::Chess =
+                        match parsed_fen.into_position(shakmaty::CastlingMode::Standard) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("Skipping invalid position {}: {}", pos.fen, e);
+                                continue;
+                            }
+                        };
 
                     // Use default global features for eval (no time pressure)
                     let elo = config.model_elo.unwrap_or(pos.player_elo);
@@ -572,15 +706,16 @@ async fn main() -> Result<()> {
             ];
 
             // Need global config for PGN processing
-            let global_config = Config::default();
-            let _ = set_global_config(global_config);
+            let mut global_config = Config::default();
+            global_config.enable_ply_sampling = Some(false);
+            global_config.enable_elo_sampling = Some(false);
+            set_global_config(global_config).expect(
+                "global config should not be initialized before create-calibration-db runs",
+            );
 
             // Step 1: Sample positions from PGN files
-            let sampled = sample_positions_from_pgn(
-                &config.pgn_dir,
-                config.num_positions,
-                &elo_buckets,
-            )?;
+            let sampled =
+                sample_positions_from_pgn(&config.pgn_dir, config.num_positions, &elo_buckets)?;
 
             if sampled.is_empty() {
                 anyhow::bail!("No positions were sampled. Check PGN directory and filters.");
@@ -634,7 +769,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::QuickEval(config) => {
-            println!("Quick evaluation: {} positions, depth {}", config.num_positions, config.depth);
+            println!(
+                "Quick evaluation: {} positions, depth {}",
+                config.num_positions, config.depth
+            );
 
             // Load model config from params.json
             let model_config = load_config_from_model_dir(&config.model_dir)?;
@@ -651,22 +789,19 @@ async fn main() -> Result<()> {
             } else {
                 // If it's a single file, use its parent directory
                 // but we need to handle this case - copy to a temp dir or handle directly
-                pgn_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+                pgn_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf()
             };
 
             // Step 1: Sample positions
-            let elo_buckets = vec![
-                (1000, 1400),
-                (1400, 1800),
-                (1800, 2200),
-                (2200, 2700),
-            ];
-            println!("\nStep 1: Sampling {} positions from PGN...", config.num_positions);
-            let sampled = sample_positions_from_pgn(
-                &pgn_dir,
-                config.num_positions,
-                &elo_buckets,
-            )?;
+            let elo_buckets = vec![(1000, 1400), (1400, 1800), (1800, 2200), (2200, 2700)];
+            println!(
+                "\nStep 1: Sampling {} positions from PGN...",
+                config.num_positions
+            );
+            let sampled = sample_positions_from_pgn(&pgn_dir, config.num_positions, &elo_buckets)?;
 
             if sampled.is_empty() {
                 anyhow::bail!("No positions sampled. Check PGN path and filters.");
@@ -697,7 +832,12 @@ async fn main() -> Result<()> {
             println!("{}", "-".repeat(32));
             for (elo, ecls) in &elo_ecls {
                 let mean = ecls.iter().sum::<f32>() / ecls.len() as f32;
-                println!("{:<12} {:>10.1} {:>8}", format!("{}-{}", elo, elo + 400), mean, ecls.len());
+                println!(
+                    "{:<12} {:>10.1} {:>8}",
+                    format!("{}-{}", elo, elo + 400),
+                    mean,
+                    ecls.len()
+                );
             }
 
             // Step 3: Run model inference using NdArray backend (CPU, same as production bot)
@@ -727,12 +867,11 @@ async fn main() -> Result<()> {
                         Ok(f) => f,
                         Err(_) => continue,
                     };
-                    let chess_pos: shakmaty::Chess = match parsed_fen
-                        .into_position(shakmaty::CastlingMode::Standard)
-                    {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
+                    let chess_pos: shakmaty::Chess =
+                        match parsed_fen.into_position(shakmaty::CastlingMode::Standard) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
 
                     let elo = config.model_elo.unwrap_or(pos.player_elo);
                     let globals = GlobalFeatures {
@@ -765,6 +904,146 @@ async fn main() -> Result<()> {
 
             #[cfg(not(feature = "backend-ndarray"))]
             anyhow::bail!("Quick eval requires backend-ndarray feature. Run with: cargo run --features backend-ndarray")
+        }
+
+        Commands::CreateCalibrationDb(config) => {
+            println!("Creating calibration DB...");
+            println!("  PGN path: {}", config.pgn_dir.display());
+            println!("  Output: {}", config.output.display());
+            println!("  Stockfish depth: {}", config.depth);
+            println!("  Target positions: {}", config.num_positions);
+
+            if let Some(parent) = config.output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let global_config = calibration_stream_config();
+            let _ = set_global_config(global_config);
+
+            let elo_buckets = vec![
+                (1000, 1200),
+                (1200, 1400),
+                (1400, 1600),
+                (1600, 1800),
+                (1800, 2000),
+                (2000, 2200),
+                (2200, 2400),
+                (2400, 2700),
+            ];
+
+            #[cfg(feature = "train")]
+            let sampled = sample_training_positions_for_calibration(
+                &config.pgn_dir,
+                config.num_positions,
+                &elo_buckets,
+                config.preserve_order.unwrap_or(false),
+            )?;
+
+            #[cfg(not(feature = "train"))]
+            let sampled = {
+                anyhow::bail!(
+                    "create-calibration-db now uses the training PGN pipeline and requires the `train` feature"
+                );
+            };
+
+            if sampled.is_empty() {
+                anyhow::bail!("No positions were sampled. Check PGN directory and filters.");
+            }
+
+            for (idx, sample) in sampled.iter().take(10).enumerate() {
+                println!(
+                    "  sample[{idx}] fen={} move={} elo_self={} elo_oppo={} ply={}",
+                    sample.fen,
+                    sample.human_move,
+                    sample.player_elo,
+                    sample.opponent_elo,
+                    sample.ply
+                );
+            }
+
+            let db = CalibrationDb::open(&config.output)?;
+            let mut existing_keys: HashSet<oxi::calibration::CalibrationKey> =
+                db.load_existing_keys(config.depth)?;
+            let existing_at_start = existing_keys.len();
+            let mut engine = StockfishEngine::new(
+                config.stockfish_path.as_deref(),
+                config.depth,
+                config.threads,
+            )?;
+
+            let total = sampled.len();
+            let mut inserted = 0usize;
+            let mut skipped = 0usize;
+            let mut skipped_existing = 0usize;
+            let mut regret_counts = [0usize; RegretBin::COUNT];
+
+            println!(
+                "  Found {} already-labeled positions at depth {}",
+                existing_at_start, config.depth
+            );
+
+            for (idx, sampled_position) in sampled.into_iter().enumerate() {
+                if (idx + 1) % 50 == 0 || idx + 1 == total {
+                    println!(
+                        "  [{}/{}] processed | ready={} (existing {} + inserted {}) | skipped_existing={} skipped_failed={}",
+                        idx + 1,
+                        total,
+                        existing_at_start + inserted,
+                        existing_at_start,
+                        inserted,
+                        skipped_existing,
+                        skipped
+                    );
+                }
+
+                let key = oxi::calibration::calibration_key_for_sample(
+                    &sampled_position.fen,
+                    &sampled_position.human_move,
+                );
+                if existing_keys.contains(&key) {
+                    skipped_existing += 1;
+                    continue;
+                }
+
+                match label_sampled_position(&mut engine, sampled_position, config.depth) {
+                    Ok(labeled) => {
+                        regret_counts[labeled.regret_bin.index() as usize] += 1;
+                        db.insert_labeled_position(&labeled, config.depth)?;
+                        existing_keys.insert(key);
+                        inserted += 1;
+                    }
+                    Err(err) => {
+                        eprintln!("Warning: failed to label position: {err}");
+                        skipped += 1;
+                    }
+                }
+            }
+
+            let total_in_db = db.count_positions()?;
+            println!("\nCalibration DB written to {}", config.output.display());
+            println!("  Inserted this run: {}", inserted);
+            println!("  Skipped existing: {}", skipped_existing);
+            println!("  Skipped this run: {}", skipped);
+            println!("  Total rows in DB: {}", total_in_db);
+            println!("\nRegret-bin histogram:");
+            for bin in [
+                RegretBin::ExactZero,
+                RegretBin::Cp1To10,
+                RegretBin::Cp11To25,
+                RegretBin::Cp26To50,
+                RegretBin::Cp51To100,
+                RegretBin::Cp101To200,
+                RegretBin::Cp201To400,
+                RegretBin::Cp400Plus,
+            ] {
+                println!(
+                    "  {:>7}: {:>6}",
+                    bin.label(),
+                    regret_counts[bin.index() as usize]
+                );
+            }
+
+            Ok(())
         }
 
         Commands::DownloadPgn {

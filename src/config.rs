@@ -252,6 +252,10 @@ pub struct Config {
     /// Size of shuffle buffer for streaming data loading (number of examples to buffer before sampling)
     pub shuffle_buffer_size: usize,
 
+    /// Disable shuffle-buffer randomization and consume buffered examples in stream order.
+    #[serde(default)]
+    pub disable_training_shuffle: Option<bool>,
+
     /// Interval for computing expensive metrics (top-5 accuracy, debug predictions, gradient breakdown, L2 penalty, tensor norms). 0 = never, 1 = every iteration.
     pub full_metrics_interval: usize,
 
@@ -264,6 +268,18 @@ pub struct Config {
 
     /// Path to puzzle CSV file (defaults to <data-path>/puzzles/lichess_db_puzzle.csv.zst)
     pub puzzle_path: Option<std::path::PathBuf>,
+
+    /// Path to SQLite DB with precomputed centipawn-loss labels
+    #[serde(default)]
+    pub calibration_db_path: Option<std::path::PathBuf>,
+
+    /// Weight for centipawn-loss calibration losses
+    #[serde(default = "default_calibration_loss_weight")]
+    pub calibration_loss_weight: f32,
+
+    /// Priority multiplier applied to calibration GradNorm target
+    #[serde(default = "default_gradnorm_calibration_priority")]
+    pub gradnorm_calibration_priority: f32,
 
     // === VALUE TOWER CONFIGURATION ===
     /// Number of transformer layers in the value tower (separate from trunk)
@@ -333,6 +349,12 @@ fn default_embedding_base_lr() -> f64 {
 }
 fn default_aux_loss_weight() -> f32 {
     0.06 // Was 0.04; increased to strengthen trunk-level auxiliary supervision signal
+}
+fn default_calibration_loss_weight() -> f32 {
+    0.10
+}
+fn default_gradnorm_calibration_priority() -> f32 {
+    2.0
 }
 /// Command-line overrides for Config. All fields are optional.
 /// Use `Config::with_overrides()` to merge with defaults.
@@ -588,6 +610,10 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub shuffle_buffer_size: Option<usize>,
 
+    /// Disable shuffle-buffer randomization and consume buffered examples in stream order
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub disable_training_shuffle: Option<bool>,
+
     /// Interval for computing expensive metrics
     #[arg(long)]
     pub full_metrics_interval: Option<usize>,
@@ -603,6 +629,15 @@ pub struct ConfigOverrides {
     /// Path to puzzle CSV file
     #[arg(long)]
     pub puzzle_path: Option<std::path::PathBuf>,
+
+    #[arg(long)]
+    pub calibration_db_path: Option<std::path::PathBuf>,
+
+    #[arg(long)]
+    pub calibration_loss_weight: Option<f32>,
+
+    #[arg(long)]
+    pub gradnorm_calibration_priority: Option<f32>,
 
     /// Number of transformer layers in the value tower
     #[arg(long)]
@@ -830,6 +865,9 @@ impl Config {
         if let Some(v) = overrides.shuffle_buffer_size {
             config.shuffle_buffer_size = v;
         }
+        if let Some(v) = overrides.disable_training_shuffle {
+            config.disable_training_shuffle = Some(v);
+        }
         if let Some(v) = overrides.full_metrics_interval {
             config.full_metrics_interval = v;
         }
@@ -841,6 +879,15 @@ impl Config {
         }
         if let Some(v) = overrides.puzzle_path {
             config.puzzle_path = Some(v);
+        }
+        if let Some(v) = overrides.calibration_db_path {
+            config.calibration_db_path = Some(v);
+        }
+        if let Some(v) = overrides.calibration_loss_weight {
+            config.calibration_loss_weight = v;
+        }
+        if let Some(v) = overrides.gradnorm_calibration_priority {
+            config.gradnorm_calibration_priority = v;
         }
         if let Some(v) = overrides.value_tower_layers {
             config.value_tower_layers = v;
@@ -971,6 +1018,10 @@ impl Config {
         self.gradnorm_aux_priority.max(0.0)
     }
 
+    pub fn gradnorm_calibration_priority(&self) -> f32 {
+        self.gradnorm_calibration_priority.max(0.0)
+    }
+
     pub fn gradnorm_probe_size(&self) -> usize {
         self.gradnorm_probe_size.max(1)
     }
@@ -1027,6 +1078,20 @@ impl Config {
 
     pub fn skip_policy_loss(&self) -> bool {
         self.skip_policy_loss.unwrap_or(false)
+    }
+
+    pub fn calibration_db_path(&self) -> Option<std::path::PathBuf> {
+        if let Some(path) = &self.calibration_db_path {
+            return Some(path.clone());
+        }
+        self.data_path.as_ref().and_then(|data_path| {
+            let candidate = data_path.join("calibration.db");
+            candidate.exists().then_some(candidate)
+        })
+    }
+
+    pub fn calibration_loss_weight(&self) -> f32 {
+        self.calibration_loss_weight.max(0.0)
     }
 
     /// Calculate value example weight based on ply (0 before start, ramps to 1 at full)
@@ -1121,10 +1186,14 @@ impl Default for Config {
             checkpoint_interval: 100,
             pretrain_samples: 0,
             shuffle_buffer_size: 100000,
+            disable_training_shuffle: Some(false),
             full_metrics_interval: 50,
             elo_priority_boost: 3.0,
             puzzle_sampling_ratio: 0.05,
             puzzle_path: None,
+            calibration_db_path: None,
+            calibration_loss_weight: default_calibration_loss_weight(),
+            gradnorm_calibration_priority: default_gradnorm_calibration_priority(),
             value_tower_layers: 2,
             value_ply_ramp_start: 10,
             value_ply_ramp_full: 30,
@@ -1234,7 +1303,6 @@ pub fn should_keep_position_by_ply(ply: usize, rng_value: f64) -> bool {
 pub fn should_keep_game_by_elo(white_elo: i32, black_elo: i32, rng_value: f64) -> bool {
     let config = get_global_config();
     if !config.enable_elo_sampling.unwrap_or(true) {
-        eprintln!("DEBUG: ELO sampling is DISABLED!");
         return true;
     }
     let avg_elo = (white_elo + black_elo) as f64 / 2.0;

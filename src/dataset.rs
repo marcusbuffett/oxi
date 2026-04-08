@@ -5,8 +5,15 @@ use burn::prelude::*;
 use serde::{Deserialize, Serialize};
 use shakmaty::uci::UciMove;
 use shakmaty::{fen::Fen, Chess, Move, Position, Square};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use crate::calibration::{
+    calibration_key_for_sample, dense_move_losses, CalibrationDb, CalibrationKey, CalibrationLabel,
+    RegretBin,
+};
 use crate::config::{get_global_config, ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
 use crate::encoding::encode_position;
 use crate::inference::{compute_material_imbalance, GlobalFeatures};
@@ -92,17 +99,48 @@ pub struct ChessItem {
     // Global features (raw, unnormalized)
     pub global_features: GlobalFeatures,
     pub is_puzzle: bool,
+    pub calibration_label: Option<CalibrationLabel>,
 }
 
 /// Grouped dataset for Oxi training
 pub struct OXIDataset {
     pub examples: Vec<ChessExample>,
     pub config: ModelConfig,
+    calibration_lookup: Option<Arc<HashMap<CalibrationKey, CalibrationLabel>>>,
+    calibration_hits: Arc<AtomicUsize>,
+    calibration_misses: Arc<AtomicUsize>,
 }
 
 impl OXIDataset {
     pub fn new(examples: Vec<ChessExample>, config: ModelConfig) -> Self {
-        Self { examples, config }
+        let calibration_lookup =
+            config
+                .calibration_db_path()
+                .and_then(|path| match CalibrationDb::load_lookup(&path) {
+                    Ok(lookup) => {
+                        tracing::info!(
+                            "calibration_lookup: loaded {} labeled positions from {}",
+                            lookup.len(),
+                            path.display()
+                        );
+                        Some(lookup)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "calibration_lookup: failed to load {}: {}",
+                            path.display(),
+                            err
+                        );
+                        None
+                    }
+                });
+        Self {
+            examples,
+            config,
+            calibration_lookup,
+            calibration_hits: Arc::new(AtomicUsize::new(0)),
+            calibration_misses: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Load dataset from PGN file
@@ -208,6 +246,45 @@ impl OXIDataset {
             total_pieces: pos.board().occupied().count() as u32,
         };
 
+        let calibration_label = self.calibration_lookup.as_ref().and_then(|lookup| {
+            let key = calibration_key_for_sample(&example.fen, &example.move_uci);
+            let label = lookup.get(&key).cloned();
+            let (hits, misses) = if label.is_some() {
+                let hits = self.calibration_hits.fetch_add(1, Ordering::Relaxed) + 1;
+                let misses = self.calibration_misses.load(Ordering::Relaxed);
+                (hits, misses)
+            } else {
+                let misses = self.calibration_misses.fetch_add(1, Ordering::Relaxed) + 1;
+                let hits = self.calibration_hits.load(Ordering::Relaxed);
+                (hits, misses)
+            };
+
+            let total = hits + misses;
+            if total <= 20 || total % 5000 == 0 {
+                tracing::info!(
+                    "calibration_lookup: total={} hits={} misses={} hit_rate={:.4}",
+                    total,
+                    hits,
+                    misses,
+                    hits as f64 / total.max(1) as f64
+                );
+            }
+
+            if total <= 10 {
+                tracing::info!(
+                    "calibration_lookup_key: hit={} fen={} move={} elo_self={} elo_oppo={} ply={}",
+                    label.is_some(),
+                    example.fen,
+                    example.move_uci,
+                    example.elo_self,
+                    example.elo_oppo,
+                    example.move_count
+                );
+            }
+
+            label
+        });
+
         Ok(ChessItem {
             board_encoded,
             move_distribution,
@@ -223,6 +300,7 @@ impl OXIDataset {
             material_imbalance_history: example.material_imbalance_history.clone(),
             global_features,
             is_puzzle: example.is_puzzle,
+            calibration_label,
         })
     }
 
@@ -265,6 +343,10 @@ pub struct ChessBatch<B: Backend> {
     pub global_features: Tensor<B, 2, Float>,
     pub value_weights: Tensor<B, 1>, // [batch] - per-sample weights for value loss (ply ramp + puzzle mask)
     pub material_imbalance: Tensor<B, 1>, // [batch] - normalized material imbalance for aux head
+    pub calibration_mask: Tensor<B, 1>, // [batch] - 1.0 when centipawn-loss labels exist
+    pub calibration_target_cp_loss: Tensor<B, 1>, // [batch]
+    pub calibration_target_bins: Tensor<B, 2>, // [batch, RegretBin::COUNT]
+    pub calibration_move_cp_losses: Tensor<B, 2>, // [batch, LEGAL_MOVES]
     // TODO: Remove these for less memory usage
     pub items: Vec<ChessItem>, // Original ChessItems for debugging/logging
 }
@@ -282,6 +364,10 @@ impl<B: Backend> ChessBatch<B> {
             global_features: self.global_features.to_device(device),
             value_weights: self.value_weights.to_device(device),
             material_imbalance: self.material_imbalance.to_device(device),
+            calibration_mask: self.calibration_mask.to_device(device),
+            calibration_target_cp_loss: self.calibration_target_cp_loss.to_device(device),
+            calibration_target_bins: self.calibration_target_bins.to_device(device),
+            calibration_move_cp_losses: self.calibration_move_cp_losses.to_device(device),
             items: self.items,
         }
     }
@@ -322,6 +408,10 @@ where
         let mut global_features_data = vec![0.0f32; batch_size * NUM_GLOBALS];
         let mut value_weights_data = vec![0.0f32; batch_size];
         let mut material_imbalance_data = vec![0.0f32; batch_size];
+        let mut calibration_mask_data = vec![0.0f32; batch_size];
+        let mut calibration_target_cp_loss_data = vec![0.0f32; batch_size];
+        let mut calibration_target_bins_data = vec![0.0f32; batch_size * RegretBin::COUNT];
+        let mut calibration_move_cp_losses_data = vec![0.0f32; batch_size * LEGAL_MOVES];
         let mut fens = Vec::with_capacity(batch_size);
         let config = get_global_config();
 
@@ -369,8 +459,20 @@ where
             value_weights_data[i] = ply_weight * puzzle_mask;
 
             // Normalize material imbalance to [-1, 1] by dividing by 39 (max possible)
-            material_imbalance_data[i] =
-                (item.material_imbalance as f32 / 39.0).clamp(-1.0, 1.0);
+            material_imbalance_data[i] = (item.material_imbalance as f32 / 39.0).clamp(-1.0, 1.0);
+
+            if let Some(calibration) = &item.calibration_label {
+                calibration_mask_data[i] = 1.0;
+                calibration_target_cp_loss_data[i] = calibration.human_regret_cp;
+                let bin_offset = i * RegretBin::COUNT;
+                calibration_target_bins_data
+                    [bin_offset + calibration.regret_bin.index() as usize] = 1.0;
+
+                let move_loss_offset = i * LEGAL_MOVES;
+                let dense_losses = dense_move_losses(&calibration.move_loss_blob, LEGAL_MOVES);
+                calibration_move_cp_losses_data[move_loss_offset..move_loss_offset + LEGAL_MOVES]
+                    .copy_from_slice(&dense_losses);
+            }
 
             fens.push(item.fen.clone());
         }
@@ -407,10 +509,24 @@ where
         let value_weights =
             Tensor::<B, 1>::from_data(TensorData::from(value_weights_data.as_slice()), device);
 
-        let material_imbalance = Tensor::<B, 1>::from_data(
-            TensorData::from(material_imbalance_data.as_slice()),
+        let material_imbalance =
+            Tensor::<B, 1>::from_data(TensorData::from(material_imbalance_data.as_slice()), device);
+        let calibration_mask =
+            Tensor::<B, 1>::from_data(TensorData::from(calibration_mask_data.as_slice()), device);
+        let calibration_target_cp_loss = Tensor::<B, 1>::from_data(
+            TensorData::from(calibration_target_cp_loss_data.as_slice()),
             device,
         );
+        let calibration_target_bins = Tensor::<B, 1>::from_data(
+            TensorData::from(calibration_target_bins_data.as_slice()),
+            device,
+        )
+        .reshape([batch_size, RegretBin::COUNT]);
+        let calibration_move_cp_losses = Tensor::<B, 1>::from_data(
+            TensorData::from(calibration_move_cp_losses_data.as_slice()),
+            device,
+        )
+        .reshape([batch_size, LEGAL_MOVES]);
 
         ChessBatch {
             board_input,
@@ -424,6 +540,10 @@ where
             global_features,
             value_weights,
             material_imbalance,
+            calibration_mask,
+            calibration_target_cp_loss,
+            calibration_target_bins,
+            calibration_move_cp_losses,
         }
     }
 }

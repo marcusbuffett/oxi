@@ -1,3 +1,4 @@
+pub mod calibration;
 pub mod config;
 pub mod constants;
 pub mod distribution_utils;
@@ -105,6 +106,8 @@ pub mod reduce_on_plateau_scheduler;
 pub mod time_usage_loss_metric;
 #[cfg(feature = "train")]
 pub mod training_stage_metric;
+#[cfg(feature = "train")]
+pub mod training_stream;
 #[cfg(feature = "train")]
 pub mod tui;
 #[cfg(feature = "train")]

@@ -1,3 +1,5 @@
+use crate::calibration::calibration_skill_band_label;
+use crate::calibration::RegretBin;
 use crate::config::{
     ModelConfig, BOARD_FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS, RECENCY_FEATURES,
 };
@@ -65,6 +67,8 @@ pub struct OXIModel<B: Backend> {
     aux_trunk_from_square_hidden: Linear<B>,
     aux_trunk_to_square_head: Linear<B>,
     aux_trunk_to_square_hidden: Linear<B>,
+    cp_loss_head_hidden: Linear<B>,
+    cp_loss_head: Linear<B>,
 }
 
 impl<B: Backend> OXIModel<B> {
@@ -86,9 +90,11 @@ impl<B: Backend> OXIModel<B> {
             .init(device);
 
         // Learnable per-square positional embedding
-        let square_embed = Param::from_tensor(
-            Tensor::random([64, base_embed_dim], burn::tensor::Distribution::Normal(0.0, 0.02), device),
-        );
+        let square_embed = Param::from_tensor(Tensor::random(
+            [64, base_embed_dim],
+            burn::tensor::Distribution::Normal(0.0, 0.02),
+            device,
+        ));
 
         // Spatial conv: 3x3 neighbor gather + linear projection (channels-last, no permute)
         let spatial_conv = if config.conv_layers() > 0 {
@@ -177,13 +183,21 @@ impl<B: Backend> OXIModel<B> {
         let aux_trunk_from_square_head = LinearConfig::new(config.embed_dim(), 1)
             .with_initializer(std_init.clone())
             .init(device);
-        let aux_trunk_from_square_hidden = LinearConfig::new(config.embed_dim(), config.embed_dim())
-            .with_initializer(std_init.clone())
-            .init(device);
+        let aux_trunk_from_square_hidden =
+            LinearConfig::new(config.embed_dim(), config.embed_dim())
+                .with_initializer(std_init.clone())
+                .init(device);
         let aux_trunk_to_square_head = LinearConfig::new(config.embed_dim(), 1)
             .with_initializer(std_init.clone())
             .init(device);
         let aux_trunk_to_square_hidden = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
+        let cp_loss_head_hidden =
+            LinearConfig::new(config.embed_dim() + NUM_GLOBALS, config.embed_dim())
+                .with_initializer(std_init.clone())
+                .init(device);
+        let cp_loss_head = LinearConfig::new(config.embed_dim(), RegretBin::COUNT)
             .with_initializer(std_init.clone())
             .init(device);
 
@@ -223,6 +237,8 @@ impl<B: Backend> OXIModel<B> {
             aux_trunk_from_square_hidden,
             aux_trunk_to_square_head,
             aux_trunk_to_square_hidden,
+            cp_loss_head_hidden,
+            cp_loss_head,
         }
     }
 
@@ -240,7 +256,14 @@ impl<B: Backend> OXIModel<B> {
         &self,
         board: Tensor<B, 3>,
         globals: Tensor<B, 2, Float>,
-    ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 3>, Tensor<B, 3>) {
+    ) -> (
+        Tensor<B, 3>,
+        Tensor<B, 2>,
+        Tensor<B, 2>,
+        Tensor<B, 2>,
+        Tensor<B, 3>,
+        Tensor<B, 3>,
+    ) {
         start_forward_pass();
         let device = board.device();
         let total_timing = TimingScope::new_with_sync::<B>("forward_total", &device);
@@ -311,8 +334,11 @@ impl<B: Backend> OXIModel<B> {
             let _timing = TimingScope::new_with_sync::<B>("policy_head", &device);
             let tokens = {
                 let _t = TimingScope::new_with_sync::<B>("policy_block", &device);
-                self.policy_block
-                    .forward_with_film(x.clone(), &self.smolgen_weight_gen, globals.clone())
+                self.policy_block.forward_with_film(
+                    x.clone(),
+                    &self.smolgen_weight_gen,
+                    globals.clone(),
+                )
             };
             log_tensor_stats("policy.tokens", &tokens);
             let logits = {
@@ -330,21 +356,29 @@ impl<B: Backend> OXIModel<B> {
         let value_logits = {
             let _stream = StreamScope::enter("value");
             let _timing = TimingScope::new_with_sync::<B>("value_head", &device);
-            let value_tokens = self.value_block.forward_with_film(x.clone(), &self.smolgen_weight_gen, globals.clone());
+            let value_tokens = self.value_block.forward_with_film(
+                x.clone(),
+                &self.smolgen_weight_gen,
+                globals.clone(),
+            );
             log_tensor_stats("value.tokens", &value_tokens);
 
             // Attention pooling: fc1 → silu → fc2 → softmax → weighted sum
             let pool_hidden = silu(self.value_pool_fc1.forward(value_tokens.clone()));
-            let pool_logits = self.value_pool_fc2.forward(pool_hidden).reshape([aux_batch_size, 64]);
+            let pool_logits = self
+                .value_pool_fc2
+                .forward(pool_hidden)
+                .reshape([aux_batch_size, 64]);
             // Scale logits by 1/sqrt(embed_dim) to prevent softmax saturation
             // Without scaling, the fc2 dot product over embed_dim dimensions produces
             // logits whose variance grows with embed_dim, causing the softmax to
             // concentrate on a single position and killing gradients through fc1/fc2.
             let scale = (embed_dim as f64).sqrt();
             let pool_logits = pool_logits / scale;
-            let pool_weights = softmax(pool_logits, 1)
-                .reshape([aux_batch_size, 64, 1]);
-            let pooled = (value_tokens * pool_weights).sum_dim(1).reshape([aux_batch_size, embed_dim]);
+            let pool_weights = softmax(pool_logits, 1).reshape([aux_batch_size, 64, 1]);
+            let pooled = (value_tokens * pool_weights)
+                .sum_dim(1)
+                .reshape([aux_batch_size, embed_dim]);
             log_tensor_stats("value.pooled", &pooled);
 
             // Concat with globals, hidden layer, output
@@ -382,8 +416,14 @@ impl<B: Backend> OXIModel<B> {
         let config = get_global_config();
         let batch_size = batch.board_input.shape().dims[0];
 
-        let (policy_logits, value_logits, _side_info_logits, time_usage_logits, trunk_output, policy_tokens) =
-            self.forward_with_trunk(batch.board_input, batch.global_features);
+        let (
+            policy_logits,
+            value_logits,
+            _side_info_logits,
+            time_usage_logits,
+            trunk_output,
+            policy_tokens,
+        ) = self.forward_with_trunk(batch.board_input, batch.global_features.clone());
 
         let policy_logits_flat_original = policy_logits.reshape([batch_size, LEGAL_MOVES]);
 
@@ -413,7 +453,9 @@ impl<B: Backend> OXIModel<B> {
             batch.move_distributions.clone() * (1.0 - eps) + uniform_over_legal * eps;
 
         // Standard cross-entropy loss per sample
-        let ce_loss_per_sample = (targets_smoothed.clone() * log_policy.clone()).sum_dim(1).neg();
+        let ce_loss_per_sample = (targets_smoothed.clone() * log_policy.clone())
+            .sum_dim(1)
+            .neg();
 
         // Focal Loss: FL(p_t) = -(1 - p_t)^γ * log(p_t)
         let gamma = config.focal_loss_gamma;
@@ -481,7 +523,13 @@ impl<B: Backend> OXIModel<B> {
         let config_weighted_policy_loss = base_policy_loss.clone() * config.policy_loss_weight;
 
         // Auxiliary losses (mobility + material prediction)
-        let (base_aux_loss, aux_mobility_loss_f32, aux_material_loss_f32, aux_mobility_mae_f32, aux_material_mae_f32) = if config.aux_loss_weight > 0.0 {
+        let (
+            base_aux_loss,
+            aux_mobility_loss_f32,
+            aux_material_loss_f32,
+            aux_mobility_mae_f32,
+            aux_material_mae_f32,
+        ) = if config.aux_loss_weight > 0.0 {
             // Mobility: predict legal move count per square from trunk output
             let legal_per_square = batch
                 .legal_moves
@@ -501,7 +549,10 @@ impl<B: Backend> OXIModel<B> {
 
             // Material: predict material imbalance from mean-pooled trunk
             let embed_dim = trunk_output.dims()[2];
-            let trunk_pooled = trunk_output.clone().mean_dim(1).reshape([batch_size, embed_dim]);
+            let trunk_pooled = trunk_output
+                .clone()
+                .mean_dim(1)
+                .reshape([batch_size, embed_dim]);
             let material_pred = self
                 .aux_material_head
                 .forward(trunk_pooled)
@@ -512,99 +563,196 @@ impl<B: Backend> OXIModel<B> {
             let material_mae = material_diff.abs().mean();
 
             // Extract f32 values for metrics (detached, no grad)
-            let mob_loss_f32 = mobility_mse.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
-            let mat_loss_f32 = material_mse.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
-            let mob_mae_f32 = mobility_mae.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
-            let mat_mae_f32 = material_mae.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let mob_loss_f32 = mobility_mse
+                .clone()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
+            let mat_loss_f32 = material_mse
+                .clone()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
+            let mob_mae_f32 = mobility_mae
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
+            let mat_mae_f32 = material_mae
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
 
-            (mobility_mse + material_mse, mob_loss_f32, mat_loss_f32, mob_mae_f32, mat_mae_f32)
+            (
+                mobility_mse + material_mse,
+                mob_loss_f32,
+                mat_loss_f32,
+                mob_mae_f32,
+                mat_mae_f32,
+            )
         } else {
             (zero_like(), 0.0, 0.0, 0.0, 0.0)
         };
 
         // Maia 2-style auxiliary losses: side info, from-square, to-square
-        let (maia_loss, aux_side_info_loss_f32, aux_from_sq_loss_f32, aux_to_sq_loss_f32, aux_from_sq_acc_f32, aux_to_sq_acc_f32) = if config.aux_loss_weight > 0.0 {
+        let (
+            maia_loss,
+            aux_side_info_loss_f32,
+            aux_from_sq_loss_f32,
+            aux_to_sq_loss_f32,
+            aux_from_sq_acc_f32,
+            aux_to_sq_acc_f32,
+        ) = if config.aux_loss_weight > 0.0 {
             let embed_dim = trunk_output.dims()[2];
 
             // Side info: piece moved/captured/check (first 13 values)
-            let side_info_target_int = batch.side_info.clone()
-                .slice([0..batch_size, 0..13]);
-            let trunk_pooled_si = trunk_output.clone().mean_dim(1).reshape([batch_size, embed_dim]);
+            let side_info_target_int = batch.side_info.clone().slice([0..batch_size, 0..13]);
+            let trunk_pooled_si = trunk_output
+                .clone()
+                .mean_dim(1)
+                .reshape([batch_size, embed_dim]);
             let side_info_logits = self.side_info_head.forward(trunk_pooled_si);
-            let side_info_bce = self.side_info_bce.forward(side_info_logits, side_info_target_int);
+            let side_info_bce = self
+                .side_info_bce
+                .forward(side_info_logits, side_info_target_int);
 
-            let si_loss_f32 = side_info_bce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let si_loss_f32 = side_info_bce
+                .clone()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
 
             // From-square: per-token prediction using policy tokens → [batch, 64]
-            let from_sq_hidden = silu(self.aux_from_square_hidden
-                .forward(policy_tokens.clone()));
-            let from_sq_logits = self.aux_from_square_head
+            let from_sq_hidden = silu(self.aux_from_square_hidden.forward(policy_tokens.clone()));
+            let from_sq_logits = self
+                .aux_from_square_head
                 .forward(from_sq_hidden)
                 .reshape([batch_size, 64]);
-            let from_sq_target_int = batch.side_info.clone()
-                .slice([0..batch_size, 13..77]);
+            let from_sq_target_int = batch.side_info.clone().slice([0..batch_size, 13..77]);
 
             // Use cross-entropy instead of BCE: from-square is a 64-class classification
             let from_sq_log_probs = log_softmax(from_sq_logits.clone(), 1);
             let from_sq_target_float = from_sq_target_int.clone().float();
-            let from_sq_ce = (from_sq_target_float * from_sq_log_probs).sum_dim(1).neg().mean();
+            let from_sq_ce = (from_sq_target_float * from_sq_log_probs)
+                .sum_dim(1)
+                .neg()
+                .mean();
 
-            let from_loss_f32 = from_sq_ce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let from_loss_f32 = from_sq_ce
+                .clone()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
 
             // From-square accuracy: argmax match
             let from_pred = from_sq_logits.argmax(1).squeeze_dim::<1>(1);
             let from_true = from_sq_target_int.argmax(1).squeeze_dim::<1>(1);
             let from_correct = from_pred.equal(from_true).float().mean();
-            let from_acc_f32 = from_correct.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let from_acc_f32 = from_correct
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
 
             // To-square: per-token prediction using policy tokens → [batch, 64]
-            let to_sq_hidden = silu(self.aux_to_square_hidden
-                .forward(policy_tokens.clone()));
-            let to_sq_logits = self.aux_to_square_head
+            let to_sq_hidden = silu(self.aux_to_square_hidden.forward(policy_tokens.clone()));
+            let to_sq_logits = self
+                .aux_to_square_head
                 .forward(to_sq_hidden)
                 .reshape([batch_size, 64]);
-            let to_sq_target_int = batch.side_info.clone()
-                .slice([0..batch_size, 77..141]);
+            let to_sq_target_int = batch.side_info.clone().slice([0..batch_size, 77..141]);
 
             // Use cross-entropy instead of BCE: to-square is a 64-class classification
             let to_sq_log_probs = log_softmax(to_sq_logits.clone(), 1);
             let to_sq_target_float = to_sq_target_int.clone().float();
-            let to_sq_ce = (to_sq_target_float * to_sq_log_probs).sum_dim(1).neg().mean();
+            let to_sq_ce = (to_sq_target_float * to_sq_log_probs)
+                .sum_dim(1)
+                .neg()
+                .mean();
 
-            let to_loss_f32 = to_sq_ce.clone().into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let to_loss_f32 = to_sq_ce
+                .clone()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
 
             // To-square accuracy: argmax match
             let to_pred = to_sq_logits.argmax(1).squeeze_dim::<1>(1);
             let to_true = to_sq_target_int.argmax(1).squeeze_dim::<1>(1);
             let to_correct = to_pred.equal(to_true).float().mean();
-            let to_acc_f32 = to_correct.into_data().to_vec::<f32>().unwrap_or_default().first().copied().unwrap_or(0.0);
+            let to_acc_f32 = to_correct
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
 
             // Trunk-level from/to square prediction: direct aux supervision on trunk tokens
             // This gives the trunk direct gradient signal about which squares matter,
             // rather than only getting it indirectly through the policy_block.
-            let trunk_from_sq_target = batch.side_info.clone()
-                .slice([0..batch_size, 13..77]);
-            let trunk_from_sq_hidden = silu(self.aux_trunk_from_square_hidden
-                .forward(trunk_output.clone()));
-            let trunk_from_sq_logits = self.aux_trunk_from_square_head
+            let trunk_from_sq_target = batch.side_info.clone().slice([0..batch_size, 13..77]);
+            let trunk_from_sq_hidden = silu(
+                self.aux_trunk_from_square_hidden
+                    .forward(trunk_output.clone()),
+            );
+            let trunk_from_sq_logits = self
+                .aux_trunk_from_square_head
                 .forward(trunk_from_sq_hidden)
                 .reshape([batch_size, 64]);
             let trunk_from_sq_log_probs = log_softmax(trunk_from_sq_logits, 1);
             let trunk_from_sq_target_float = trunk_from_sq_target.float();
-            let trunk_from_sq_ce = (trunk_from_sq_target_float * trunk_from_sq_log_probs).sum_dim(1).neg().mean();
+            let trunk_from_sq_ce = (trunk_from_sq_target_float * trunk_from_sq_log_probs)
+                .sum_dim(1)
+                .neg()
+                .mean();
 
-            let trunk_to_sq_target = batch.side_info.clone()
-                .slice([0..batch_size, 77..141]);
-            let trunk_to_sq_hidden = silu(self.aux_trunk_to_square_hidden
-                .forward(trunk_output.clone()));
-            let trunk_to_sq_logits = self.aux_trunk_to_square_head
+            let trunk_to_sq_target = batch.side_info.clone().slice([0..batch_size, 77..141]);
+            let trunk_to_sq_hidden = silu(
+                self.aux_trunk_to_square_hidden
+                    .forward(trunk_output.clone()),
+            );
+            let trunk_to_sq_logits = self
+                .aux_trunk_to_square_head
                 .forward(trunk_to_sq_hidden)
                 .reshape([batch_size, 64]);
             let trunk_to_sq_log_probs = log_softmax(trunk_to_sq_logits, 1);
             let trunk_to_sq_target_float = trunk_to_sq_target.float();
-            let trunk_to_sq_ce = (trunk_to_sq_target_float * trunk_to_sq_log_probs).sum_dim(1).neg().mean();
+            let trunk_to_sq_ce = (trunk_to_sq_target_float * trunk_to_sq_log_probs)
+                .sum_dim(1)
+                .neg()
+                .mean();
 
-            (side_info_bce + from_sq_ce + to_sq_ce + trunk_from_sq_ce + trunk_to_sq_ce, si_loss_f32, from_loss_f32, to_loss_f32, from_acc_f32, to_acc_f32)
+            (
+                side_info_bce + from_sq_ce + to_sq_ce + trunk_from_sq_ce + trunk_to_sq_ce,
+                si_loss_f32,
+                from_loss_f32,
+                to_loss_f32,
+                from_acc_f32,
+                to_acc_f32,
+            )
         } else {
             (zero_like(), 0.0, 0.0, 0.0, 0.0, 0.0)
         };
@@ -612,10 +760,176 @@ impl<B: Backend> OXIModel<B> {
         let base_aux_loss = base_aux_loss + maia_loss;
         let aux_term = base_aux_loss.clone() * config.aux_loss_weight;
 
+        let (
+            base_calibration_loss,
+            calibration_head_loss_f32,
+            calibration_policy_mae_f32,
+            calibration_head_mae_f32,
+            calibration_labeled_fraction_f32,
+            calibration_overall_score_f32,
+            calibration_policy_signed_error_by_elo,
+        ) = if config.calibration_loss_weight() > 0.0 {
+            let calibration_mask = batch.calibration_mask.clone();
+            let labeled_count = calibration_mask.clone().sum().into_scalar().elem::<f32>();
+            if labeled_count > 0.0 {
+                let embed_dim = trunk_output.dims()[2];
+                let trunk_pooled = trunk_output
+                    .clone()
+                    .mean_dim(1)
+                    .reshape([batch_size, embed_dim]);
+                let cp_loss_hidden = silu(self.cp_loss_head_hidden.forward(Tensor::cat(
+                    vec![trunk_pooled, batch.global_features.clone()],
+                    1,
+                )));
+                let cp_loss_logits = self.cp_loss_head.forward(cp_loss_hidden);
+                let cp_loss_log_probs = log_softmax(cp_loss_logits.clone(), 1);
+                let cp_loss_probs = cp_loss_log_probs.clone().exp();
+
+                let head_ce_per_sample = (batch.calibration_target_bins.clone()
+                    * cp_loss_log_probs)
+                    .sum_dim(1)
+                    .neg()
+                    .reshape([batch_size]);
+
+                let centers: [f32; RegretBin::COUNT] = [
+                    RegretBin::ExactZero.representative_cp(),
+                    RegretBin::Cp1To10.representative_cp(),
+                    RegretBin::Cp11To25.representative_cp(),
+                    RegretBin::Cp26To50.representative_cp(),
+                    RegretBin::Cp51To100.representative_cp(),
+                    RegretBin::Cp101To200.representative_cp(),
+                    RegretBin::Cp201To400.representative_cp(),
+                    RegretBin::Cp400Plus.representative_cp(),
+                ];
+                let center_tensor = Tensor::<B, 1>::from_data(
+                    TensorData::from(centers.as_slice()),
+                    &policy_logits_flat_original.device(),
+                )
+                .reshape([1, RegretBin::COUNT]);
+                let head_expected_cp = (cp_loss_probs * center_tensor)
+                    .sum_dim(1)
+                    .reshape([batch_size]);
+
+                let policy_probs = log_policy.clone().exp().mask_fill(mask.clone(), 0.0);
+                let policy_expected_cp = (policy_probs * batch.calibration_move_cp_losses.clone())
+                    .sum_dim(1)
+                    .reshape([batch_size]);
+
+                let target_cp = batch.calibration_target_cp_loss.clone();
+                let mask_sum = calibration_mask.clone().sum().clamp_min(1.0);
+                let head_ce =
+                    (head_ce_per_sample * calibration_mask.clone()).sum() / mask_sum.clone();
+                let policy_mae = ((policy_expected_cp.clone() - target_cp.clone()).abs()
+                    * calibration_mask.clone())
+                .sum()
+                    / mask_sum.clone();
+                let head_mae = ((head_expected_cp - target_cp).abs() * calibration_mask.clone())
+                    .sum()
+                    / mask_sum.clone();
+
+                let base_loss =
+                    head_ce.clone() + policy_mae.clone() * 0.01 + head_mae.clone() * 0.005;
+
+                let mut signed_error_sums =
+                    std::collections::BTreeMap::<String, (f32, usize)>::new();
+                let policy_expected_cp_values = policy_expected_cp
+                    .clone()
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap_or_default();
+                let target_cp_values = batch
+                    .calibration_target_cp_loss
+                    .clone()
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap_or_default();
+                let calibration_mask_values = batch
+                    .calibration_mask
+                    .clone()
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap_or_default();
+                for (idx, item) in batch.items.iter().enumerate() {
+                    if calibration_mask_values.get(idx).copied().unwrap_or(0.0) <= 0.0 {
+                        continue;
+                    }
+                    let signed_error = policy_expected_cp_values.get(idx).copied().unwrap_or(0.0)
+                        - target_cp_values.get(idx).copied().unwrap_or(0.0);
+                    let bucket = calibration_skill_band_label(item.elo_self).to_string();
+                    let entry = signed_error_sums.entry(bucket).or_insert((0.0, 0));
+                    entry.0 += signed_error;
+                    entry.1 += 1;
+                }
+                let calibration_policy_signed_error_by_elo = signed_error_sums
+                    .into_iter()
+                    .filter_map(|(bucket, (sum, count))| {
+                        (count > 0).then_some((bucket, sum / count as f32))
+                    })
+                    .collect::<Vec<_>>();
+                let calibration_overall_score = {
+                    let mut total_score = 0.0f32;
+                    let mut total_count = 0usize;
+                    for idx in 0..policy_expected_cp_values.len() {
+                        if calibration_mask_values.get(idx).copied().unwrap_or(0.0) <= 0.0 {
+                            continue;
+                        }
+                        let abs_error = (policy_expected_cp_values[idx]
+                            - target_cp_values.get(idx).copied().unwrap_or(0.0))
+                        .abs();
+                        let bounded = (1.0 - (abs_error.min(200.0) / 200.0)).max(0.0);
+                        total_score += bounded;
+                        total_count += 1;
+                    }
+                    if total_count > 0 {
+                        total_score / total_count as f32
+                    } else {
+                        0.0
+                    }
+                };
+
+                (
+                    base_loss,
+                    head_ce
+                        .clone()
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap_or_default()
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0),
+                    policy_mae
+                        .clone()
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap_or_default()
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0),
+                    head_mae
+                        .clone()
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap_or_default()
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0),
+                    labeled_count / batch_size as f32,
+                    calibration_overall_score,
+                    calibration_policy_signed_error_by_elo,
+                )
+            } else {
+                (zero_like(), 0.0, 0.0, 0.0, 0.0, 0.0, Vec::new())
+            }
+        } else {
+            (zero_like(), 0.0, 0.0, 0.0, 0.0, 0.0, Vec::new())
+        };
+        let calibration_term = base_calibration_loss.clone() * config.calibration_loss_weight();
+
         let loss = config_weighted_policy_loss.clone()
             + value_term.clone()
             + time_usage_term.clone()
-            + aux_term.clone();
+            + aux_term.clone()
+            + calibration_term.clone();
 
         // Accuracy
         let targets = batch.move_distributions.clone().argmax(1).squeeze_dim(1);
@@ -629,6 +943,7 @@ impl<B: Backend> OXIModel<B> {
             value_term.clone(),
             time_usage_term.clone(),
             aux_term,
+            calibration_term.clone(),
             policy_logits_flat,
             targets,
             value_logits,
@@ -645,6 +960,15 @@ impl<B: Backend> OXIModel<B> {
             base_value_loss,
             base_time_usage_loss,
             base_aux_loss,
+        )
+        .with_base_calibration_loss(base_calibration_loss)
+        .with_calibration_metrics(
+            calibration_head_loss_f32,
+            calibration_policy_mae_f32,
+            calibration_head_mae_f32,
+            calibration_labeled_fraction_f32,
+            calibration_overall_score_f32,
+            calibration_policy_signed_error_by_elo,
         )
         .with_aux_metrics(
             aux_mobility_loss_f32,

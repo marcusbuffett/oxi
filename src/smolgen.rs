@@ -212,9 +212,8 @@ impl<B: Backend> SmolgenAttention<B> {
         // Initialize log_temperature so exp(log_temp) = 1/sqrt(head_dim)
         // i.e., log_temp = -0.5 * ln(head_dim)
         let init_log_temp = -0.5 * (head_dim as f64).ln();
-        let log_temperature = Param::from_tensor(
-            Tensor::full([num_heads], init_log_temp as f32, device),
-        );
+        let log_temperature =
+            Param::from_tensor(Tensor::full([num_heads], init_log_temp as f32, device));
 
         Self {
             qkv_proj,
@@ -258,9 +257,8 @@ impl<B: Backend> SmolgenAttention<B> {
         let k_norm = RmsNormConfig::new(head_dim).init(device);
 
         let init_log_temp = -0.5 * (head_dim as f64).ln();
-        let log_temperature = Param::from_tensor(
-            Tensor::full([num_heads], init_log_temp as f32, device),
-        );
+        let log_temperature =
+            Param::from_tensor(Tensor::full([num_heads], init_log_temp as f32, device));
 
         Self {
             qkv_proj,
@@ -333,7 +331,10 @@ impl<B: Backend> SmolgenAttention<B> {
 
         // Learnable per-head temperature: scale Q by exp(log_temperature) per head
         // Shape: [num_heads] -> [1, num_heads, 1, 1] for broadcasting
-        let temperature = self.log_temperature.val().exp()
+        let temperature = self
+            .log_temperature
+            .val()
+            .exp()
             .reshape([1, num_heads, 1, 1]);
         let q_scaled = q * temperature;
 
