@@ -1149,7 +1149,7 @@ impl Default for Config {
             lr_window_size: 300,
             lr_improvement_threshold: 0.005,
             lr_reduction_factor: 0.7,
-            lr_multiplier: 1.0,
+            lr_multiplier: 1.2,
             muon_base_lr: default_muon_base_lr(),
             adamw_base_lr: default_adamw_base_lr(),
             embedding_base_lr: default_embedding_base_lr(),

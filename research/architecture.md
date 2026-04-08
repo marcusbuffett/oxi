@@ -1,6 +1,8 @@
 # Oxi Architecture Reference (for Research Agents)
 
-This document describes the full Oxi chess model as used by `research_loop.py`. It covers the model architecture, input representation, output heads, loss functions, training loop, optimizer configuration, metrics logging, data pipeline, and evaluation. All values reflect what actually runs during a research loop iteration unless noted otherwise.
+This document describes the Oxi training stack as it actually exists in the current codebase used by `research_loop.py`. It covers the model architecture, input representation, output heads, loss functions, GradNorm setup, optimizer configuration, data pipeline, centipawn-loss calibration path, metrics logging, and evaluation scoring.
+
+If this file and an older research note disagree, trust the code and update this file.
 
 ---
 
@@ -11,44 +13,63 @@ This document describes the full Oxi chess model as used by `research_loop.py`. 
 3. [Model Architecture](#model-architecture)
 4. [Output Heads](#output-heads)
 5. [Loss Functions](#loss-functions)
-6. [GradNorm (Adaptive Loss Weighting)](#gradnorm)
-7. [Optimizer & Learning Rate](#optimizer--learning-rate)
-8. [LR Scheduling (Reduce-on-Plateau)](#lr-scheduling)
+6. [GradNorm](#gradnorm)
+7. [Optimizer \& Learning Rate](#optimizer--learning-rate)
+8. [LR Scheduling](#lr-scheduling)
 9. [Data Pipeline](#data-pipeline)
-10. [Training Loop Details](#training-loop-details)
-11. [Metrics Logging & File Format](#metrics-logging--file-format)
-12. [Evaluation & Scoring](#evaluation--scoring)
-13. [Hyperparameter Reference](#hyperparameter-reference)
-14. [Key Source Files](#key-source-files)
+10. [Centipawn-Loss Calibration](#centipawn-loss-calibration)
+11. [Training Loop Details](#training-loop-details)
+12. [Metrics Logging \& File Format](#metrics-logging--file-format)
+13. [Evaluation \& Scoring](#evaluation--scoring)
+14. [Hyperparameter Reference](#hyperparameter-reference)
+15. [Key Source Files](#key-source-files)
 
 ---
 
 ## Research Loop Context
 
-The research loop (`research_loop.py`) spawns subagents to propose code changes, then evaluates them via two 60-minute training runs (different seeds). Key overrides from code defaults:
+The research loop (`research_loop.py`) proposes a single code change, compiles it, builds a release binary, runs one 60-minute training job, and decides whether to keep the change by comparing the new run against the current best run.
+
+The standard research training command is:
+
+```bash
+./target/release/oxi train \
+  --pretrain-samples=0 \
+  --data-path=../data \
+  --physical-batch-size=512 \
+  --seed=<varies> \
+  --log-dir=<run_dir> \
+  --disable-tui \
+  --warmup-multiplier=0.1 \
+  --log-gradient-breakdown \
+  --full-metrics-interval=200 \
+  --gradnorm-interval=200 \
+  --checkpoint-interval=0
+```
+
+Key overrides from code defaults:
 
 | Parameter | Research Loop Value | Code Default |
-|-----------|-------------------|--------------|
-| `physical_batch_size` | **512** (CLI override) | 16000 |
-| `warmup_multiplier` | **0.1** (CLI override) | 2.0 |
-| `full_metrics_interval` | **200** (CLI override) | 50 |
-| `gradnorm_interval` | **200** (CLI override) | 20 |
-| `checkpoint_interval` | **0** (disabled, CLI override) | 100 |
+|-----------|---------------------|--------------|
+| `physical_batch_size` | **512** | 16000 |
+| `warmup_multiplier` | **0.1** | 2.0 |
+| `full_metrics_interval` | **200** | 50 |
+| `gradnorm_interval` | **200** | 20 |
+| `checkpoint_interval` | **0** | 100 |
 | `--disable-tui` | yes | no |
 | `--log-gradient-breakdown` | yes | no |
-| Training duration | 3600s per seed × 2 seeds (killed via SIGKILL) | unlimited |
+| `pretrain_samples` | **0** | 0 |
 
-**Architecture is NOT pinned via CLI.** The model's `embed_dim`, `num_layers`, and `head_dim` come from defaults in `src/config.rs` (currently 192, 12, 24). If you want to change the architecture, modify those defaults directly. The training command does not pass `--embed-dim`, `--num-layers`, or `--head-dim`.
+Architecture is not pinned by CLI. The research loop relies on `Config::default()` in `src/config.rs`, which currently means:
 
-Everything else uses code defaults. The training command is:
-```
-./target/release/oxi train \
-  --pretrain-samples=0 --data-path=../data \
-  --physical-batch-size=512 \
-  --seed=<varies> --log-dir=<run_dir> --disable-tui \
-  --warmup-multiplier=0.1 --log-gradient-breakdown \
-  --full-metrics-interval=200 --gradnorm-interval=200 --checkpoint-interval=0
-```
+| Parameter | Current Default |
+|-----------|-----------------|
+| `embed_dim` | 192 |
+| `num_layers` | 12 |
+| `num_heads` | 6 |
+| `conv_layers` | 0 |
+
+The research loop score now includes centipawn-loss calibration in addition to move/value/aux metrics. That calibration component is coverage-gated so runs with too little labeled calibration data do not get over-rewarded.
 
 ---
 
@@ -56,78 +77,53 @@ Everything else uses code defaults. The training command is:
 
 ### Board Encoding: 64 squares × 65 features per square
 
-Each of the 64 squares gets a feature vector of length `FEATURES_PER_TOKEN = 65`:
+Each of the 64 squares gets a feature vector of length `FEATURES_PER_TOKEN = 65`.
 
-**`BOARD_FEATURES_PER_TOKEN = 61`** (current position only, before recency):
+`BOARD_FEATURES_PER_TOKEN = 61`:
 
-| Group | Features | Count | Description |
-|-------|----------|-------|-------------|
-| **Piece Identity** | 0–11 | 12 | One-hot for piece type: 6 white (P,N,B,R,Q,K) + 6 black |
-| **Tactical** | 12–33 | 22 | See breakdown below |
-| **Positional** | 34–58 | 25 | See breakdown below |
-| **Misc** | 59–60 | 2 | En passant target (1), local castling right (1) |
+| Group | Count | Notes |
+|-------|-------|-------|
+| Piece identity | 12 | one-hot for white/black piece type |
+| Tactical | 22 | attacker roles/counts/material, pin flags, hanging flag, square control |
+| Positional | 25 | local mobility, pawn structure, weak squares, open file, passed pawn, rank/file one-hots |
+| Misc | 2 | en passant target, local castling right |
 
-**Tactical features (22):**
-- White attackers by role: 6 one-hots (one per piece type, clamped to 0/1)
-- White total attacker material: 1 (sum of attacker piece values, normalized by 24)
-- White attacker count: 1 (normalized by 6)
-- Black attackers by role: 6 one-hots
-- Black total attacker material: 1
-- Black attacker count: 1
-- Pinned flag: 1
-- Absolute pin to king: 1
-- Pin target flag: 1
-- Hanging piece flag: 1
-- Has pinned defender: 1
-- Square control value: 1
+`RECENCY_FEATURES = 4` are appended after the 61 board features:
 
-**Positional features (25):**
-- Normalized legal moves from square: 1
-- Pawn structure (isolated, backward, doubled): 3
-- Weak square (white perspective, black perspective): 2
-- Open file: 1
-- Passed pawn: 1
-- Dark square flag: 1
-- Rank one-hot: 8
-- File one-hot: 8
+| Feature | Meaning |
+|---------|---------|
+| White from heatmap | decayed move-from history |
+| White to heatmap | decayed move-to history |
+| Black from heatmap | decayed move-from history |
+| Black to heatmap | decayed move-to history |
 
-**`RECENCY_FEATURES = 4`** (appended after the 61 board features):
-- White move-from heatmap: 1 (exponential decay over last 5 positions, decay=0.8)
-- White move-to heatmap: 1
-- Black move-from heatmap: 1
-- Black move-to heatmap: 1
-
-These are per-square scalars encoding recent move history with `HISTORY_DECAY = 0.8` over `PREVIOUS_POSITIONS = 5` half-moves.
+Recency uses `PREVIOUS_POSITIONS = 5` and `HISTORY_DECAY = 0.8`.
 
 ### Global Features: `NUM_GLOBALS = 10`
 
-A single vector per position, not per-square:
+These are per-position features used for FiLM conditioning and head readouts:
 
-| Index | Feature | Normalization |
-|-------|---------|---------------|
-| 0 | Time remaining (self) | / 1500, clamped [0, 1] |
-| 1 | Time remaining (self) as ratio to base time | ratio |
-| 2 | Time remaining (opponent) | / 1500, clamped [0, 1] |
-| 3 | Time remaining (opponent) as ratio to base time | ratio |
-| 4 | Increment as ratio to base time | ratio |
-| 5 | Move count | / 300, clamped [0, 1] |
-| 6 | Elo (self) | (elo - 800) / 2000, clamped [0, 1] |
-| 7 | Puzzle flag | 0.0 or 1.0 |
-| 8 | Material imbalance | (material / 15), mapped from [-1,1] to [0,1] |
-| 9 | Total pieces / 32 | clamped [0, 1] — game phase proxy |
-
-Global features are used for FiLM conditioning throughout the transformer and concatenated with pooled tokens in the value head.
+| Index | Feature |
+|-------|---------|
+| 0 | self time remaining, normalized |
+| 1 | self time / base time |
+| 2 | opponent time remaining, normalized |
+| 3 | opponent time / base time |
+| 4 | increment / base time |
+| 5 | move count, normalized |
+| 6 | self Elo, normalized |
+| 7 | puzzle flag |
+| 8 | material imbalance, normalized |
+| 9 | total pieces / 32 |
 
 ### Move Encoding: `LEGAL_MOVES = 64 × 76 = 4864`
 
-Each move is encoded as `(from_square, target_index)` where:
-- target_index 0–63: standard move to that destination square
-- target_index 64–75: promotion moves (3 directions × 4 piece types)
-  - Direction 0 (left diagonal): indices 64–67 (knight, bishop, rook, queen)
-  - Direction 1 (straight): indices 68–71
-  - Direction 2 (right diagonal): indices 72–75
+Moves are encoded as `(from_square, target_index)`:
 
-The flat index is `from_square * 76 + target_index`.
+- `0..63`: ordinary target squares
+- `64..75`: promotion targets
+
+The flat move index is `from_square * 76 + target_index`.
 
 ---
 
@@ -135,180 +131,166 @@ The flat index is `from_square * 76 + target_index`.
 
 ### Overview
 
-Pre-norm transformer operating on 64 square tokens, with FiLM conditioning from global features, Smolgen attention biases, and SwiGLU MLPs.
+Oxi is a pre-norm transformer over 64 square tokens with:
 
-```
-Input: [batch, 64, 65]
-  ↓
-Split → board_features [batch, 64, 61] + recency [batch, 64, 4]
-  ↓
-Linear(61 → base_embed_dim) + learnable square embeddings [64, base_embed_dim]
-  → token_embeddings [batch, 64, base_embed_dim]
-  ↓
-Concat(token_embeddings, RmsNorm(recency)) → [batch, 64, embed_dim]
-  ↓
-Optional: SpatialConv (if conv_layers > 0)
-  ↓
-N × TransformerBlock (with FiLM conditioning from globals)   ← "trunk"
-  ↓
-RmsNorm → trunk_output [batch, 64, embed_dim]
-  ↓
-┌─ policy_block (1 extra TransformerBlock) → policy_tokens
-├─ value_block  (1 extra TransformerBlock) → value_tokens
-└─ trunk_output used directly for: SideInfo, Aux (mobility, material, trunk from/to)
-  ↓
-Heads: Policy (from policy_tokens), Value (from value_tokens),
-       TimeUsage (disabled), SideInfo, Aux
+- FiLM-conditioned RMSNorm using the 10 global features
+- Smolgen-generated attention biases
+- SwiGLU MLP blocks
+- one extra transformer block for the policy path
+- one extra transformer block for the value path
+
+High-level structure:
+
+```text
+board_input [B, 64, 65]
+  -> split board features / recency
+  -> token embed + square embeddings + recency concat
+  -> trunk transformer blocks (num_layers)
+  -> RMSNorm
+  -> policy block -> policy tokens -> policy head
+  -> value block  -> value tokens  -> value head
+  -> trunk/policy pooled features -> aux heads + CP-loss head
 ```
 
-**Total transformer blocks = `num_layers + 2`** (trunk + 1 policy + 1 value). For research config: 12 + 2 = **14 blocks**.
+For current defaults:
 
-Where `base_embed_dim = embed_dim - RECENCY_FEATURES = 192 - 4 = 188` in the research config.
+- `embed_dim = 192`
+- `num_layers = 12`
+- `num_heads = 6`
+- `head_dim = 32`
+- total transformer blocks on the active forward path = 14
 
 ### Learnable Square Embeddings
 
-A `[64, base_embed_dim]` parameter tensor, initialized with Normal(0, 0.02). Added to each square's token embedding before concatenation with recency features.
+A `[64, base_embed_dim]` parameter tensor is added to token embeddings before recency channels are concatenated.
 
-### Spatial Convolution (optional, `conv_layers` default=0)
+### Spatial Convolution
 
-When enabled, applies a 3×3 neighborhood gather on the 8×8 board:
-- Gathers 9 patches (center ± 1 in each direction, zero-padded at edges)
-- Concatenates along channels: `[batch, 64, 9 * channels]`
-- Linear projection: `9 * in_channels → in_channels`
-- SiLU activation
+`conv_layers` exists, but the current default is `0`, so research-loop runs do not use spatial convolution unless code or config defaults are changed.
 
 ### Transformer Block
 
-Each block contains:
+Each block has:
 
-1. **FiLM-RmsNorm** → pre-norm with global feature modulation
-2. **SmolgenAttention** → multi-head self-attention with position-dependent biases
-3. **Residual connection** (plain addition; residual scaling is initialization-only, see below)
-4. **FiLM-RmsNorm** → pre-norm
-5. **SwiGLU MLP**
-6. **Residual connection**
+1. FiLM-RMSNorm
+2. Smolgen attention
+3. residual add
+4. FiLM-RMSNorm
+5. SwiGLU MLP
+6. residual add
 
-#### FiLM-RmsNorm
+#### FiLM-RMSNorm
 
-Standard RmsNorm augmented with Feature-wise Linear Modulation:
+The global feature vector modulates normalized token activations:
+
+```text
+gamma = gamma_proj(globals) + 1
+beta  = beta_proj(globals)
+out   = rms_norm(x) * gamma + beta
 ```
-gamma = gamma_proj(globals) + 1.0    # [batch, embed_dim]
-beta = beta_proj(globals)            # [batch, embed_dim]
-output = rms_norm(x) * gamma + beta
-```
-Where `gamma_proj` and `beta_proj` are `Linear(NUM_GLOBALS, embed_dim)`.
 
-#### SmolgenAttention
+#### Smolgen Attention
 
-Multi-head attention with dynamic position-dependent bias:
-
-- **QKV projection**: `Linear(embed_dim, 3 * embed_dim)` → split into Q, K, V
-- **Head split**: `[batch, 64, embed_dim] → [batch, num_heads, 64, head_dim]`
-- **Attention**: `softmax((Q @ K^T) / sqrt(head_dim) + positional_bias)`
-- **Output projection**: `Linear(embed_dim, embed_dim)` with residual scaling
-
-**Smolgen (position bias generator):**
-1. Per-token compression: `Linear(embed_dim, smolgen_hidden)` → `[batch, 64, smolgen_hidden]`
-2. Flatten: `[batch, 64 * smolgen_hidden]`
-3. Global extraction: `Linear(64 * smolgen_hidden, smolgen_global_dim)` with LayerNorm + SiLU
-4. Per-head projection: `Linear(smolgen_global_dim, num_heads * smolgen_gen_size)` with LayerNorm + SiLU
-5. Shared weight generation: `Linear(smolgen_gen_size, 64 * 64)` → reshape to `[batch, num_heads, 64, 64]`
-
-The weight_gen linear is shared across all transformer layers. Initialized with 0.01 std to keep initial biases small.
-
-Smolgen dimensions are derived from model geometry: `smolgen_hidden=head_dim` (24), `smolgen_global_dim=embed_dim/3` (64), `smolgen_gen_size=embed_dim/4` (48). These are not independently configurable.
+Attention uses standard QKV projections plus a dynamically generated position-dependent bias. The Smolgen generator is shared across layers and derives bias tensors from token activations.
 
 #### SwiGLU MLP
 
-```
-hidden_dim = embed_dim * 2.5  (= 480 for embed_dim=192)
-gate_up = Linear(embed_dim, 2 * hidden_dim)  # fused
-gate, up = split(gate_up)
-hidden = SiLU(gate) * up
-output = Linear(hidden_dim, embed_dim)  # residual-scaled
-```
+The MLP uses a fused gate/up projection, SiLU gating, and a linear projection back to model width.
 
 ### Initialization
 
-- Most weights: Normal(0, 0.02)
-- Residual projections (attention output, MLP down): Normal(0, 0.02 / sqrt(2 * num_layers)) — this is the "residual scaling"; it reduces initial residual magnitude via smaller weights, **not** a runtime scaling factor. The forward pass uses plain `x = x + attn_out` and `x = x + mlp_out`.
-- Smolgen weight_gen: Normal(0, 0.01)
-- Square embeddings: Normal(0, 0.02)
+- most weights: Normal(0, 0.02)
+- residual projections: scaled down by layer-count-dependent init
+- Smolgen generator weights: smaller init
+- square embeddings: Normal(0, 0.02)
 
 ---
 
 ## Output Heads
 
-### 1. Policy Head (Factorized)
+### 1. Policy Head
 
-**Output: `[batch, 64, 76]`** → flattened to `[batch, 4864]`
+Output shape: `[batch, 4864]`
 
-Uses factorized dot-product between source and target token representations. Input comes from **policy_tokens** (output of the dedicated policy transformer block, not raw trunk output):
+The policy head uses factorized source/target projections over `policy_tokens`, with separate promotion handling. Illegal moves are masked before softmax.
 
-```
-source_tokens = Linear(embed_dim, embed_dim)(policy_tokens)  # [batch, 64, embed_dim]
-target_tokens = Linear(embed_dim, embed_dim)(policy_tokens)  # [batch, 64, embed_dim]
-base_logits = source_tokens @ target_tokens.T                # [batch, 64, 64]
-```
-
-**Promotion handling:**
-- Extract promotion-eligible rows and columns based on side to move
-- `promo_from_proj(from_tokens) + promo_to_proj(to_tokens)` → `[batch, n_promo_from, n_promo_to, 4]`
-- Sliced into the [64, 76] output at the correct promotion indices
-
-Illegal moves are masked to `-inf` before softmax.
+This is still the primary output of the model.
 
 ### 2. Value Head (WDL)
 
-**Output: `[batch, 3]`** — logits for (loss, draw, win)
+Output shape: `[batch, 3]`
 
-Input comes from **value_tokens** (output of the dedicated value transformer block applied to a clone of the trunk output). The value block is a single `TransformerBlock` (not a multi-layer tower — `value_tower_layers` config exists but the actual implementation uses one block). Gradients flow back to the trunk through this clone.
+The value head applies one extra transformer block to trunk output, then attention-pools over squares and predicts win/draw/loss logits.
 
-Uses attention pooling over value tokens:
-```
-pool_hidden = SiLU(fc1(value_tokens))              # [batch, 64, embed_dim]
-pool_weights = softmax(fc2(pool_hidden), dim=1)    # [batch, 64, 1] → weights
-pooled = (value_tokens * pool_weights).sum(dim=1)  # [batch, embed_dim]
-combined = concat(pooled, globals)                 # [batch, embed_dim + NUM_GLOBALS]
-hidden = SiLU(head_hidden(combined))               # [batch, embed_dim]
-logits = head_output(hidden)                       # [batch, 3]
-```
+Important implementation note:
 
-**Value weight ramp:** Loss weight scales linearly from 0 at `value_ply_ramp_start=10` to full at `value_ply_ramp_full=30` — early-game positions get less value supervision because outcomes are less attributable.
+- `value_tower_layers` exists in config for future or alternate implementations
+- the active model path still uses a single dedicated `value_block` in `src/model.rs`
 
-### 3. Time Usage Head (DISABLED)
+Value examples are weighted by a ply ramp:
 
-**Currently disabled.** The head parameters exist in the model struct but the forward pass hardcodes the output to `zeros([batch, 2])`. The `time_usage_loss_weight` default is 0.0, so even if logits were computed, the loss would be zero. The head's intended design was to output (alpha, beta) for a Beta distribution modeling clock time fraction, but it is not active.
+- zero before `value_ply_ramp_start = 10`
+- linearly ramps up
+- full weight by `value_ply_ramp_full = 30`
 
-### 4. Side Info Head
+### 3. Time Usage Head
 
-**Output: `[batch, 141]`** — 141 binary/one-hot predictions
+This is effectively disabled in the current regime:
 
-Mean-pooled trunk → linear → 141 logits. Trained with binary cross-entropy. The 141 features are:
-- Indices 0–5: piece moved (6 piece types, one-hot)
-- Indices 6–11: captured piece (6 piece types, one-hot; all zero if no capture)
-- Index 12: check flag (1)
-- Indices 13–76: from-square (64 squares, one-hot)
-- Indices 77–140: to-square (64 squares, one-hot)
+- the config default `time_usage_loss_weight` is `0.0`
+- research-loop runs do not use it for scoring
+
+The plumbing still exists, but it is not an important active training signal right now.
+
+### 4. Side-Info Head
+
+Output shape: `[batch, 141]`
+
+Predicts:
+
+- moved piece type
+- captured piece type
+- check flag
+- from-square
+- to-square
+
+This is trained with BCE and contributes to the auxiliary loss bundle.
 
 ### 5. Auxiliary Heads
 
-**Mobility:** Per-square legal move count prediction.
-- Per-token linear from trunk output → `[batch, 64]`
-- MSE + MAE loss
+These are all grouped into the auxiliary task:
 
-**Material:** Total material imbalance prediction.
-- Mean-pooled trunk → linear → `[batch, 1]`
-- MSE + MAE loss
+- mobility head: per-square legal-move count prediction
+- material head: material imbalance prediction
+- Maia-style from-square head
+- Maia-style to-square head
+- trunk-level from-square head
+- trunk-level to-square head
 
-**From/To Square (Maia 2-style):**
-- Policy-token-level 64-way classification: which square is the from-square / to-square of the played move
-- Cross-entropy loss
-- Accuracy tracked (these are `aux_from_square_accuracy` and `aux_to_square_accuracy` in the composite score)
+`aux_from_square_accuracy` and `aux_to_square_accuracy` are still part of the research score.
 
-**Trunk-level From/To Square:**
-- Direct trunk token supervision (separate from the policy-token version)
-- Additional CE losses: `trunk_from_sq_ce`, `trunk_to_sq_ce`
+### 6. Centipawn-Loss Calibration Head
+
+This is the major recent addition.
+
+Output shape: `[batch, 8]`
+
+The head predicts a categorical distribution over human centipawn-loss bins:
+
+| Bin | Label |
+|-----|-------|
+| 0 | `0` |
+| 1 | `1-10` |
+| 2 | `11-25` |
+| 3 | `26-50` |
+| 4 | `51-100` |
+| 5 | `101-200` |
+| 6 | `201-400` |
+| 7 | `400+` |
+
+This head is trained only on positions that have precomputed Stockfish labels in the calibration database.
+
+It is not the main behavioral target by itself; it is an auxiliary readout used alongside direct policy-side CPL supervision.
 
 ---
 
@@ -316,89 +298,109 @@ Mean-pooled trunk → linear → 141 logits. Trained with binary cross-entropy. 
 
 ### Policy Loss
 
-```python
-# Label smoothing over legal moves only
-smooth_target = (1 - eps) * one_hot(true_move) + eps * uniform(legal_moves)
+Primary move-prediction loss over legal moves only:
 
-# Standard cross-entropy (when focal_loss_gamma == 0):
-loss = -sum(smooth_target * log_softmax(logits))
+- label smoothing over legal moves
+- optional focal loss support, though the current default is standard CE (`focal_loss_gamma = 0.0`)
 
-# Focal loss (when focal_loss_gamma > 0):
-loss = -sum(smooth_target * (1 - p_t)^gamma * log(p_t))
+### Value Loss
+
+Cross-entropy over WDL logits, multiplied by per-example value weights from the ply ramp.
+
+### Time Usage Loss
+
+Present in the plumbing but effectively zeroed in current practice because `time_usage_loss_weight = 0.0`.
+
+### Auxiliary Loss
+
+A single bundled auxiliary task containing:
+
+- mobility loss
+- material loss
+- side-info BCE
+- policy-token from/to CE
+- trunk-token from/to CE
+
+### Centipawn-Loss Calibration Loss
+
+This is active only on examples with calibration labels.
+
+For labeled positions, the model computes:
+
+1. `head_ce`
+   cross-entropy for the 8-bin CPL head
+2. `head_mae`
+   MAE between the head's expected CPL and the human target CPL
+3. `policy_mae`
+   MAE between the policy-implied expected CPL and the human target CPL
+
+Policy-implied expected CPL is computed from:
+
+```text
+policy_probs * calibration_move_cp_losses
 ```
 
-Default: `policy_label_smoothing=0.005`, `focal_loss_gamma=0.0` (standard CE).
+summed over the full 4864-move output space. The move-loss tensor is dense in the batch, though it is derived from a sparse blob in the SQLite cache.
 
-### Value Loss (WDL)
+Current base calibration loss in `src/model.rs`:
 
-Cross-entropy on the 3-class (loss, draw, win) logits. Targets are one-hot from game outcome.
-
-Optional entropy bonus on decisive games: `-entropy_bonus * value_entropy_weight` (default weight=0.0, disabled).
-
-### Time Usage Loss (DISABLED)
-
-The time usage head is currently disabled (outputs zeros, weight=0.0). If re-enabled, the intended loss is Beta distribution negative log-likelihood:
-```
-target = clamp(time_used / time_remaining, eps, 1-eps)
-loss = -beta_log_pdf(target | alpha, beta)
+```text
+base_calibration_loss =
+    head_ce
+  + 0.01  * policy_mae
+  + 0.005 * head_mae
 ```
 
-### Auxiliary Losses
-
-All auxiliary losses are summed and weighted by a single `aux_loss_weight`:
-- Mobility: MSE on per-square legal move counts
-- Material: MSE on material imbalance (batch tensor normalized by ÷39, vs ÷15 for the global feature — these are separate)
-- Side info: Binary CE on 141 predictions
-- From/to square: CE on 64-way classification (both policy-token and trunk-level versions)
+That base loss is then multiplied by `calibration_loss_weight` and also participates in GradNorm as its own task.
 
 ### Total Loss
 
-```
-total_loss = gradnorm_weight_policy * policy_loss
-           + gradnorm_weight_value * value_loss
-           + gradnorm_weight_time * time_usage_loss
-           + gradnorm_weight_aux * aux_loss
+Conceptually:
+
+```text
+total_loss =
+    weighted_policy
+  + weighted_value
+  + weighted_time_usage
+  + weighted_aux
+  + weighted_calibration
 ```
 
-The GradNorm weights are dynamically adjusted — the config `policy_loss_weight`, `value_loss_weight`, etc. are only initial values.
+Where the runtime weights come from GradNorm, not just the static config defaults.
 
 ---
 
 ## GradNorm
 
-GradNorm adaptively reweights the 4 task losses (policy, value, time_usage, auxiliary) to balance gradient magnitudes.
+GradNorm now balances **five** tasks:
 
-### Algorithm
+1. policy
+2. value
+3. time usage
+4. auxiliary
+5. calibration
 
-Every `gradnorm_interval` optimizer steps (200 in research loop), plus an early adjustment at step 10:
+That calibration task was a recent addition. It is skipped for GradNorm probing on batches with zero labeled calibration examples.
 
-1. Compute each task's loss on a probe batch (`gradnorm_probe_size=256` examples)
-2. Track `initial_loss_i` (set on first occurrence of each task)
-3. Compute loss ratio: `loss_ratio_i = (loss_i / initial_loss_i)^alpha`
-4. Compute target gradient norm: `target_i = mean_grad_norm * loss_ratio_i * priority_i`
-5. Update task weight: gradient descent on `(||grad_norm_i|| - target_i)^2` with `gradnorm_learning_rate`
-6. **Clamp** updated weights to `[0.1×, 10×]` of their initial values
-7. **Renormalize** all weights so their sum equals the original reference total (prevents drift)
+### Current Defaults
 
-GradNorm probing is skipped entirely during value-tower-only training mode (only one loss active).
+| Parameter | Value |
+|-----------|-------|
+| `enable_gradnorm` | true |
+| `gradnorm_interval` | 20 by default, **200 in research loop** |
+| `gradnorm_alpha` | 0.5 |
+| `gradnorm_learning_rate` | 0.1 |
+| `gradnorm_policy_priority` | 5.0 |
+| `gradnorm_value_priority` | 1.0 |
+| `gradnorm_time_priority` | 1.0 |
+| `gradnorm_aux_priority` | 1.5 |
+| `gradnorm_calibration_priority` | 2.0 |
+| `gradnorm_probe_size` | 256 |
 
-### Config (research loop values = code defaults for these)
+Important detail:
 
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `enable_gradnorm` | true | GradNorm is active |
-| `gradnorm_interval` | 200 (overridden) | Steps between weight updates |
-| `gradnorm_alpha` | 0.5 | Loss ratio scaling exponent (lower = more aggressive balancing) |
-| `gradnorm_learning_rate` | 0.1 | Meta-learning rate for weight adjustment |
-| `gradnorm_policy_priority` | 5.0 | Policy gets 5× priority weighting |
-| `gradnorm_value_priority` | 1.0 | |
-| `gradnorm_time_priority` | 1.0 | |
-| `gradnorm_aux_priority` | 1.5 | Aux gets 1.5× priority |
-| `gradnorm_probe_size` | 256 | Examples materialized on lead device for gradient computation |
-
-### Observed Behavior
-
-From research notes (run 3 logs): by end of training, GradNorm increased policy weight from 0.30→0.36 and decreased aux weight from 0.06→0.005. GradNorm considers policy under-resourced and aux "too easy."
+- the calibration task is considered inactive for a probe batch if `calibration_labeled_fraction == 0`
+- this avoids backward-on-zero-task panics and keeps calibration from skewing GradNorm when labels are absent
 
 ---
 
@@ -406,176 +408,275 @@ From research notes (run 3 logs): by end of training, GradNorm increased policy 
 
 ### Parameter Groups
 
-The model uses **5 separate optimizer groups**:
+The model uses multiple optimizer groups:
 
-| Group | Optimizer | Parameters | Weight Decay | LR |
-|-------|-----------|-----------|--------------|-----|
-| 1 | **Muon** | 2D+ weight matrices | `weight_decay` | `muon_lr` |
-| 2 | AdamW (decay, normal LR) | Most other params | `weight_decay` | `adamw_lr` |
-| 3 | AdamW (decay, high LR) | Embedding params | `weight_decay` | `embedding_lr` |
-| 4 | AdamW (no decay, normal LR) | LayerNorms, biases | 0.0 | `adamw_lr` |
-| 5 | AdamW (no decay, high LR) | Embedding-related biases | 0.0 | `embedding_lr` |
+- Muon for 2D+ weight matrices when enabled
+- AdamW with decay for standard params
+- AdamW with higher LR for embedding-related params
+- AdamW without decay for norm/bias params
+- AdamW without decay at embedding LR for embedding-related bias params
 
-**Cautious weight decay** is enabled by default: weight decay is only applied when the gradient and update direction align (i.e., `grad · update > 0`).
+### Learning Rate Scaling
 
-### μP-Scaled Learning Rates
+Learning rates use μP-style width scaling with `d=256` as the reference width.
 
-Learning rates scale with model width using Maximal Update Parameterization (μP), referenced to `d=256`:
+Base learning rates:
 
-```
-batch_scale = effective_batch_size / 1024.0
+| Parameter | Value |
+|-----------|-------|
+| `muon_base_lr` | 0.0225 |
+| `adamw_base_lr` | 3.375e-4 |
+| `embedding_base_lr` | 0.1125 |
 
-adamw_dim_scale = 256 / embed_dim
-adamw_lr = adamw_base_lr × adamw_dim_scale × batch_scale × lr_multiplier
-
-muon_dim_scale = sqrt(256 / embed_dim)
-muon_lr = muon_base_lr × muon_dim_scale × batch_scale × lr_multiplier
-
-embedding_lr = embedding_base_lr × batch_scale × lr_multiplier
-  (no width scaling — width-independent per μP)
-```
-
-For the research config (`embed_dim=192, physical_batch_size=512, batch_size=auto`):
-- `adamw_dim_scale = 256/192 ≈ 1.333`
-- `muon_dim_scale = sqrt(256/192) ≈ 1.155`
-- `batch_scale = effective_batch_size / 1024` (depends on auto-computed batch_size)
-
-Base LRs:
-- `muon_base_lr = 0.0225`
-- `adamw_base_lr = 3.375e-4`
-- `embedding_base_lr = 0.1125`
-
-### Other Optimizer Settings
+Other defaults:
 
 | Parameter | Value |
 |-----------|-------|
 | `weight_decay` | 0.003 |
 | `adam_epsilon` | 1e-8 |
-| `gradient_clip` | 3.0 (L2 norm) |
+| `gradient_clip` | 3.0 |
+| `cautious_weight_decay` | true |
 
 ---
 
 ## LR Scheduling
 
-### Reduce-on-Plateau
+Oxi still uses the reduce-on-plateau scheduler based on linear regression over a sliding loss window.
 
-The scheduler detects training plateaus using linear regression on a sliding window of loss values.
-
-**Algorithm:**
-1. Maintain a FIFO window of `lr_window_size` loss values
-2. Fit linear regression: `loss = a + b × step`
-3. Compute relative improvement: `improvement = -slope × window_size / mean_loss`
-4. If `improvement < lr_improvement_threshold`: multiply LR by `lr_reduction_factor`
-5. Stop when LR reaches `lr_min`
-
-**Warmup:** Linear warmup from 0 to initial LR over `warmup_iterations = warmup_multiplier × effective_batch_size` **optimizer steps** (not samples — despite the config comment saying "samples"). For research config: `0.1 × 512 = 51` iterations of warmup.
+Defaults:
 
 | Parameter | Value |
 |-----------|-------|
 | `lr_window_size` | 120 |
-| `lr_improvement_threshold` | 0.02 (2%) |
+| `lr_improvement_threshold` | 0.02 |
 | `lr_reduction_factor` | 0.5 |
-| `lr_min` | 0.000001 |
-| `warmup_multiplier` | **0.1** (research override, default=2.0) |
+| `lr_min` | 1e-6 |
+| `warmup_multiplier` | 2.0 default, **0.1 in research loop** |
 
-Plateau detections are logged to `plateau_detection.log` with the full window dump.
+Warmup length is:
+
+```text
+warmup_iterations = warmup_multiplier * effective_batch_size
+```
+
+measured in optimizer steps.
 
 ### Two-Stage Training
 
-After the LR scheduler reaches `lr_min` AND detects another plateau:
-1. **Stage 2: Value Tower Only** — disables policy loss, filters gradients to value tower params only, resets LR to initial value
-2. The plateau detector switches to tracking **value_loss** instead of policy_loss for LR reduction decisions
-3. GradNorm probing is disabled (only one loss active)
-4. Continues until `lr_min` reached again
+The value-tower-only second stage still exists:
 
-This allows the value head to train further after the policy head has converged. Can also be triggered from the start via `--skip-policy-loss`.
+- when the scheduler bottoms out and plateaus again, training can switch into value-only mode
+- policy loss is disabled
+- puzzles are skipped
+- GradNorm probing is disabled because only one task remains active
+
+This also can be triggered immediately with `--skip-policy-loss`.
 
 ---
 
 ## Data Pipeline
 
-### Data Source
+### Shared Human Training Stream
 
-PGN files from `--data-path=../data`. Processed into `ChessExample` structs containing:
-- FEN position
-- Played move
-- Game outcome (W/D/L)
-- Time usage (clock info)
+Recent calibration work introduced a shared stream path in `src/training_stream.rs`.
+
+Both:
+
+- normal training
+- ordered calibration DB generation
+
+now consume the same human training stream abstraction, which prevents the old mismatch where calibration labels and training examples were coming from subtly different iterator orders or conventions.
+
+### Human Data
+
+Training streams human PGN data from `--data-path`, which is expected to be a directory.
+
+Examples are represented as `ChessExample` and contain:
+
+- FEN
+- move UCI
+- outcome
+- clock features
 - Elo ratings
-- Move history (previous 5 positions)
-- Whether this is a puzzle position
+- move count
+- recent-history data
+- puzzle flag
+
+### Puzzle Mixing
+
+If enabled, puzzle examples are mixed into the human stream at:
+
+- `puzzle_sampling_ratio = 0.05` by default
+
+In value-only mode, puzzle mixing is disabled.
+
+### Sampling / Filtering
+
+Defaults:
+
+- ply sampling enabled
+- Elo sampling enabled
+- `elo_priority_boost = 3.0`
+- minimum clock time filter still applies
+
+The calibration builder can also run in an ordered mode using a config with:
+
+- ply sampling disabled
+- Elo sampling disabled
+
+to align exactly with deterministic sanity checks.
 
 ### Shuffle Buffer
 
-A `ShuffleBuffer` of size `shuffle_buffer_size=100000` examples enables streaming without loading the full dataset. Batches are sampled randomly from the buffer, which is continuously refilled.
+Training uses a `ShuffleBuffer` with:
 
-### Data Filtering / Sampling
+- `shuffle_buffer_size = 100000`
 
-| Filter | Behavior |
-|--------|----------|
-| **Ply sampling** | 80% drop at ply 0, linearly decreasing to 0% drop at ply 10+ |
-| **Elo sampling** | Flattens Elo distribution; boosts 2000+ Elo by `elo_priority_boost=3.0×` |
-| **Puzzle mixing** | `puzzle_sampling_ratio=0.05` — 5% puzzle positions mixed in |
-| **Min clock time** | Positions with <30 seconds on the clock are filtered |
+By default, the buffer is randomized. A recent debug feature added:
+
+- `--disable-training-shuffle`
+
+which drains the buffer in stream order instead. This is mainly useful for deterministic calibration overlap tests.
 
 ### Batch Construction
 
-Each `ChessBatch` contains:
+A `ChessBatch` contains the usual tensors plus the new optional calibration tensors:
 
-| Tensor | Shape | Description |
-|--------|-------|-------------|
-| `board_input` | `[batch, 64, 65]` | Per-square features |
-| `move_distributions` | `[batch, 4864]` | One-hot target move |
-| `legal_moves` | `[batch, 4864]` | Binary mask of legal moves |
-| `values` | `[batch, 3]` | One-hot WDL target |
-| `global_features` | `[batch, 10]` | Global features |
-| `time_usages` | `[batch, 1]` | Time fraction target |
-| `value_weights` | `[batch]` | Ply ramp × puzzle mask |
-| `material_imbalance` | `[batch]` | Normalized to [-1, 1] by ÷39 (max possible). Note: global feature #8 uses ÷15 instead |
-| `side_info` | `[batch, 141]` | Integer features for side info head |
+| Tensor | Shape | Notes |
+|--------|-------|-------|
+| `board_input` | `[B, 64, 65]` | board + recency features |
+| `move_distributions` | `[B, 4864]` | target move distribution |
+| `legal_moves` | `[B, 4864]` | legal move mask |
+| `values` | `[B, 3]` | WDL target |
+| `global_features` | `[B, 10]` | FiLM/global features |
+| `time_usages` | `[B, 1]` | mostly inactive target |
+| `value_weights` | `[B]` | ply-ramped value supervision |
+| `material_imbalance` | `[B]` | material target |
+| `side_info` | `[B, 141]` | side-info head targets |
+| `calibration_mask` | `[B]` | 1 if Stockfish label exists |
+| `calibration_target_cp_loss` | `[B]` | human move CPL target |
+| `calibration_target_bins` | `[B, 8]` | one-hot CPL-bin target |
+| `calibration_move_cp_losses` | `[B, 4864]` | dense per-move CPL tensor |
+
+Only a subset of positions carry calibration labels, so calibration supervision is sparse relative to the full policy dataset.
+
+---
+
+## Centipawn-Loss Calibration
+
+### Purpose
+
+The calibration path exists to address a specific failure mode:
+
+- strong move prediction does not guarantee human-like mistake severity
+- when the top-1 move is wrong, the model can still be too strong or too weak in unrealistic ways
+
+The goal is not “maximize strength.” The goal is “match human error level.”
+
+### Stored Labels
+
+Precomputed labels are stored in a SQLite database, usually:
+
+```text
+<data-path>/calibration.db
+```
+
+Training will automatically use that path if `--calibration-db-path` is not explicitly set and the DB exists under `data_path`.
+
+The DB stores, per labeled position:
+
+- FEN
+- human move
+- player Elo
+- opponent Elo
+- ply
+- stage
+- Stockfish depth
+- best evaluation
+- human CPL
+- regret bin
+- sparse move-loss blob
+
+The storage is sparse, but the training batcher expands the move-loss blob to a dense `[4864]` tensor per labeled example.
+
+### Cache Key
+
+At training lookup time, calibration labels are keyed by:
+
+- `fen`
+- `human_move`
+
+This is intentionally looser than the full DB uniqueness constraint and matches the fact that the move-loss vector is a property of the position and move, not the Elo bucket.
+
+### Regret / CPL Bins
+
+The code still uses the internal name `RegretBin`, but functionally this is a centipawn-loss bucketization for the human move:
+
+- `0`
+- `1-10`
+- `11-25`
+- `26-50`
+- `51-100`
+- `101-200`
+- `201-400`
+- `400+`
+
+Representative centers are used to convert the head distribution into an expected CPL estimate.
+
+### Calibration Metrics
+
+The training loop logs:
+
+- `cp_loss_policy_mae`
+- `cp_loss_head_mae`
+- `cp_loss_head_ce`
+- `cp_loss_labeled_fraction`
+- `cp_loss_calibration_overall`
+
+It also logs coarse signed calibration errors by Elo skill band:
+
+- `cp_loss_calibration_beginner`
+- `cp_loss_calibration_intermediate`
+- `cp_loss_calibration_expert`
+
+Those band metrics are clipped to `[-200, 200]` centipawns in the renderer/logging path for chart readability.
+
+`cp_loss_calibration_overall` is the main bounded research-loop metric. It maps absolute CPL error to a `0..1` score with a 200cp cap.
 
 ---
 
 ## Training Loop Details
 
-### Gradient Accumulation
+### Main Loop
 
-If `batch_size > physical_batch_size`:
-- `grad_accumulation_steps = ceil(batch_size / physical_batch_size)`
-- Accumulate gradients over micro-batches before optimizer step
+At a high level:
 
-When `batch_size` is `None` (the default, including in the research config), `grad_accumulation_steps = 1` and `effective_batch_size = physical_batch_size`. So in the research loop, effective batch size is simply 512.
+1. build the streamed human iterator
+2. optionally mix puzzles
+3. fill the shuffle buffer
+4. sample or drain examples from the buffer
+5. batch and tensorize examples
+6. split across worker/device threads
+7. forward pass
+8. backward pass
+9. gradient clip
+10. optimizer step
+11. scheduler update
+12. metrics logging
 
-### Per-Iteration Steps
+### Effective Batch Size
 
-1. Sample batch from shuffle buffer
-2. Process examples in parallel (`rayon::par_iter`)
-3. Split across devices (default: 1 device)
-4. Forward pass → `ChessOutput` (all head outputs + losses)
-5. Backward pass → gradients
-6. Accumulate gradients (if grad accumulation > 1)
-7. Clip gradients (L2 norm, threshold=3.0)
-8. Optimizer step (5 separate groups)
-9. LR scheduler: `record_batch(plateau_loss)`
-10. Log metrics
+If `batch_size` is `None`, effective batch size equals `physical_batch_size`. This is the standard research-loop regime, so the effective batch size is normally 512.
 
-### Logging Frequency
+### Calibration Coverage
 
-| What | When |
-|------|------|
-| `total_loss`, `policy_loss`, `value_loss`, `time_usage_loss` | Every iteration |
-| `aux_mobility_loss`, `aux_material_loss`, `aux_side_info_loss`, etc. | Every iteration (if > 0) |
-| `aux_from_square_loss`, `aux_to_square_loss` | Every iteration |
-| `aux_from_square_accuracy`, `aux_to_square_accuracy` | Every iteration |
-| `gradient_norm` | Every iteration |
-| `plateau_loss` | Every iteration |
-| `top1_accuracy`, `wdl_accuracy` | Every iteration |
-| `puzzle_solve_rate` | Every iteration |
-| `move_top_5_accuracy` | Every `full_metrics_interval` (200 in research) |
-| Gradient breakdown (per-head, per-layer) | Every `full_metrics_interval` (when `log_gradient_breakdown=true`) |
-| Learning rates | Every 100 optimizer steps |
+Calibration labels are optional per example, so:
 
-**Note:** Most metrics are logged every iteration. Only `move_top_5_accuracy` and the gradient breakdown are gated behind `full_metrics_interval`.
+- some batches may have zero labeled examples
+- some runs may have low calibration coverage
+- calibration metrics are only emitted when at least one labeled example is present in the aggregated output
+
+The training loop logs `calibration_batch_stats` in `train.log` to make labeled coverage visible during live runs.
 
 ---
 
@@ -583,191 +684,216 @@ When `batch_size` is `None` (the default, including in the research config), `gr
 
 ### Directory Structure
 
-```
+```text
 <log_dir>/
-├── train.log                     # Full tracing output
-├── stderr.log                    # Stderr capture (research loop adds this)
-├── plateau_detection.log         # Full window dump on each plateau detection
+├── train.log
+├── stderr.log                  # research loop / launcher dependent
+├── plateau_detection.log
 └── metrics_logs/
     ├── total_loss.log
     ├── policy_loss.log
     ├── value_loss.log
-    ├── time_usage_loss.log
-    ├── plateau_loss.log
-    ├── gradient_norm.log
-    ├── top1_accuracy.log
-    ├── wdl_accuracy.log         # Mean probability of correct class (0-1 fraction)
     ├── aux_from_square_accuracy.log
     ├── aux_to_square_accuracy.log
-    ├── aux_from_square_loss.log
-    ├── aux_to_square_loss.log
-    ├── aux_mobility_loss.log
-    ├── aux_mobility_mae.log
-    ├── aux_material_loss.log
-    ├── aux_material_mae.log
-    ├── aux_side_info_loss.log
-    ├── puzzle_solve_rate.log
-    └── move_top_5_accuracy.log   # (and potentially more)
+    ├── top1_accuracy.log
+    ├── wdl_accuracy.log
+    ├── cp_loss_policy_mae.log
+    ├── cp_loss_head_mae.log
+    ├── cp_loss_head_ce.log
+    ├── cp_loss_labeled_fraction.log
+    ├── cp_loss_calibration_overall.log
+    ├── cp_loss_calibration_beginner.log
+    ├── cp_loss_calibration_intermediate.log
+    ├── cp_loss_calibration_expert.log
+    └── ...
 ```
 
-### TSV Format
+### File Format
 
-Each `.log` file is tab-separated with two columns: `iteration\tvalue`
+Each metric log is TSV with:
 
-```
-1	0.06490872
-2	0.08282828
-3	0.11836735
+```text
+iteration<TAB>value
 ```
 
-No header row. Iteration numbers are optimizer step counts. Values are `:.8` precision floats. Files are append-only (but the research loop deletes the `metrics_logs/` directory before each run to prevent stale data).
+There is no header row.
 
-### train.log
+### TUI / CLI Renderer
 
-Contains structured tracing output with targets:
-- `gradient_debug` — per-head gradient norms, per-layer breakdown, total gradient norm
-- `plateau_detection` — LR reduction events with full window dump
-- `weight_decay` — L2 penalty values
-- Default target — iteration progress, timing, stage transitions
+The current training renderer exposes:
 
-### How the Research Loop Reads Metrics
+- the classic move/value/aux charts
+- a dedicated `Centipawn Loss Calibration` group with:
+  - `Policy MAE`
+  - `Head MAE`
+  - `Head CE`
+  - `Labeled Fraction`
+  - `Overall`
+- a separate coarse Elo-band chart:
+  - `CP Loss Calibration By Elo|Beginner`
+  - `CP Loss Calibration By Elo|Intermediate`
+  - `CP Loss Calibration By Elo|Expert`
 
-The research loop's `parse_composite_score()` reads these specific metric files:
-- `top1_accuracy.log` — averaged over last 100 values
-- `wdl_accuracy.log` — averaged over last 100 values (stored as 0-1 fraction, mean probability of correct class)
-- `aux_from_square_accuracy.log` — averaged over last 100 values
-- `aux_to_square_accuracy.log` — averaged over last 100 values
-
-The statistical test (`check_improvement()`) aligns these 4 metrics by step number, computes the composite score at each step, then pools the last 100 values across 2 seeds and runs a block bootstrap test.
+The live monitor (`monitor.py`) also includes `cp_loss_calibration_overall`.
 
 ---
 
 ## Evaluation & Scoring
 
-### Composite Score
+### Research Loop Composite Score
 
-```
-score = 1.0 × top1_accuracy + 0.5 × wdl_accuracy + 0.2 × aux_accuracy
+`research_loop.py` now scores four components:
+
+```text
+score =
+    1.0 * top1_accuracy
+  + 0.5 * normalized_wdl_accuracy
+  + 0.2 * aux_accuracy
+  + 0.4 * calibration_score
 ```
 
 Where:
-- `top1_accuracy`: fraction (0–1), policy head's top-1 move prediction accuracy
-- `wdl_accuracy`: fraction (0–1), mean probability assigned to the correct WDL class (rewards calibration, not just argmax correctness)
-- `aux_accuracy`: `(aux_from_square_accuracy + aux_to_square_accuracy) / 2`, fraction (0–1)
 
-Each component is averaged over the last `METRIC_WINDOW = 100` logged values. Each experiment runs 2 seeds; the reported score is the mean across seeds.
+- `top1_accuracy` is the move top-1 hit rate
+- `normalized_wdl_accuracy` is `wdl_accuracy`, normalized to `0..1` if logged as percentages
+- `aux_accuracy = (from_sq_acc + to_sq_acc) / 2`
+- `calibration_score = cp_loss_calibration_overall * coverage_factor`
 
-### Acceptance Criterion
+Coverage factor is derived from `cp_loss_labeled_fraction` and the number of recent steps with enough calibration coverage:
 
-A change is **kept** only if BOTH conditions hold:
-1. **Block bootstrap test**: `p < 0.05` (autocorrelation-corrected — consecutive training steps are correlated, so we resample in blocks of 20)
-2. **Cohen's d**: `d >= 0.3` (the improvement must be at least ~0.3 pooled standard deviations)
+- minimum labeled fraction per valid step: `0.05`
+- target labeled fraction: `0.10`
+- minimum valid steps in the window: `20`
 
-The test pools per-step composite score arrays across both seeds, then compares the new run vs the current best run.
+This means calibration helps only when the run has enough usable labeled examples.
+
+### Windowing
+
+Most research-loop comparisons use the last:
+
+- `METRIC_WINDOW = 100`
+
+logged values.
+
+### Statistical Acceptance
+
+A run is accepted only if both hold:
+
+1. block bootstrap `p < 0.05`
+2. Cohen's `d >= 0.3`
+
+The bootstrap is done over the composite score sequence, with block resampling to account for autocorrelation.
+
+### Monitor
+
+`monitor.py` mirrors the calibration-aware composite:
+
+- it shows `CPL Calibration`
+- it uses the same calibration coverage gating
+- it can compare the current run to the best logged run
 
 ---
 
 ## Hyperparameter Reference
 
-### Full Config Defaults (with research loop overrides marked)
+Current relevant defaults in `Config::default()`:
 
-```
+```text
 # Architecture
-embed_dim               = 384          # ⚠️ RESEARCH: 192
-num_layers              = 24           # ⚠️ RESEARCH: 12
-head_dim                = 24           # num_heads = embed_dim / head_dim
-conv_layers             = 0
-# smolgen dims are derived: hidden=head_dim, global=embed_dim/3, gen=embed_dim/4
-value_tower_layers      = 2
+embed_dim                    = 192
+num_layers                   = 12
+num_heads                    = 6
+conv_layers                  = 0
 
-# Training
-physical_batch_size     = 16000        # ⚠️ RESEARCH: 512
-batch_size              = None         # when None, effective_batch_size = physical_batch_size (no grad accumulation)
-seed                    = 42
-num_workers             = 4
-num_devices             = 1
-shuffle_buffer_size     = 100000
+# Training / batching
+physical_batch_size          = 16000
+batch_size                   = None
+shuffle_buffer_size          = 100000
+disable_training_shuffle     = false
+num_workers                  = 4
+num_devices                  = 1
 
-# Loss Weights (initial — GradNorm adjusts these)
-policy_loss_weight      = 0.30
-value_loss_weight       = 0.0001
-time_usage_loss_weight  = 0.0          # disabled
-aux_loss_weight         = 0.06
+# Loss weights (initial values; GradNorm adapts them)
+policy_loss_weight           = 0.30
+value_loss_weight            = 0.10
+time_usage_loss_weight       = 0.0
+aux_loss_weight              = 0.06
+calibration_loss_weight      = 0.10
 
-# Loss Config
-policy_label_smoothing  = 0.005
-focal_loss_gamma        = 0.0          # disabled (standard CE)
-value_entropy_weight    = 0.0          # disabled
+# GradNorm priorities
+gradnorm_policy_priority     = 5.0
+gradnorm_value_priority      = 1.0
+gradnorm_time_priority       = 1.0
+gradnorm_aux_priority        = 1.5
+gradnorm_calibration_priority = 2.0
 
-# Learning Rates (base, before μP scaling)
-muon_base_lr            = 0.0225
-adamw_base_lr           = 3.375e-4
-embedding_base_lr       = 0.1125
-lr_multiplier           = 1.0
+# Policy loss config
+policy_label_smoothing       = 0.005
+focal_loss_gamma             = 0.0
 
-# LR Scheduling
-warmup_multiplier       = 2.0          # ⚠️ RESEARCH: 0.1
-lr_window_size          = 120
-lr_improvement_threshold = 0.02
-lr_reduction_factor     = 0.5
-lr_min                  = 0.000001
+# Value config
+value_ply_ramp_start         = 10
+value_ply_ramp_full          = 30
+value_tower_layers           = 2    # config exists; active model path still uses one value block
 
-# Regularization
-weight_decay            = 0.003
-cautious_weight_decay   = true
-gradient_clip           = 3.0
-adam_epsilon            = 1e-8
+# Optimizer / regularization
+muon_base_lr                 = 0.0225
+adamw_base_lr                = 3.375e-4
+embedding_base_lr            = 0.1125
+weight_decay                 = 0.003
+gradient_clip                = 3.0
+cautious_weight_decay        = true
 
-# GradNorm
-enable_gradnorm         = true
-gradnorm_interval       = 20           # ⚠️ RESEARCH: 200
-gradnorm_alpha          = 0.5
-gradnorm_learning_rate  = 0.1
-gradnorm_policy_priority = 5.0
-gradnorm_value_priority = 1.0
-gradnorm_time_priority  = 1.0
-gradnorm_aux_priority   = 1.5
-gradnorm_probe_size     = 256
+# Scheduler
+warmup_multiplier            = 2.0
+lr_window_size               = 120
+lr_improvement_threshold     = 0.02
+lr_reduction_factor          = 0.5
+lr_min                       = 1e-6
 
-# Value Head
-value_backprop_to_trunk = false
-value_ply_ramp_start    = 10
-value_ply_ramp_full     = 30
-value_train_on_puzzles  = false
+# Data sampling
+enable_ply_sampling          = true
+enable_elo_sampling          = true
+elo_priority_boost           = 3.0
+puzzle_sampling_ratio        = 0.05
 
-# Data Sampling
-enable_ply_sampling     = true
-enable_elo_sampling     = true
-elo_priority_boost      = 3.0
-puzzle_sampling_ratio   = 0.05
+# Logging / checkpoints
+full_metrics_interval        = 50
+checkpoint_interval          = 100
 
-# Metrics & Checkpointing
-full_metrics_interval   = 50           # ⚠️ RESEARCH: 200
-checkpoint_interval     = 100          # ⚠️ RESEARCH: 0 (disabled)
-log_gradient_breakdown  = false        # ⚠️ RESEARCH: true
+# Calibration
+calibration_db_path          = <data-path>/calibration.db if present
 ```
+
+Research-loop overrides mainly affect:
+
+- batch size
+- warmup
+- metrics cadence
+- checkpointing
+- TUI
+
+They do not currently override calibration-specific defaults.
 
 ---
 
 ## Key Source Files
 
-| File | Contents |
-|------|----------|
-| `src/config.rs` | All hyperparameter definitions, constants (`FEATURES_PER_TOKEN`, `LEGAL_MOVES`, etc.), CLI argument parsing |
-| `src/model.rs` | Main `OXIModel` — forward pass, loss computation, all output heads, loss functions |
-| `src/factorized_policy.rs` | Factorized policy head (source×target dot product + promotion handling) |
-| `src/relative_position_transformer.rs` | Transformer blocks, SmolgenAttention, FiLM-RmsNorm, SwiGLU MLP |
-| `src/value_tower.rs` | Value tower struct (exists but not instantiated — actual value head uses a single block in model.rs) |
-| `src/spatial_conv.rs` | Optional 3×3 spatial convolution |
-| `src/gradnorm.rs` | GradNorm multi-task adaptive weighting |
-| `src/reduce_on_plateau_scheduler.rs` | LR scheduler with linear regression plateau detection |
-| `src/dataset.rs` | Dataset loading, `ChessItem`/`ChessBatch`, batching |
-| `src/encoding.rs` | Position encoding — all 61+4 per-square features |
-| `src/move_encoding.rs` | Move → (from_square, target_index) encoding |
-| `src/inference.rs` | Inference engine, global feature computation, material imbalance |
-| `src/custom_training.rs` | Training loop, gradient accumulation, multi-optimizer stepping, metrics logging |
-| `src/main.rs` | Entry point, CLI dispatch, device setup |
-| `src/lib.rs` | Module declarations |
-| `research_loop.py` | Research orchestration — spawns subagents, runs training, evaluates, keeps/discards |
-| `research_log.md` | Experiment history with scores |
-| `research/notes.md` | Ad-hoc research notes from previous agents |
+| File | Purpose |
+|------|---------|
+| `src/config.rs` | core defaults, CLI overrides, runtime config accessors |
+| `src/model.rs` | main forward pass, all heads, all loss construction including CPL calibration |
+| `src/factorized_policy.rs` | factorized policy head |
+| `src/relative_position_transformer.rs` | transformer blocks, Smolgen attention, FiLM-RMSNorm, SwiGLU |
+| `src/gradnorm.rs` | five-task GradNorm logic including calibration |
+| `src/custom_training.rs` | training loop, worker orchestration, batching, logging, rendering |
+| `src/dataset.rs` | `ChessExample`, `ChessBatch`, calibration label lookup, dense CPL batch tensors |
+| `src/training_stream.rs` | shared human-training stream used by training and ordered calibration generation |
+| `src/calibration.rs` | SQLite calibration DB, CPL bins, sparse move-loss blobs, labels |
+| `src/pgn_processor.rs` | PGN streaming and deterministic file iteration |
+| `src/stockfish.rs` | Stockfish integration for offline labeling |
+| `src/main.rs` | CLI entrypoints including `train` and `create-calibration-db` |
+| `research_loop.py` | automated research orchestration and calibration-aware scoring |
+| `monitor.py` | live TUI/CLI monitor with calibration charting |
+| `docs/calibrated-strength-spec.md` | design spec for the CPL calibration feature |
+

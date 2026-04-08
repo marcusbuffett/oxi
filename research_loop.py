@@ -6,7 +6,6 @@ v2 changes:
 - Architecture search: agents modify config.rs defaults directly (no CLI pinning)
 - 60-minute training timeout (from 30)
 - Pre-builds binary and runs it directly (training time isn't eaten by compile)
-- Diagnostic pre-analysis subagent feeds findings to the proposal agent
 - Better error handling: all errors with exponential backoff, max consecutive limit
 - Better statistical test: block bootstrap to handle autocorrelation
 - Better title extraction with validation
@@ -473,44 +472,6 @@ def validate_title(title):
     return not any(lower.startswith(p) for p in noise_starts)
 
 
-def run_diagnostics(best_run_dir, best_score, best_components):
-    """Run a diagnostic subagent that analyzes the current best run.
-    Returns a diagnostic report string to feed to the proposal agent."""
-    diag_dir = Path(best_run_dir)
-    if not diag_dir.exists() or not (diag_dir / "metrics_logs").is_dir():
-        return "(No diagnostic data available — first iteration)"
-
-    diag_prompt = f"""You are analyzing training logs for the Oxi chess model to find optimization opportunities.
-
-Current best composite score: {best_score:.6f} {format_components(best_components)}
-Training timeout: {TRAINING_TIMEOUT}s
-
-The training logs are in: {diag_dir}
-- `train.log`: full training output with gradient norms, GradNorm weight updates, LR schedule, etc.
-- `metrics_logs/`: per-metric TSV files
-
-Your job:
-1. Read the train.log (focus on gradient breakdowns, GradNorm updates, LR reductions, and any warnings)
-2. Read the metric logs to understand learning curves (are metrics still improving at the end? plateaued? regressing?)
-3. Look for anomalies: gradient vanishing/exploding in specific layers, GradNorm weights hitting clamp limits, LR schedule firing too early/late, any components that seem under-optimized
-4. Check the codebase for potential bugs or disconnected code paths (values computed but never used, conditions that can never trigger, etc.)
-
-Produce a CONCISE diagnostic report (max 500 words) with:
-- **Training dynamics**: throughput (iter/sec), total iterations, LR schedule behavior
-- **Gradient health**: any layers with anomalous gradients, GradNorm clamping issues
-- **Metric trajectories**: which components are still improving vs plateaued
-- **Potential issues**: any bugs, misconfigurations, or disconnected code paths found
-- **Top opportunities**: 2-3 most promising avenues for improvement, ranked by expected impact
-
-Be specific and quantitative. Reference actual values from the logs."""
-
-    try:
-        result = call_tool("subagent_run", task=diag_prompt, role="full")
-        return result.get("output", "(diagnostic failed)")
-    except Exception as e:
-        return f"(diagnostic failed: {e})"
-
-
 def main():
     AUTORESEARCH_DIR.mkdir(parents=True, exist_ok=True)
     RESEARCH_RUNS.mkdir(parents=True, exist_ok=True)
@@ -565,16 +526,15 @@ def main():
         try:
             git_revert()
 
-            # --- Phase 1: Diagnostic analysis ---
-            print(f"  Running diagnostic analysis...")
-            best_comps = state.get("best_components", {"top1": 0.0, "wdl": 0.0, "aux": 0.0})
-            diagnostic_report = run_diagnostics(state["best_run_dir"], best, best_comps)
+            best_comps = state.get(
+                "best_components",
+                {"top1": 0.0, "wdl": 0.0, "aux": 0.0, "calibration": 0.0, "calibration_cov": 0.0},
+            )
 
             iter_dir = AUTORESEARCH_DIR / str(i)
             iter_dir.mkdir(parents=True, exist_ok=True)
-            (iter_dir / "diagnostics.md").write_text(diagnostic_report)
 
-            # --- Phase 2: Propose experiment ---
+            # --- Propose experiment ---
             idea_prompt = f"""You are an ML researcher improving a chess move-prediction transformer.
 
 **Start by reading `research/architecture.md`** — it contains a comprehensive reference of the model architecture, input representation, all output heads, loss functions, GradNorm, optimizer config, LR scheduling, data pipeline, metrics logging, and evaluation scoring. This is your primary reference for understanding the codebase.
@@ -582,34 +542,40 @@ def main():
 ## Evaluation Metric
 
 Your changes are evaluated on a **composite score** computed as:
-  score = {WEIGHT_TOP1}*top1_accuracy + {WEIGHT_WDL:.4f}*wdl_accuracy + {WEIGHT_AUX}*aux_accuracy
-where each component is the average of its last {METRIC_WINDOW} logged values during a {TRAINING_TIMEOUT//60}-minute training run.
+  score = {WEIGHT_TOP1}*top1_accuracy + {WEIGHT_WDL:.4f}*wdl_accuracy + {WEIGHT_AUX}*aux_accuracy + {WEIGHT_CALIBRATION:.4f}*calibration
+where each component is computed from the last {METRIC_WINDOW} logged values during a {TRAINING_TIMEOUT//60}-minute training run.
 
 Components:
 - **top1_accuracy** (weight {WEIGHT_TOP1}): Policy head move prediction accuracy (0-1).
-- **wdl_accuracy** (weight {WEIGHT_WDL:.4f}): Win/draw/loss prediction accuracy (0-1).
+- **wdl_accuracy** (weight {WEIGHT_WDL:.4f}): Win/draw/loss prediction accuracy (0-1, normalized if logged as percentages).
 - **aux_accuracy** (weight {WEIGHT_AUX}): Average of from-square and to-square auxiliary head accuracy (0-1).
+- **calibration** (weight {WEIGHT_CALIBRATION:.4f}): `cp_loss_calibration_overall`, coverage-gated by `cp_loss_labeled_fraction`. This rewards matching the human centipawn-loss profile, not just predicting the exact move.
+
+Important calibration details:
+- Calibration only counts when labeled coverage is high enough. Runs with sparse calibration labels get little or no calibration credit.
+- The main human-facing diagnostics are the signed Elo-band CPL calibration metrics, but the loop score uses the bounded overall calibration metric.
+- A change that improves top-1 while harming human-strength calibration can lose overall.
 
 Current best score: {best:.6f} {format_components(best_comps)} | Baseline: {baseline:.6f} | Iteration {i}
 
-## Diagnostic Report
-
-A diagnostic agent analyzed the current best training run and found:
-
-{diagnostic_report}
-
 ## Important Context
 
-- **Loss weighting is handled by GradNorm** — the model uses adaptive GradNorm reweighting. You do NOT need to manually tune loss weights.
+- **Loss weighting is handled by GradNorm** — the model uses adaptive GradNorm reweighting across policy, value, aux, and calibration. You do NOT need to manually tune loss weights unless you are deliberately changing the training objective.
 - **This is a time-constrained training run** ({TRAINING_TIMEOUT//60} minutes). Throughput matters.
-- **The goal is to prep for a larger production run.** We want to find the best architecture config + training recipe that can then be scaled up. Improvements to training dynamics, loss functions, and architecture design are all valuable.
+- **The goal is to prep for a larger production run.** We want the best architecture/training recipe for both move prediction and human-strength calibration. Improvements to training dynamics, loss functions, architecture, or calibration behavior are all valuable.
 - **Architecture is not pinned.** The model's embed_dim, num_layers, and head_dim come from defaults in `src/config.rs`. If you want to change the architecture, modify those defaults. The training command does NOT pass these as CLI args, so your config.rs changes will take effect.
+
+## Risk Tolerance
+
+A change that scores 5% worse is free — it gets reverted automatically. A change that scores 2% better is kept forever. **The expected value of bold experiments is high.** Don't optimize for keep rate, optimize for finding large improvements.
+
+If your proposed change would not plausibly move the score by at least 1%, it's too small. One logical change can still be large — replacing the attention mechanism is one change, adding a new auxiliary head is one change.
 
 ## What To Do
 
 Read the experiment log at research_log.md to see what has been tried. Do not repeat failed ideas.
 
-Explore the codebase, then propose **a single targeted change**. This means ONE logical modification — do not bundle unrelated hyperparameter tweaks with architectural changes. If you want to change the architecture, that's the one change. If you want to fix a training bug, that's the one change.
+Explore the codebase, then propose **one logical change**. Don't bundle unrelated modifications, but the change itself can be ambitious — a new architecture component, a different training objective, a structural refactor of how something works.
 
 Verify your change compiles: `cargo check --features "train,backend-tch"`
 
@@ -627,7 +593,7 @@ DO NOT TOUCH:
 - CLI argument handling or data loading
 - The LR scheduler type (reduce-on-plateau only, no cosine/cyclic). Adjusting LR values, warmup, or plateau parameters is fine.
 - The evaluation metric or how accuracy is measured
-- Loss weights — GradNorm handles this
+- Loss weights by default — GradNorm handles this unless the experiment is specifically about the objective itself
 - research_log.md and research_runs/ — read-only (except research_runs/run_{i}/conclusion.md which you must create)
 
 ## Required Output

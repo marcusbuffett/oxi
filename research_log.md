@@ -45,3 +45,13 @@ State reset performed:
 - removed `research_runs/baseline`
 
 The next research-loop baseline should be treated as the start of a new series under the calibration-aware objective.
+| 0 | [ERROR x5] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | — | ⚠️ |
+| 0 | [ERROR x5] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | — | ⚠️ |
+| 0 | [ERROR x5] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | — | ⚠️ |
+| 0 | [ERROR x5] Bridge request failed: <urlopen error [Errno 61] C | 0.000000 | — | ⚠️ |
+| 0 | Value tower mean-pool skip connection | 1.087750 (top1=0.4493, wdl=0.6844, aux=0.5108, cal=0.9260, cal_cov=0.5240) | -3.0305 (top1=+0.1794, wdl=+0.0989, aux=-16.1327, cal=+0.3587) | ✅ |
+| 1 | Lower LR plateau threshold 0.8% to 0.5% | 1.116930 (top1=0.4608, wdl=0.7096, aux=0.5240, cal=0.9304, cal_cov=0.5281) | +0.0292 (top1=+0.0115, wdl=+0.0252, aux=+0.0131, cal=+0.0044) | ✅ |
+| 2 | Fix GradNorm bootstrap stuck on missing calibration probes | 1.103758 (top1=0.4560, wdl=0.6911, aux=0.5163, cal=0.9254, cal_cov=0.5375) | -0.0132 (top1=-0.0048, wdl=-0.0185, aux=-0.0077, cal=-0.0050) | ❌ |
+| 3 | Raise GradNorm weight floor to prevent aux/cal starvation | 1.104957 (top1=0.4523, wdl=0.6925, aux=0.5299, cal=0.9343, cal_cov=0.5363) | -0.0120 (top1=-0.0085, wdl=-0.0171, aux=+0.0059, cal=+0.0038) | ❌ |
+| 4 | Disable broken GradNorm to eliminate probe overhead | 1.070750 (top1=0.4420, wdl=0.6305, aux=0.5318, cal=0.9426, cal_cov=0.5494) | -0.0462 (top1=-0.0188, wdl=-0.0791, aux=+0.0079, cal=+0.0122) | ❌ |
+| 5 | Lower LR plateau threshold from 0.5% to 0.3% | 1.106794 (top1=0.4582, wdl=0.7004, aux=0.5176, cal=0.9318, cal_cov=0.5229) | -0.0101 (top1=-0.0026, wdl=-0.0092, aux=-0.0064, cal=+0.0014) | ❌ |
