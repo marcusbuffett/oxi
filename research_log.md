@@ -55,3 +55,4 @@ The next research-loop baseline should be treated as the start of a new series u
 | 3 | Raise GradNorm weight floor to prevent aux/cal starvation | 1.075259 (top1=0.4523, wdl=0.6925, aux=0.5299, cal=0.4268) | -0.0073 (top1=-0.0085, wdl=-0.0171, aux=+0.0059, cal=+0.0213) | ❌ |
 | 4 | Disable broken GradNorm to eliminate probe overhead | 1.055493 (top1=0.4420, wdl=0.6305, aux=0.5318, cal=0.4797) | -0.0271 (top1=-0.0188, wdl=-0.0791, aux=+0.0079, cal=+0.0742) | ❌ |
 | 5 | Lower LR plateau threshold from 0.5% to 0.3% | 1.076957 (top1=0.4582, wdl=0.7004, aux=0.5176, cal=0.4126) | -0.0056 (top1=-0.0026, wdl=-0.0092, aux=-0.0064, cal=+0.0071) | ❌ |
+| 6 | Increase policy label smoothing 0.005→0.1 | 1.041291 (top1=0.4486, wdl=0.6923, aux=0.5171, cal=0.3579) | -0.0413 (top1=-0.0122, wdl=-0.0173, aux=-0.0069, cal=-0.0476) | ❌ |

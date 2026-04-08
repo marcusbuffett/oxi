@@ -37,6 +37,12 @@
       "title": "Lower LR plateau threshold from 0.5% to 0.3%",
       "ao": 1.076957,
       "status": "discarded"
+    },
+    {
+      "iter": 6,
+      "title": "Increase policy label smoothing 0.005→0.1",
+      "ao": 1.04129064286,
+      "status": "discarded"
     }
   ],
   "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_1",
