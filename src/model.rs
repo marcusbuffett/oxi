@@ -823,12 +823,23 @@ impl<B: Backend> OXIModel<B> {
                     * calibration_mask.clone())
                 .sum()
                     / mask_sum.clone();
+                // Metric-aligned policy calibration loss: directly optimizes the scoring metric exp(-|error|/15).
+                // Unlike MAE (constant gradient), this gives stronger gradient for small errors where the
+                // metric is steep, and weaker gradient for large errors where the metric is flat.
+                // This prevents the model from wasting gradient budget on irredeemable miscalibrations
+                // and focuses optimization where the metric is most sensitive.
+                let policy_cp_error = (policy_expected_cp.clone() - target_cp.clone()).abs();
+                let policy_cal_metric = (policy_cp_error.neg().div_scalar(15.0f32)
+                    .exp().neg().add_scalar(1.0f32)
+                    * calibration_mask.clone())
+                .sum()
+                    / mask_sum.clone();
                 let head_mae = ((head_expected_cp - target_cp).abs() * calibration_mask.clone())
                     .sum()
                     / mask_sum.clone();
 
                 let base_loss =
-                    head_ce.clone() + policy_mae.clone() * 0.01 + head_mae.clone() * 0.005;
+                    head_ce.clone() + policy_cal_metric * 2.0 + head_mae.clone() * 0.005;
 
                 let mut signed_error_sums =
                     std::collections::BTreeMap::<String, (f32, usize)>::new();
