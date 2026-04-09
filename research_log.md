@@ -56,3 +56,20 @@ The next research-loop baseline should be treated as the start of a new series u
 | 4 | Disable broken GradNorm to eliminate probe overhead | 1.055493 (top1=0.4420, wdl=0.6305, aux=0.5318, cal=0.4797) | -0.0271 (top1=-0.0188, wdl=-0.0791, aux=+0.0079, cal=+0.0742) | ❌ |
 | 5 | Lower LR plateau threshold from 0.5% to 0.3% | 1.076957 (top1=0.4582, wdl=0.7004, aux=0.5176, cal=0.4126) | -0.0056 (top1=-0.0026, wdl=-0.0092, aux=-0.0064, cal=+0.0071) | ❌ |
 | 6 | Increase policy label smoothing 0.005→0.1 | 1.041291 (top1=0.4486, wdl=0.6923, aux=0.5171, cal=0.3579) | -0.0413 (top1=-0.0122, wdl=-0.0173, aux=-0.0069, cal=-0.0476) | ❌ |
+| 7 | Boost policy-implied CPL loss 50x | 0.919296 (top1=0.2812, wdl=0.6009, aux=0.4199, cal=0.6342) | -0.1633 (top1=-0.1796, wdl=-0.1087, aux=-0.1041, cal=+0.2287) | ❌ |
+| 8 | FiLM-conditioned policy head | 1.113876 (top1=0.4551, wdl=0.7048, aux=0.5175, cal=0.5072) | +0.0313 (top1=-0.0057, wdl=-0.0048, aux=-0.0065, cal=+0.1017) | ✅ |
+| 9 | Elo-Conditional Temperature Scaling | 1.119919 (top1=0.4598, wdl=0.6921, aux=0.5269, cal=0.5218) | +0.0060 (top1=+0.0047, wdl=-0.0128, aux=+0.0094, cal=+0.0147) | ❌ |
+| 10 | Metric-Aligned Calibration Loss | 1.166766 (top1=0.4725, wdl=0.7070, aux=0.5394, cal=0.5821) | +0.0529 (top1=+0.0174, wdl=+0.0022, aux=+0.0219, cal=+0.0749) | ✅ |
+| 11 | Non-Linear Factorized Policy Head | 1.148648 (top1=0.4587, wdl=0.6865, aux=0.5323, cal=0.6006) | -0.0181 (top1=-0.0139, wdl=-0.0205, aux=-0.0071, cal=+0.0186) | ❌ |
+| 12 | Mid-trunk deep supervision for from/to square heads | 1.170902 (top1=0.4784, wdl=0.6954, aux=0.5444, cal=0.5897) | +0.0041 (top1=+0.0059, wdl=-0.0117, aux=+0.0050, cal=+0.0076) | ❌ |
+| 13 | Residual spatial conv for local board context | 1.151362 (top1=0.4633, wdl=0.7144, aux=0.5286, cal=0.5630) | -0.0154 (top1=-0.0093, wdl=+0.0073, aux=-0.0108, cal=-0.0191) | ❌ |
+| 14 | Wider shallower architecture 224d×10L×7H | 1.155768 (top1=0.4614, wdl=0.7126, aux=0.5279, cal=0.5813) | -0.0110 (top1=-0.0112, wdl=+0.0056, aux=-0.0115, cal=-0.0008) | ❌ |
+| 15 | Stochastic depth regularization for trunk transformer | 1.157168 (top1=0.4737, wdl=0.6922, aux=0.5332, cal=0.5767) | -0.0096 (top1=+0.0012, wdl=-0.0148, aux=-0.0062, cal=-0.0054) | ❌ |
+| 16 | Restore value head mean-pool skip connection | 1.173534 (top1=0.4770, wdl=0.6964, aux=0.5463, cal=0.5977) | +0.0068 (top1=+0.0044, wdl=-0.0106, aux=+0.0069, cal=+0.0156) | ❌ |
+| 17 | Higher LR + stronger weight decay training regime | 1.183133 (top1=0.4875, wdl=0.6830, aux=0.5516, cal=0.6096) | +0.0164 (top1=+0.0149, wdl=-0.0240, aux=+0.0122, cal=+0.0275) | ✅ |
+| 18 | Rebalance calibration loss toward policy pathway | 1.167889 (top1=0.4698, wdl=0.6918, aux=0.5332, cal=0.6139) | -0.0152 (top1=-0.0177, wdl=+0.0088, aux=-0.0184, cal=+0.0043) | ❌ |
+| 19 | Focal loss gamma=2.0 for policy head | 1.162769 (top1=0.4710, wdl=0.6925, aux=0.5407, cal=0.5934) | -0.0204 (top1=-0.0165, wdl=+0.0095, aux=-0.0110, cal=-0.0161) | ❌ |
+| 20 | Higher LR 1.8× and stronger weight decay 0.01 | 1.180364 (top1=0.4788, wdl=0.6963, aux=0.5457, cal=0.6107) | -0.0028 (top1=-0.0087, wdl=+0.0133, aux=-0.0060, cal=+0.0011) | ❌ |
+| 21 | AdamW beta_2 from 0.999 to 0.95 | 1.163385 (top1=0.4685, wdl=0.6978, aux=0.5299, cal=0.5999) | -0.0197 (top1=-0.0189, wdl=+0.0148, aux=-0.0217, cal=-0.0097) | ❌ |
+| 22 | Dual-pathway calibration head with policy tokens | 1.168374 (top1=0.4733, wdl=0.6965, aux=0.5412, cal=0.5965) | -0.0148 (top1=-0.0142, wdl=+0.0136, aux=-0.0104, cal=-0.0131) | ❌ |
+| 23 | Deeper policy head with second transformer block | 1.156665 (top1=0.4682, wdl=0.6918, aux=0.5349, cal=0.5891) | -0.0265 (top1=-0.0193, wdl=+0.0088, aux=-0.0167, cal=-0.0205) | ❌ |
