@@ -343,7 +343,7 @@ impl<B: Backend> OXIModel<B> {
             log_tensor_stats("policy.tokens", &tokens);
             let logits = {
                 let _t = TimingScope::new_with_sync::<B>("factorized_policy", &device);
-                self.policy_head.forward(tokens.clone())
+                self.policy_head.forward(tokens.clone(), globals.clone())
             };
             log_tensor_stats("policy.logits", &logits);
             (logits, tokens)

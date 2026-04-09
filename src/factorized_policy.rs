@@ -3,7 +3,7 @@ use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::backend::Backend;
 
-use crate::config::get_global_config;
+use crate::config::{get_global_config, NUM_GLOBALS};
 
 const NUM_PROMO_PIECES: usize = 4;
 
@@ -13,6 +13,10 @@ pub struct FactorizedPolicyHead<B: Backend> {
     target_proj: Linear<B>,
     promo_from_proj: Linear<B>,
     promo_to_proj: Linear<B>,
+    source_gamma_proj: Linear<B>,
+    source_beta_proj: Linear<B>,
+    target_gamma_proj: Linear<B>,
+    target_beta_proj: Linear<B>,
 }
 
 impl<B: Backend> FactorizedPolicyHead<B> {
@@ -24,6 +28,12 @@ impl<B: Backend> FactorizedPolicyHead<B> {
         let std_init = Initializer::Normal {
             mean: 0.0,
             std: 0.02,
+        };
+
+        // Smaller init for FiLM projections so they start near-identity (gamma≈1, beta≈0)
+        let film_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.01,
         };
 
         Self {
@@ -39,23 +49,53 @@ impl<B: Backend> FactorizedPolicyHead<B> {
             promo_to_proj: LinearConfig::new(embed_dim, NUM_PROMO_PIECES)
                 .with_initializer(std_init.clone())
                 .init(device),
+            source_gamma_proj: LinearConfig::new(NUM_GLOBALS, embed_dim)
+                .with_initializer(film_init.clone())
+                .init(device),
+            source_beta_proj: LinearConfig::new(NUM_GLOBALS, embed_dim)
+                .with_initializer(film_init.clone())
+                .init(device),
+            target_gamma_proj: LinearConfig::new(NUM_GLOBALS, embed_dim)
+                .with_initializer(film_init.clone())
+                .init(device),
+            target_beta_proj: LinearConfig::new(NUM_GLOBALS, embed_dim)
+                .with_initializer(film_init.clone())
+                .init(device),
         }
     }
 
-    pub fn forward(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, tokens: Tensor<B, 3>, globals: Tensor<B, 2>) -> Tensor<B, 3> {
         let [batch_size, seq_len, _embed_dim] = tokens.dims();
         debug_assert_eq!(seq_len, 64, "Expected 64 squares");
         let device = tokens.device();
 
-        let base_logits = self.compute_base_logits(tokens.clone());
+        let base_logits = self.compute_base_logits(tokens.clone(), globals);
         let promo_logits = self.compute_promotion_logits(tokens);
 
         self.combine_logits_vectorized(base_logits, promo_logits, batch_size, &device)
     }
 
-    fn compute_base_logits(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn compute_base_logits(&self, tokens: Tensor<B, 3>, globals: Tensor<B, 2>) -> Tensor<B, 3> {
         let source = self.source_proj.forward(tokens.clone());
         let target = self.target_proj.forward(tokens);
+
+        // FiLM conditioning: modulate source/target features based on global features (Elo, time, etc.)
+        // gamma = gamma_proj(globals) + 1  (starts near identity due to small init)
+        // beta = beta_proj(globals)        (starts near zero due to small init)
+        let source_gamma = self.source_gamma_proj.forward(globals.clone()) + 1.0;
+        let source_beta = self.source_beta_proj.forward(globals.clone());
+        let target_gamma = self.target_gamma_proj.forward(globals.clone()) + 1.0;
+        let target_beta = self.target_beta_proj.forward(globals);
+
+        // Reshape for broadcasting: [batch, embed_dim] -> [batch, 1, embed_dim]
+        let source_gamma = source_gamma.unsqueeze_dim(1);
+        let source_beta = source_beta.unsqueeze_dim(1);
+        let target_gamma = target_gamma.unsqueeze_dim(1);
+        let target_beta = target_beta.unsqueeze_dim(1);
+
+        let source = source * source_gamma + source_beta;
+        let target = target * target_gamma + target_beta;
+
         source.matmul(target.transpose())
     }
 
@@ -202,8 +242,9 @@ mod tests {
         let head = FactorizedPolicyHead::<TestBackend>::new(&device);
         let batch_size = 2usize;
         let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
+        let globals = Tensor::zeros([batch_size, NUM_GLOBALS], &device);
 
-        let output = head.forward(tokens);
+        let output = head.forward(tokens, globals);
         assert_eq!(output.dims(), [batch_size, 64, 76]);
     }
 
@@ -216,8 +257,9 @@ mod tests {
         let head = FactorizedPolicyHead::<TestBackend>::new(&device);
         let batch_size = 2usize;
         let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
+        let globals = Tensor::zeros([batch_size, NUM_GLOBALS], &device);
 
-        let base = head.compute_base_logits(tokens);
+        let base = head.compute_base_logits(tokens, globals);
         assert_eq!(base.dims(), [batch_size, 64, 64]);
     }
 
