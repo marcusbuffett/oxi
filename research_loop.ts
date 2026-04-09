@@ -702,7 +702,7 @@ End your response with:
 \`\`\``;
 
       console.log("  Requesting experiment idea from subagent...");
-      const ideaResult = await call_tool("subagent_run", { task: ideaPrompt, role: "full" });
+      const ideaResult = await call_tool("subagent_run", { task: ideaPrompt, role: "full", reasoning_effort: "high" });
       const ideaOutput = ideaResult.output ?? "";
 
       await Bun.write(join(iterDir, "idea.md"), ideaOutput);
