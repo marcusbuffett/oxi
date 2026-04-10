@@ -1,7 +1,7 @@
 use crate::calibration::calibration_skill_band_label;
 use crate::calibration::RegretBin;
 use crate::config::{
-    ModelConfig, BOARD_FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS, RECENCY_FEATURES,
+    ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS,
 };
 use crate::distribution_utils::beta_log_pdf;
 use crate::factorized_policy::FactorizedPolicyHead;
@@ -32,7 +32,8 @@ use crate::train_stubs::*;
 
 #[derive(Module, Debug)]
 pub struct OXIModel<B: Backend> {
-    token_embed: Linear<B>,
+    embed_proj1: Linear<B>,
+    embed_proj2: Linear<B>,
     square_embed: Param<Tensor<B, 2>>,
     spatial_conv: Option<SpatialConv<B>>,
     token_norm: RmsNorm<B>,
@@ -54,7 +55,6 @@ pub struct OXIModel<B: Backend> {
     value_uncertainty: Param<Tensor<B, 1>>,
     side_info_uncertainty: Param<Tensor<B, 1>>,
     time_usage_uncertainty: Param<Tensor<B, 1>>,
-    recency_norm: RmsNorm<B>,
     policy_block: TransformerBlock<B>,
     value_block: TransformerBlock<B>,
     aux_mobility_head: Linear<B>,
@@ -73,11 +73,8 @@ pub struct OXIModel<B: Backend> {
 
 impl<B: Backend> OXIModel<B> {
     pub fn new(device: &Device<B>, config: &ModelConfig) -> Self {
-        let base_embed_dim = config.embed_dim().saturating_sub(RECENCY_FEATURES);
-        assert!(
-            base_embed_dim >= 2,
-            "embed_dim must exceed recency features"
-        );
+        let embed_dim = config.embed_dim();
+        let embed_hidden_dim = 256; // intermediate dim for two-layer embedding
 
         // Standard initialization: Normal(0, 0.02)
         let std_init = Initializer::Normal {
@@ -85,20 +82,24 @@ impl<B: Backend> OXIModel<B> {
             std: 0.02,
         };
 
-        let token_embed = LinearConfig::new(BOARD_FEATURES_PER_TOKEN, base_embed_dim)
+        // Two-layer nonlinear embedding: all features (board + recency) → hidden → embed_dim
+        let embed_proj1 = LinearConfig::new(FEATURES_PER_TOKEN, embed_hidden_dim)
+            .with_initializer(std_init.clone())
+            .init(device);
+        let embed_proj2 = LinearConfig::new(embed_hidden_dim, embed_dim)
             .with_initializer(std_init.clone())
             .init(device);
 
-        // Learnable per-square positional embedding
+        // Learnable per-square positional embedding (full embed_dim)
         let square_embed = Param::from_tensor(Tensor::random(
-            [64, base_embed_dim],
+            [64, embed_dim],
             burn::tensor::Distribution::Normal(0.0, 0.02),
             device,
         ));
 
         // Spatial conv: 3x3 neighbor gather + linear projection (channels-last, no permute)
         let spatial_conv = if config.conv_layers() > 0 {
-            Some(SpatialConv::new(device, BOARD_FEATURES_PER_TOKEN))
+            Some(SpatialConv::new(device, FEATURES_PER_TOKEN))
         } else {
             None
         };
@@ -110,8 +111,7 @@ impl<B: Backend> OXIModel<B> {
             blocks.push(TransformerBlock::new(device));
         }
 
-        let token_norm = RmsNormConfig::new(base_embed_dim).init(device);
-        let recency_norm = RmsNormConfig::new(RECENCY_FEATURES).init(device);
+        let token_norm = RmsNormConfig::new(embed_dim).init(device);
 
         let norm = RmsNormConfig::new(config.embed_dim()).init(device);
 
@@ -202,7 +202,8 @@ impl<B: Backend> OXIModel<B> {
             .init(device);
 
         Self {
-            token_embed,
+            embed_proj1,
+            embed_proj2,
             square_embed,
             spatial_conv,
             token_norm,
@@ -224,7 +225,6 @@ impl<B: Backend> OXIModel<B> {
             value_uncertainty,
             side_info_uncertainty,
             time_usage_uncertainty,
-            recency_norm,
             policy_block,
             value_block,
             aux_mobility_head,
@@ -276,24 +276,11 @@ impl<B: Backend> OXIModel<B> {
         let board_features = board.clone();
         log_tensor_stats("input.board_features", &board_features);
 
-        let main_features = board_features
-            .clone()
-            .narrow(2, 0, BOARD_FEATURES_PER_TOKEN);
-        log_tensor_stats("input.main_features", &main_features);
-
-        let recency_features = board_features.narrow(2, BOARD_FEATURES_PER_TOKEN, RECENCY_FEATURES);
-        log_tensor_stats("input.recency_features", &recency_features);
-
-        let mut token_features = main_features.clone();
-        log_tensor_stats("embed.token_features_initial", &token_features);
-
-        if let Some(ref spatial_conv) = self.spatial_conv {
-            token_features = spatial_conv.forward(token_features);
-        }
-
+        // Two-layer nonlinear embedding: all 65 features → SiLU → embed_dim
         let token_embeds = {
             let _t = TimingScope::new_with_sync::<B>("token_embed", &device);
-            let embeds = self.token_embed.forward(token_features);
+            let hidden = silu(self.embed_proj1.forward(board_features));
+            let embeds = self.embed_proj2.forward(hidden);
             // Add learnable per-square positional embeddings
             embeds + self.square_embed.val().unsqueeze_dim::<3>(0)
         };
@@ -304,13 +291,7 @@ impl<B: Backend> OXIModel<B> {
             "Sequence length must be 64 for 8x8 board"
         );
 
-        let token_normed = self.token_norm.forward(token_embeds);
-        let recency_normed = self.recency_norm.forward(recency_features);
-
-        log_tensor_stats("embed.token_normed", &token_normed);
-        log_tensor_stats("embed.recency_normed", &recency_normed);
-
-        let mut x = Tensor::cat(vec![token_normed, recency_normed], 2);
+        let mut x = self.token_norm.forward(token_embeds);
         log_tensor_stats("encoder.input_tokens", &x);
 
         {
