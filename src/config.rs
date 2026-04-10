@@ -1159,7 +1159,7 @@ impl Default for Config {
             value_loss_weight: 0.10,
             value_entropy_weight: 0.0,
             embed_dim: 192,
-            num_layers: 12,
+            num_layers: 8,
             num_heads: 6,
 
             conv_layers: 0,
@@ -1189,7 +1189,7 @@ impl Default for Config {
             disable_training_shuffle: Some(false),
             full_metrics_interval: 50,
             elo_priority_boost: 3.0,
-            puzzle_sampling_ratio: 0.05,
+            puzzle_sampling_ratio: 0.0,
             puzzle_path: None,
             calibration_db_path: None,
             calibration_loss_weight: default_calibration_loss_weight(),
