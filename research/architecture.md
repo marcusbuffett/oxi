@@ -40,11 +40,11 @@ The standard research training command is:
   --seed=<varies> \
   --log-dir=<run_dir> \
   --disable-tui \
-  --warmup-multiplier=0.1 \
+  --warmup-multiplier=1.0 \
   --log-gradient-breakdown \
   --full-metrics-interval=200 \
   --gradnorm-interval=200 \
-  --checkpoint-interval=0
+  --checkpoint-interval=400
 ```
 
 Key overrides from code defaults:
@@ -52,10 +52,10 @@ Key overrides from code defaults:
 | Parameter | Research Loop Value | Code Default |
 |-----------|---------------------|--------------|
 | `physical_batch_size` | **512** | 16000 |
-| `warmup_multiplier` | **0.1** | 2.0 |
+| `warmup_multiplier` | **1.0** | 2.0 |
 | `full_metrics_interval` | **200** | 50 |
 | `gradnorm_interval` | **200** | 20 |
-| `checkpoint_interval` | **0** | 100 |
+| `checkpoint_interval` | **400** | 100 |
 | `--disable-tui` | yes | no |
 | `--log-gradient-breakdown` | yes | no |
 | `pretrain_samples` | **0** | 0 |
@@ -64,9 +64,9 @@ Architecture is not pinned by CLI. The research loop relies on `Config::default(
 
 | Parameter | Current Default |
 |-----------|-----------------|
-| `embed_dim` | 192 |
-| `num_layers` | 12 |
-| `num_heads` | 6 |
+| `embed_dim` | 224 |
+| `num_layers` | 8 |
+| `num_heads` | 7 |
 | `conv_layers` | 0 |
 
 The research loop score now includes centipawn-loss calibration in addition to move/value/aux metrics. That calibration component is coverage-gated so runs with too little labeled calibration data do not get over-rewarded.
@@ -154,11 +154,11 @@ board_input [B, 64, 65]
 
 For current defaults:
 
-- `embed_dim = 192`
-- `num_layers = 12`
-- `num_heads = 6`
+- `embed_dim = 224`
+- `num_layers = 8`
+- `num_heads = 7`
 - `head_dim = 32`
-- total transformer blocks on the active forward path = 14
+- total transformer blocks on the active forward path = 10
 
 ### Learnable Square Embeddings
 
@@ -451,7 +451,7 @@ Defaults:
 | `lr_improvement_threshold` | 0.02 |
 | `lr_reduction_factor` | 0.5 |
 | `lr_min` | 1e-6 |
-| `warmup_multiplier` | 2.0 default, **0.1 in research loop** |
+| `warmup_multiplier` | 2.0 default, **1.0 in research loop** |
 
 Warmup length is:
 
@@ -506,7 +506,7 @@ Examples are represented as `ChessExample` and contain:
 
 If enabled, puzzle examples are mixed into the human stream at:
 
-- `puzzle_sampling_ratio = 0.05` by default
+- `puzzle_sampling_ratio = 0.0` by default (disabled)
 
 In value-only mode, puzzle mixing is disabled.
 
@@ -663,6 +663,10 @@ At a high level:
 10. optimizer step
 11. scheduler update
 12. metrics logging
+
+### Performance Logging
+
+The training loop logs `perf_main_loop` with timing breakdowns. **Note:** `worker_wait` is the time spent waiting for device worker threads to finish — this includes forward pass, backward pass, and gradient computation, not data loading. It is the dominant cost per iteration and reflects model compute time.
 
 ### Effective Batch Size
 

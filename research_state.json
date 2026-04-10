@@ -145,6 +145,18 @@
       "title": "Deeper policy head with second transformer block",
       "ao": 1.1566651872100002,
       "status": "discarded"
+    },
+    {
+      "iter": 24,
+      "title": "Learnable 2D relative position bias in attention",
+      "ao": 0,
+      "status": "discarded"
+    },
+    {
+      "iter": 25,
+      "title": "[ERROR] openrouter API error (status=403 Forbidden): {\"err",
+      "ao": 0,
+      "status": "error"
     }
   ],
   "best_run_dir": "/Users/marcusbuffett/projects/chessbook/oxi/research_runs/run_17",

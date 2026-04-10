@@ -7,7 +7,7 @@
  * - Inline statistical helpers replace numpy/scipy
  * - Chart generation via canvas
  */
-import { call_tool } from "./shadesmar_tools";
+import { call_tool, subagent } from "./shadesmar_tools";
 import { join } from "path";
 import { existsSync, mkdirSync, readdirSync, statSync, rmSync, readFileSync, writeFileSync, appendFileSync } from "fs";
 
@@ -329,8 +329,7 @@ function buildBinary(): [boolean, string] {
 
 async function runTraining(runName: string, seed: number): Promise<[number, Components]> {
   const logDir = join(RESEARCH_RUNS, runName);
-  const metricsDir = join(logDir, "metrics_logs");
-  if (existsSync(metricsDir)) rmSync(metricsDir, { recursive: true });
+  if (existsSync(logDir)) rmSync(logDir, { recursive: true });
   mkdirSync(logDir, { recursive: true });
 
   const binary = join(WORKSPACE, "target", "release", "oxi");
@@ -566,8 +565,9 @@ async function main() {
     );
   }
 
-  // Run baseline if needed
-  if (state.baseline_score === 0.0) {
+  // Run baseline if needed (also re-run if baseline dir was deleted)
+  const baselineDirExists = existsSync(join(RESEARCH_RUNS, "baseline", "metrics_logs"));
+  if (state.baseline_score === 0.0 || !baselineDirExists) {
     console.log("=== Running baseline training ===");
     gitRevert();
 
@@ -666,7 +666,7 @@ If your proposed change would not plausibly move the score by at least 1%, it's 
 
 ## What To Do
 
-Read the experiment log at research_log.md to see what has been tried. Do not repeat failed ideas.
+Read the experiment log at research_log.md to see what has been tried. Do not repeat failed ideas. If something similar was tried and failed, explain specifically what makes your approach different.
 
 Explore the codebase, then propose **one logical change**. Don't bundle unrelated modifications, but the change itself can be ambitious — a new architecture component, a different training objective, a structural refactor of how something works.
 
@@ -702,7 +702,7 @@ End your response with:
 \`\`\``;
 
       console.log("  Requesting experiment idea from subagent...");
-      const ideaResult = await call_tool("subagent_run", { task: ideaPrompt, role: "full", reasoning_effort: "high" });
+      const ideaResult = await subagent.run({ task: ideaPrompt, role: "full", reasoning_effort: "high" });
       const ideaOutput = ideaResult.output ?? "";
 
       await Bun.write(join(iterDir, "idea.md"), ideaOutput);
@@ -711,32 +711,7 @@ End your response with:
       console.log(`  Title: ${title}`);
       if (description) console.log(`  Description: ${description}`);
 
-      // --- Phase 3: Compile check ---
-      console.log("  Checking compilation...");
-      const [compiles, compileStderr] = compileCheck();
-      if (!compiles) {
-        console.log("  ❌ Compile failed!");
-        console.log(`  ${compileStderr.slice(-500)}`);
-        gitRevert();
-        const result: ResultEntry = {
-          iter: i,
-          title: `[COMPILE FAIL] ${title}`,
-          ao: 0.0,
-          status: "fail",
-        };
-        allResults.push(result);
-        appendFileSync(RESEARCH_LOG,
-            `| ${i} | [COMPILE FAIL] ${title} | 0.000000 | — | ❌ |\n`,
-        );
-        state.results = allResults;
-        saveState(state);
-        consecutiveErrors = 0;
-        continue;
-      }
-
-      console.log("  ✅ Compilation succeeded");
-
-      // --- Phase 4: Build release binary ---
+      // --- Phase 3: Build release binary (also serves as compile check) ---
       console.log("  Building release binary...");
       const [buildOk, buildStderr] = buildBinary();
       if (!buildOk) {
@@ -759,9 +734,29 @@ End your response with:
         continue;
       }
 
-      // --- Phase 5: Training ---
+      // --- Phase 4: Training ---
       const seed = 42;
       const [score, components] = await runTraining(`run_${i}`, seed);
+
+      // --- Phase 5: Crash / NaN detection ---
+      if (score < 0.01) {
+        console.log(`  ❌ Training crashed or diverged (score=${score.toFixed(6)})`);
+        gitRevert();
+        const result: ResultEntry = {
+          iter: i,
+          title: `[CRASH] ${title}`,
+          ao: score,
+          status: "fail",
+        };
+        allResults.push(result);
+        appendFileSync(RESEARCH_LOG,
+            `| ${i} | [CRASH] ${title} | ${score.toFixed(6)} | — | ❌ |\n`,
+        );
+        state.results = allResults;
+        saveState(state);
+        consecutiveErrors = 0;
+        continue;
+      }
 
       // --- Phase 6: Statistical comparison ---
       const bestDir = state.best_run_dir!;
