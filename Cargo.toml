@@ -20,7 +20,7 @@ clap = { version = "*", features = ["derive"] }
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 serde_yaml = "*"
-shakmaty = "*"
+shakmaty = "0.29"
 pgn-reader = { git = "https://github.com/marcusbuffett/rust-pgn-reader", branch = "master" }
 tokio = { version = "*", features = ["full"] }
 indicatif = "*"
