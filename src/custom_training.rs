@@ -16,7 +16,7 @@ use burn_train::metric::IterationSpeedMetric;
 use burn_train::metric::{Adaptor, Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 use burn_train::Interrupter;
 use rand::seq::{IteratorRandom, SliceRandom};
-use rand::thread_rng;
+use rand::rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -407,7 +407,7 @@ fn sample_gradnorm_items(items: &[ChessItem], sample_size: usize) -> Vec<ChessIt
         return items.to_vec();
     }
 
-    let mut rng = thread_rng();
+    let mut rng = rng();
     items
         .iter()
         .choose_multiple(&mut rng, sample_size)

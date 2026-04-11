@@ -351,7 +351,7 @@ impl Visitor for PgnVisitor {
         }
 
         // Apply Elo-based game sampling
-        let rng_value: f64 = rand::thread_rng().gen();
+        let rng_value: f64 = rand::rng().random();
         if !should_keep_game_by_elo(white_elo, black_elo, rng_value) {
             self.skip = true;
             tracing::debug!("skipping!");
@@ -438,7 +438,7 @@ impl Visitor for PgnVisitor {
 
         // Apply ply-based position sampling
         let current_ply = self.moves.len(); // This gives us the ply number (0-based)
-        let rng_value: f64 = rand::thread_rng().gen();
+        let rng_value: f64 = rand::rng().random();
         let should_include = should_include && should_keep_position_by_ply(current_ply, rng_value);
 
         if should_include {

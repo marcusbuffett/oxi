@@ -1,6 +1,7 @@
 use clap::Args;
 use once_cell::sync::Lazy;
 use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
@@ -1280,8 +1281,8 @@ pub fn elo_keep_probability_with_boost(avg_elo: f64, priority_boost: f64) -> f64
 /// Use this to guard expensive host syncs (e.g., tensor .to_data()) in hot paths.
 pub fn should_log_item() -> bool {
     let config = get_global_config();
-    let mut rng = rand::thread_rng();
-    rng.gen::<f32>() < config.item_log_probability
+    let mut rng = rand::rng();
+    rng.random::<f32>() < config.item_log_probability
 }
 
 /// Execute the provided logger closure with probability `item_log_probability`.

@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use burn::prelude::*;
 use burn::tensor::activation::{log_softmax, softmax};
 use pgn_reader::{San, SanPlus};
-use rand::{thread_rng, Rng};
+use rand::Rng;
 use shakmaty::uci::UciMove;
 use shakmaty::{fen::Fen, Chess, Position, Square};
 use statrs::distribution::{Beta, ContinuousCDF};

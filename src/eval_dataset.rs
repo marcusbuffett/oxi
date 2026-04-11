@@ -592,6 +592,7 @@ pub fn sample_positions_from_pgn(
     use pgn_reader::{BufferedReader, RawHeader, SanPlus, Skip, Visitor};
     use rand::seq::SliceRandom;
     use rand::Rng;
+    use rand::RngExt;
     use shakmaty::{Chess, Color, EnPassantMode, Position};
 
     let per_bucket = num_positions / elo_buckets.len();
