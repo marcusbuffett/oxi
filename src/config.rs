@@ -91,8 +91,10 @@ pub struct Config {
     /// Window size for plateau detection (number of iterations to compare)
     pub lr_window_size: usize,
 
-    /// Minimum relative improvement threshold for plateau detection (e.g., 0.0005 = 0.05% improvement required)
-    pub lr_improvement_threshold: f64,
+    /// Welch's t-test threshold for plateau detection. Plateau is declared when t-statistic
+    /// falls below this value (i.e., we can't confidently say loss is still decreasing).
+    /// 1.65 ≈ p<0.05 one-sided, 2.33 ≈ p<0.01 one-sided.
+    pub lr_plateau_t_threshold: f64,
 
     /// Factor to reduce learning rate by when plateau is detected (e.g., 0.5 means halve the LR)
     pub lr_reduction_factor: f64,
@@ -410,9 +412,9 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub lr_window_size: Option<usize>,
 
-    /// Minimum relative improvement threshold for plateau detection
+    /// Welch's t-test threshold for plateau detection (e.g., 1.65 = p<0.05)
     #[arg(long)]
-    pub lr_improvement_threshold: Option<f64>,
+    pub lr_plateau_t_threshold: Option<f64>,
 
     /// Factor to reduce learning rate by when plateau is detected
     #[arg(long)]
@@ -720,8 +722,8 @@ impl Config {
         if let Some(v) = overrides.lr_window_size {
             config.lr_window_size = v;
         }
-        if let Some(v) = overrides.lr_improvement_threshold {
-            config.lr_improvement_threshold = v;
+        if let Some(v) = overrides.lr_plateau_t_threshold {
+            config.lr_plateau_t_threshold = v;
         }
         if let Some(v) = overrides.lr_reduction_factor {
             config.lr_reduction_factor = v;
@@ -1146,8 +1148,8 @@ impl Default for Config {
             gradnorm_aux_priority: 1.5,
             gradnorm_probe_size: 256,
             lr_min: 0.000001,
-            lr_window_size: 300,
-            lr_improvement_threshold: 0.005,
+            lr_window_size: 1000,
+            lr_plateau_t_threshold: 0.6,
             lr_reduction_factor: 0.7,
             lr_multiplier: 1.5,
             muon_base_lr: default_muon_base_lr(),

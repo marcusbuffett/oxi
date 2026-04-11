@@ -1376,7 +1376,7 @@ Model & Data Configuration\n\
 - Warmup iterations: {warmup_iterations}\n\
 - Warmup multiplier: {warmup_multiplier}\n\
 - LR window size: {lr_window_size}\n\
-- LR improvement threshold: {lr_improvement_threshold:.2}%\n\
+- LR plateau t-threshold: {lr_plateau_t_threshold:.2}\n\
 - LR reduction factor: {lr_reduction_factor}\n\
 \n\
 Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
@@ -1413,7 +1413,7 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         warmup_iterations = warmup_iterations,
         warmup_multiplier = config.warmup_multiplier,
         lr_window_size = config.lr_window_size,
-        lr_improvement_threshold = config.lr_improvement_threshold * 100.0,
+        lr_plateau_t_threshold = config.lr_plateau_t_threshold,
         lr_reduction_factor = config.lr_reduction_factor,
         window = SCORE_WINDOW,
     );
@@ -1495,12 +1495,19 @@ where
     // Create model
     let mut model: OXIModel<B> = OXIModel::new(&devices[0], &config);
 
+    // Checkpoint directory: log_dir/model/ if log_dir is set, otherwise model/
+    let checkpoint_dir: PathBuf = config
+        .log_dir
+        .as_ref()
+        .map(|d| d.join(MODEL_DIR_NAME))
+        .unwrap_or_else(|| PathBuf::from(MODEL_DIR_NAME));
+
     let mut resume_status = "Not requested".to_string();
     let mut resume_optimizer_dir: Option<PathBuf> = None;
 
     if config.resume.unwrap_or(false) {
         let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-        let resume_dir = Path::new(MODEL_DIR_NAME);
+        let resume_dir = &checkpoint_dir;
         let model_file = resume_dir.join(MODEL_FILE_NAME);
 
         if resume_dir.is_dir() && model_file.exists() {
@@ -2032,9 +2039,9 @@ where
         initial_adamw_lr, initial_muon_lr, config.lr_min
     );
     println!(
-        "LR window: {}, LR improvement threshold: {:.2}%, LR reduction factor: {}",
+        "LR window: {}, LR plateau t-threshold: {:.2}, LR reduction factor: {}",
         config.lr_window_size,
-        config.lr_improvement_threshold * 100.0,
+        config.lr_plateau_t_threshold,
         config.lr_reduction_factor
     );
 
@@ -2249,7 +2256,7 @@ where
         config.lr_min,
         config.lr_reduction_factor,
         config.lr_window_size,
-        config.lr_improvement_threshold,
+        config.lr_plateau_t_threshold,
         warmup_iterations,
     );
 
@@ -2365,8 +2372,8 @@ where
             if value_tower_only_mode {
                 // Already in value tower only mode, stop training
                 println!(
-                    "Training stopped: reached min LR in value tower only mode with <{:.2}% improvement",
-                    config.lr_improvement_threshold * 100.0
+                    "Training stopped: reached min LR in value tower only mode (plateau: t < {:.2})",
+                    config.lr_plateau_t_threshold
                 );
                 tracing::info!(
                     "EXIT_CONDITION: lr_min_reached_value_tower at iteration {} (current_lr={:.2e}, min_lr={:.2e})",
@@ -2379,8 +2386,8 @@ where
                 tracing::info!("TRANSITIONING TO VALUE TOWER ONLY MODE");
                 tracing::info!("========================================");
                 tracing::info!(
-                    "Main training reached min LR with <{:.2}% improvement",
-                    config.lr_improvement_threshold * 100.0
+                    "Main training reached min LR (plateau: t < {:.2})",
+                    config.lr_plateau_t_threshold
                 );
                 tracing::info!("Now training only value tower parameters");
                 tracing::info!("  - Resetting LR to initial value");
@@ -3200,10 +3207,11 @@ where
 
         let lr_plateau_input = LrPlateauInput::new(
             current_lr,
+            lr_scheduler.t_statistic(),
             lr_scheduler.relative_improvement(),
             lr_scheduler.window_fill_ratio(),
             lr_scheduler.num_reductions(),
-            config.lr_improvement_threshold,
+            config.lr_plateau_t_threshold,
             lr_scheduler.is_warming_up(),
             lr_scheduler.warmup_progress(),
         );
@@ -3299,7 +3307,7 @@ where
             tracing::info!(
                 "Saving checkpoint at iteration {} to {}",
                 iteration,
-                MODEL_DIR_NAME
+                checkpoint_dir.display()
             );
 
             save_training_state(
@@ -3311,7 +3319,7 @@ where
                 &optim_decay_high,
                 &optim_no_decay_normal,
                 &optim_no_decay_high,
-                Path::new(MODEL_DIR_NAME),
+                &checkpoint_dir,
             )?;
         }
 
@@ -3389,7 +3397,7 @@ where
         &optim_decay_high,
         &optim_no_decay_normal,
         &optim_no_decay_high,
-        Path::new(MODEL_DIR_NAME),
+        &checkpoint_dir,
     )?;
 
     Ok(())

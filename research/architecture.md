@@ -65,7 +65,7 @@ Architecture is not pinned by CLI. The research loop relies on `Config::default(
 | Parameter | Current Default |
 |-----------|-----------------|
 | `embed_dim` | 192 |
-| `num_layers` | 8 |
+| `num_layers` | 10 |
 | `num_heads` | 6 |
 | `conv_layers` | 0 |
 
@@ -155,10 +155,10 @@ board_input [B, 64, 65]
 For current defaults:
 
 - `embed_dim = 192`
-- `num_layers = 8`
+- `num_layers = 10`
 - `num_heads = 6`
 - `head_dim = 32`
-- total transformer blocks on the active forward path = 10
+- total transformer blocks on the active forward path = 12
 
 ### Learnable Square Embeddings
 
@@ -805,7 +805,7 @@ Current relevant defaults in `Config::default()`:
 ```text
 # Architecture
 embed_dim                    = 192
-num_layers                   = 12
+num_layers                   = 10
 num_heads                    = 6
 conv_layers                  = 0
 

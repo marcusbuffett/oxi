@@ -462,6 +462,14 @@ async fn main() -> Result<()> {
             #[cfg(feature = "train")]
             {
                 let config = Config::with_overrides(overrides);
+                if let Some(ref log_dir) = config.log_dir {
+                    if log_dir.exists() {
+                        tracing::info!("Clearing log directory: {}", log_dir.display());
+                        if let Err(e) = std::fs::remove_dir_all(log_dir) {
+                            eprintln!("Warning: failed to clear log directory: {}", e);
+                        }
+                    }
+                }
                 let _guard = oxi::custom_training::init_train_logging(config.log_dir.as_deref());
                 tracing::info!("Starting training with config: {:?}", config);
                 set_global_config(config.clone()).unwrap();

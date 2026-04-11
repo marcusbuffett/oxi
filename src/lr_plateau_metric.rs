@@ -3,10 +3,11 @@ use burn::train::metric::{Metric, MetricMetadata, Numeric, NumericEntry, Seriali
 #[derive(Clone)]
 pub struct LrPlateauInput {
     pub lr: f64,
+    pub t_statistic: Option<f64>,
     pub relative_improvement: Option<f64>,
     pub window_fill_ratio: f64,
     pub num_reductions: usize,
-    pub improvement_threshold: f64,
+    pub t_threshold: f64,
     pub is_warming_up: bool,
     pub warmup_progress: f64,
 }
@@ -14,19 +15,21 @@ pub struct LrPlateauInput {
 impl LrPlateauInput {
     pub fn new(
         lr: f64,
+        t_statistic: Option<f64>,
         relative_improvement: Option<f64>,
         window_fill_ratio: f64,
         num_reductions: usize,
-        improvement_threshold: f64,
+        t_threshold: f64,
         is_warming_up: bool,
         warmup_progress: f64,
     ) -> Self {
         Self {
             lr,
+            t_statistic,
             relative_improvement,
             window_fill_ratio,
             num_reductions,
-            improvement_threshold,
+            t_threshold,
             is_warming_up,
             warmup_progress,
         }
@@ -36,10 +39,11 @@ impl LrPlateauInput {
 #[derive(Default, Clone)]
 pub struct LrPlateauMetric {
     current_lr: f64,
+    t_statistic: Option<f64>,
     relative_improvement: Option<f64>,
     window_fill_ratio: f64,
     num_reductions: usize,
-    improvement_threshold: f64,
+    t_threshold: f64,
     is_warming_up: bool,
     warmup_progress: f64,
 }
@@ -55,10 +59,11 @@ impl Metric for LrPlateauMetric {
 
     fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         self.current_lr = input.lr;
+        self.t_statistic = input.t_statistic;
         self.relative_improvement = input.relative_improvement;
         self.window_fill_ratio = input.window_fill_ratio;
         self.num_reductions = input.num_reductions;
-        self.improvement_threshold = input.improvement_threshold;
+        self.t_threshold = input.t_threshold;
         self.is_warming_up = input.is_warming_up;
         self.warmup_progress = input.warmup_progress;
 
@@ -74,20 +79,19 @@ impl Metric for LrPlateauMetric {
             String::new()
         };
 
-        let improvement_display = self
-            .relative_improvement
-            .map(|r| format!("{:.2}%", r * 100.0))
+        let t_display = self
+            .t_statistic
+            .map(|t| format!("t={:.2}", t))
             .unwrap_or_else(|| "...".to_string());
 
-        let threshold = self.improvement_threshold * 100.0;
         let fill_pct = self.window_fill_ratio * 100.0;
 
         let formatted = format!(
-            "LR: {}{} | improvement: {} (thresh: {:.2}%) | fill: {:.0}% | reductions: {}",
+            "LR: {}{} | {} (thresh: {:.2}) | fill: {:.0}% | reductions: {}",
             lr_display,
             warmup_display,
-            improvement_display,
-            threshold,
+            t_display,
+            self.t_threshold,
             fill_pct,
             self.num_reductions
         );
@@ -97,10 +101,11 @@ impl Metric for LrPlateauMetric {
 
     fn clear(&mut self) {
         self.current_lr = 0.0;
+        self.t_statistic = None;
         self.relative_improvement = None;
         self.window_fill_ratio = 0.0;
         self.num_reductions = 0;
-        self.improvement_threshold = 0.005;
+        self.t_threshold = 0.6;
         self.is_warming_up = false;
         self.warmup_progress = 0.0;
     }

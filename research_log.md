@@ -28,3 +28,20 @@
 | 23 | Deeper policy head with second transformer block | 1.156665 (top1=0.4682, wdl=0.6918, aux=0.5349, cal=0.5891) | -0.0265 (top1=-0.0193, wdl=+0.0088, aux=-0.0167, cal=-0.0205) | ❌ |
 | 24 | Learnable 2D relative position bias in attention | 0.000000 (top1=0.0000, wdl=0.0000, aux=0.0000, cal=0.0000) | -1.1831 (top1=-0.4875, wdl=-0.6830, aux=-0.5516, cal=-0.6096) | ❌ |
 | 25 | [ERROR x5] openrouter API error (status=403 Forbidden): {"err | 0.000000 | — | ⚠️ |
+| 2 | [CRASH] Learnable per-head position bias in attention | 0.000000 | — | ❌ |
+| 3 | Two-layer nonlinear embedding with unified features | 1.174399 (top1=0.4874, wdl=0.6584, aux=0.5432, cal=0.6229) | +0.0165 (top1=-0.0031, wdl=+0.0341, aux=+0.0048, cal=+0.0039) | ✅ |
+| 4 | Fix value head: apply ply-ramp weights + restore skip | 1.163703 (top1=0.4971, wdl=0.6191, aux=0.5473, cal=0.6189) | -0.0107 (top1=+0.0098, wdl=-0.0393, aux=+0.0040, cal=-0.0041) | ❌ |
+| 5 | Widen Smolgen attention bias generator bottleneck | 1.171145 (top1=0.4924, wdl=0.6396, aux=0.5474, cal=0.6237) | -0.0033 (top1=+0.0050, wdl=-0.0188, aux=+0.0042, cal=+0.0008) | ❌ |
+| 6 | Route calibration head through value-block features | 1.165859 (top1=0.4962, wdl=0.6262, aux=0.5378, cal=0.6225) | -0.0085 (top1=+0.0088, wdl=-0.0322, aux=-0.0054, cal=-0.0004) | ❌ |
+| 7 | FiLM-conditioned embedding for Elo-aware input tokens | 1.164077 (top1=0.5001, wdl=0.6225, aux=0.5496, cal=0.6071) | -0.0103 (top1=+0.0127, wdl=-0.0359, aux=+0.0064, cal=-0.0158) | ❌ |
+| 8 | Increase trunk depth from 8 to 10 layers | 1.171285 (top1=0.4947, wdl=0.6404, aux=0.5444, cal=0.6188) | -0.0031 (top1=+0.0073, wdl=-0.0180, aux=+0.0012, cal=-0.0041) | ❌ |
+| 9 | Compute-neutral wider-shallower architecture 224d×6L×7H | 1.168989 (top1=0.4950, wdl=0.6380, aux=0.5396, cal=0.6176) | -0.0054 (top1=+0.0076, wdl=-0.0204, aux=-0.0036, cal=-0.0054) | ❌ |
+| 10 | Enable 5% puzzle data mixing for tactical transfer | 1.181212 (top1=0.4975, wdl=0.6565, aux=0.5576, cal=0.6099) | +0.0068 (top1=+0.0101, wdl=-0.0019, aux=+0.0144, cal=-0.0131) | ❌ |
+| 11 | FiLM-conditioned value head for Elo-aware WDL | 1.180152 (top1=0.5003, wdl=0.6481, aux=0.5361, cal=0.6214) | +0.0058 (top1=+0.0129, wdl=-0.0103, aux=-0.0071, cal=-0.0015) | ❌ |
+| 12 | Sqrt-scaled warmup for 76% more full-LR training | 1.180067 (top1=0.5012, wdl=0.6337, aux=0.5556, cal=0.6272) | +0.0057 (top1=+0.0138, wdl=-0.0247, aux=+0.0124, cal=+0.0043) | ❌ |
+| 13 | Increase attention heads from 6 to 8 | 1.169300 (top1=0.4891, wdl=0.6462, aux=0.5385, cal=0.6235) | -0.0051 (top1=+0.0017, wdl=-0.0122, aux=-0.0048, cal=+0.0006) | ❌ |
+| 14 | Concatenated trunk skip connection for value head | 0.931806 (top1=0.3621, wdl=0.5935, aux=0.4566, cal=0.4541) | -0.2426 (top1=-0.1253, wdl=-0.0649, aux=-0.0866, cal=-0.1688) | ❌ |
+| 15 | Rebalance GradNorm priorities for value and calibration | 1.135539 (top1=0.4421, wdl=0.6802, aux=0.4994, cal=0.6337) | -0.0389 (top1=-0.0453, wdl=+0.0218, aux=-0.0438, cal=+0.0108) | ❌ |
+| 16 | Fix embedding optimizer misconfig from rename | 1.128454 (top1=0.4472, wdl=0.6915, aux=0.5059, cal=0.5858) | -0.0459 (top1=-0.0402, wdl=+0.0331, aux=-0.0374, cal=-0.0372) | ❌ |
+| 17 | Grouped Query Attention with 2 KV heads | 0.537733 (top1=0.2238, wdl=0.5061, aux=0.1455, cal=0.0796) | -0.6367 (top1=-0.2636, wdl=-0.1523, aux=-0.3978, cal=-0.5433) | ❌ |
+| 18 | Squeeze-and-Excitation channel gating in MLP blocks | 0.907889 (top1=0.3518, wdl=0.5997, aux=0.4435, cal=0.4189) | -0.2665 (top1=-0.1356, wdl=-0.0587, aux=-0.0997, cal=-0.2040) | ❌ |

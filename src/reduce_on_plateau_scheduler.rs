@@ -8,15 +8,17 @@ use std::io::Write;
 pub struct PlateauDetector {
     window: VecDeque<f64>,
     window_size: usize,
-    improvement_threshold: f64,
+    /// t-statistic threshold: plateau is declared when t < this value
+    /// (i.e., we can't confidently say loss is still decreasing)
+    t_threshold: f64,
 }
 
 impl PlateauDetector {
-    pub fn new(window_size: usize, improvement_threshold: f64) -> Self {
+    pub fn new(window_size: usize, t_threshold: f64) -> Self {
         Self {
             window: VecDeque::with_capacity(window_size),
             window_size,
-            improvement_threshold,
+            t_threshold,
         }
     }
 
@@ -31,87 +33,76 @@ impl PlateauDetector {
         self.window.push_back(loss);
     }
 
-    pub fn is_plateau(&self) -> bool {
+    /// Welch's t-test comparing first half vs second half of the window.
+    /// Returns the t-statistic (positive means loss decreased from first to second half).
+    fn welch_t_statistic(&self) -> Option<f64> {
         if self.window.len() < self.window_size {
-            return false;
-        }
-
-        // Linear regression: fit loss = a + b*t over the window.
-        // Plateau if the slope is not significantly negative (loss not decreasing fast enough).
-        // We normalize slope by mean loss to get a relative rate of improvement per step.
-        let n = self.window.len() as f64;
-        let mut sum_x = 0.0;
-        let mut sum_y = 0.0;
-        let mut sum_xy = 0.0;
-        let mut sum_xx = 0.0;
-        for (i, &y) in self.window.iter().enumerate() {
-            let x = i as f64;
-            sum_x += x;
-            sum_y += y;
-            sum_xy += x * y;
-            sum_xx += x * x;
-        }
-        let mean_y = sum_y / n;
-        if mean_y <= 0.0 {
-            return false;
-        }
-        let denom = sum_xx - sum_x * sum_x / n;
-        if denom.abs() < 1e-12 {
-            return false;
-        }
-        let slope = (sum_xy - sum_x * sum_y / n) / denom;
-
-        // Relative improvement rate: negative slope means loss is decreasing.
-        // Normalize by mean loss and window size to get "fraction improved over the window".
-        let relative_improvement = -slope * n / mean_y;
-        relative_improvement < self.improvement_threshold
-    }
-
-    fn half_window_averages(&self) -> Option<(f64, f64)> {
-        if self.window.len() < 4 {
             return None;
         }
 
         let mid = self.window.len() / 2;
-        let first_half: Vec<f64> = self.window.iter().take(mid).copied().collect();
-        let second_half: Vec<f64> = self.window.iter().skip(mid).copied().collect();
+        let n1 = mid as f64;
+        let n2 = (self.window.len() - mid) as f64;
 
-        if first_half.is_empty() || second_half.is_empty() {
+        if n1 < 2.0 || n2 < 2.0 {
             return None;
         }
 
-        let old_avg = first_half.iter().sum::<f64>() / first_half.len() as f64;
-        let new_avg = second_half.iter().sum::<f64>() / second_half.len() as f64;
+        let (sum1, sum_sq1) = self.window.iter().take(mid).fold((0.0, 0.0), |(s, sq), &v| {
+            (s + v, sq + v * v)
+        });
+        let (sum2, sum_sq2) = self.window.iter().skip(mid).fold((0.0, 0.0), |(s, sq), &v| {
+            (s + v, sq + v * v)
+        });
 
-        Some((old_avg, new_avg))
+        let mean1 = sum1 / n1;
+        let mean2 = sum2 / n2;
+
+        // Sample variance: Var = (sum_sq - n*mean^2) / (n - 1)
+        let var1 = (sum_sq1 - n1 * mean1 * mean1) / (n1 - 1.0);
+        let var2 = (sum_sq2 - n2 * mean2 * mean2) / (n2 - 1.0);
+
+        if var1 <= 0.0 && var2 <= 0.0 {
+            return None;
+        }
+
+        let se = (var1 / n1 + var2 / n2).sqrt();
+        if se < 1e-15 {
+            return None;
+        }
+
+        // Positive t means first half had higher loss (= loss is decreasing)
+        Some((mean1 - mean2) / se)
     }
 
+    pub fn is_plateau(&self) -> bool {
+        match self.welch_t_statistic() {
+            Some(t) => t < self.t_threshold,
+            None => false,
+        }
+    }
+
+    /// Returns the Welch t-statistic if the window is full.
+    pub fn t_statistic(&self) -> Option<f64> {
+        self.welch_t_statistic()
+    }
+
+    /// Returns the relative improvement (fraction) between first and second half means.
+    /// Kept for display/logging purposes.
     pub fn relative_improvement(&self) -> Option<f64> {
         if self.window.len() < 4 {
             return None;
         }
-        let n = self.window.len() as f64;
-        let mut sum_x = 0.0;
-        let mut sum_y = 0.0;
-        let mut sum_xy = 0.0;
-        let mut sum_xx = 0.0;
-        for (i, &y) in self.window.iter().enumerate() {
-            let x = i as f64;
-            sum_x += x;
-            sum_y += y;
-            sum_xy += x * y;
-            sum_xx += x * x;
-        }
-        let mean_y = sum_y / n;
-        if mean_y <= 0.0 {
+        let mid = self.window.len() / 2;
+        let first_half_mean: f64 =
+            self.window.iter().take(mid).sum::<f64>() / mid as f64;
+        let second_half_mean: f64 =
+            self.window.iter().skip(mid).sum::<f64>() / (self.window.len() - mid) as f64;
+
+        if first_half_mean <= 0.0 {
             return None;
         }
-        let denom = sum_xx - sum_x * sum_x / n;
-        if denom.abs() < 1e-12 {
-            return None;
-        }
-        let slope = (sum_xy - sum_x * sum_y / n) / denom;
-        Some(-slope * n / mean_y)
+        Some((first_half_mean - second_half_mean) / first_half_mean)
     }
 
     pub fn oldest_loss(&self) -> Option<f64> {
@@ -134,8 +125,8 @@ impl PlateauDetector {
         self.window.len()
     }
 
-    pub fn improvement_threshold(&self) -> f64 {
-        self.improvement_threshold
+    pub fn t_threshold(&self) -> f64 {
+        self.t_threshold
     }
 
     pub fn reset(&mut self) {
@@ -165,7 +156,7 @@ impl ReduceOnPlateauScheduler {
         min_lr: f64,
         reduction_factor: f64,
         window_size: usize,
-        improvement_threshold: f64,
+        t_threshold: f64,
         warmup_iterations: usize,
     ) -> Self {
         Self {
@@ -173,7 +164,7 @@ impl ReduceOnPlateauScheduler {
             current_lr: initial_lr,
             min_lr,
             reduction_factor,
-            detector: PlateauDetector::new(window_size, improvement_threshold),
+            detector: PlateauDetector::new(window_size, t_threshold),
             iteration: 0,
             num_reductions: 0,
             warmup_iterations,
@@ -202,19 +193,21 @@ impl ReduceOnPlateauScheduler {
                 let window_values = self.detector.window_values();
                 let old_loss = self.detector.oldest_loss().unwrap_or(f64::NAN);
                 let new_loss = self.detector.newest_loss().unwrap_or(f64::NAN);
+                let t_stat = self.detector.t_statistic().unwrap_or(f64::NAN);
                 let rel_improvement = self.detector.relative_improvement().unwrap_or(f64::NAN);
-                let threshold = self.detector.improvement_threshold();
+                let threshold = self.detector.t_threshold();
 
                 tracing::warn!(
                     target: "plateau_detection",
-                    "PLATEAU DETECTED at iteration {}: LR {} -> {} | loss: {:.6} -> {:.6} | improvement: {:.4}% < threshold: {:.4}% | window_size: {} | reduction #{}",
+                    "PLATEAU DETECTED at iteration {}: LR {} -> {} | loss: {:.6} -> {:.6} | t-stat: {:.3} < threshold: {:.3} | rel_improvement: {:.4}% | window_size: {} | reduction #{}",
                     self.iteration,
                     self.current_lr,
                     new_lr,
                     old_loss,
                     new_loss,
+                    t_stat,
+                    threshold,
                     rel_improvement * 100.0,
-                    threshold * 100.0,
                     window_values.len(),
                     self.num_reductions + 1
                 );
@@ -233,15 +226,19 @@ impl ReduceOnPlateauScheduler {
                     let _ = writeln!(file, "Loss: {:.6} -> {:.6}", old_loss, new_loss);
                     let _ = writeln!(
                         file,
-                        "Relative improvement: {:.4}% (threshold: {:.4}%)",
-                        rel_improvement * 100.0,
-                        threshold * 100.0
+                        "Welch t-stat: {:.3} (threshold: {:.3})",
+                        t_stat, threshold
+                    );
+                    let _ = writeln!(
+                        file,
+                        "Relative improvement: {:.4}%",
+                        rel_improvement * 100.0
                     );
                     let _ = writeln!(file, "Window values ({}):", window_values.len());
                     for (i, v) in window_values.iter().enumerate() {
                         let _ = writeln!(file, "  [{:4}] {:.6}", i, v);
                     }
-                    let _ = writeln!(file, "");
+                    let _ = writeln!(file);
                 }
 
                 self.current_lr = new_lr;
@@ -282,6 +279,10 @@ impl ReduceOnPlateauScheduler {
         self.detector.relative_improvement()
     }
 
+    pub fn t_statistic(&self) -> Option<f64> {
+        self.detector.t_statistic()
+    }
+
     pub fn window_fill_ratio(&self) -> f64 {
         self.detector.fill_ratio()
     }
@@ -290,8 +291,8 @@ impl ReduceOnPlateauScheduler {
         self.num_reductions
     }
 
-    pub fn improvement_threshold(&self) -> f64 {
-        self.detector.improvement_threshold()
+    pub fn t_threshold(&self) -> f64 {
+        self.detector.t_threshold()
     }
 
     pub fn should_stop(&self) -> bool {
@@ -322,7 +323,7 @@ impl LrScheduler for ReduceOnPlateauScheduler {
         f64,      // min_lr
         f64,      // reduction_factor
         usize,    // window_size
-        f64,      // improvement_threshold
+        f64,      // t_threshold
         usize,    // iteration
         usize,    // num_reductions
         usize,    // warmup_iterations
@@ -340,7 +341,7 @@ impl LrScheduler for ReduceOnPlateauScheduler {
             self.min_lr,
             self.reduction_factor,
             self.detector.window_size,
-            self.detector.improvement_threshold,
+            self.detector.t_threshold,
             self.iteration,
             self.num_reductions,
             self.warmup_iterations,
