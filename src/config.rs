@@ -1,6 +1,6 @@
 use clap::Args;
 use once_cell::sync::Lazy;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
