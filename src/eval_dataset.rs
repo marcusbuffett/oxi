@@ -591,7 +591,7 @@ pub fn sample_positions_from_pgn(
 ) -> Result<Vec<SampledPosition>> {
     use pgn_reader::{BufferedReader, RawHeader, SanPlus, Skip, Visitor};
     use rand::seq::SliceRandom;
-    use rand::Rng;
+    use rand::RngCore;
     use shakmaty::{Chess, Color, EnPassantMode, Position};
 
     let per_bucket = num_positions / elo_buckets.len();
@@ -703,7 +703,7 @@ pub fn sample_positions_from_pgn(
             // Skip very early moves (opening book territory)
             if self.ply >= 10 {
                 // Randomly sample this position
-                if self.rng.random::<f64>() < self.keep_prob {
+                if (self.rng.next_u64() as f64 / u64::MAX as f64) < self.keep_prob {
                     let is_white = self.position.turn() == Color::White;
                     let (player_elo, opponent_elo) = if is_white {
                         (
