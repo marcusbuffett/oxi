@@ -1,12 +1,11 @@
 use clap::Args;
 use once_cell::sync::Lazy;
 use rand::Rng;
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
 
-pub const NUM_GLOBALS: usize = 10;
+pub const NUM_GLOBALS: usize = 11;
 pub const LEGAL_MOVES: usize = 64 * 76;
 // Per-square features (current position only):
 // - 12 piece one-hots (white/black 6 each)

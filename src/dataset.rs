@@ -241,6 +241,7 @@ impl OXIDataset {
             increment: example.original_time_control.1,
             move_count: example.move_count,
             elo_self: example.elo_self,
+            elo_oppo: example.elo_oppo,
             is_puzzle: example.is_puzzle,
             is_in_check: pos.is_check(),
             total_pieces: pos.board().occupied().count() as u32,

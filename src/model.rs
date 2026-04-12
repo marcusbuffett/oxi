@@ -474,13 +474,18 @@ impl<B: Backend> OXIModel<B> {
             + win_norm.clone() * (win_norm.clone().add_scalar(1e-8).log()))
         .neg();
         let entropy_bonus = (binary_entropy * decisive_mass).sum_dim(1);
+        let value_weights = batch.value_weights.clone().reshape([batch_size, 1]);
+        let value_weight_sum = value_weights.clone().sum().clamp_min(1e-8);
 
         // Helper for creating zero tensors
         let zero_like = || Tensor::zeros([1], &policy_logits_flat_original.device());
 
         // Only compute value loss if weight is non-zero
         let (base_value_loss, value_term) = if config.value_loss_weight > 0.0 {
-            let value_loss = (ce_per_sample - entropy_bonus * config.value_entropy_weight).mean();
+            let value_loss_per_sample =
+                ce_per_sample - entropy_bonus * config.value_entropy_weight;
+            let value_loss =
+                (value_loss_per_sample * value_weights.clone()).sum() / value_weight_sum.clone();
             let weighted = value_loss.clone() * config.value_loss_weight;
             (value_loss, weighted)
         } else {

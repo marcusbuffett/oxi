@@ -164,6 +164,8 @@ pub struct GlobalFeatures {
     pub move_count: usize,
     /// Self Elo rating
     pub elo_self: i32,
+    /// Opponent Elo rating
+    pub elo_oppo: i32,
     /// Whether this is a puzzle position
     pub is_puzzle: bool,
     /// Whether the side to move is in check
@@ -195,6 +197,8 @@ pub struct GlobalFeaturesInternal {
     pub move_count: usize,
     /// Self Elo rating
     pub elo_self: i32,
+    /// Opponent Elo rating
+    pub elo_oppo: i32,
     /// Material imbalance history for momentum calculation
     pub material_imbalance_history: Vec<i32>,
     /// Whether this is a puzzle position
@@ -214,7 +218,8 @@ pub struct GlobalFeaturesNormalized {
     pub time_oppo_ratio: f32,
     pub increment_ratio: f32,
     pub move_count_normalized: f32,
-    pub elo_normalized: f32,
+    pub elo_self_normalized: f32,
+    pub elo_oppo_normalized: f32,
     pub material_imbalance_normalized: f32,
     pub momentum: f32,
     pub volatility: f32,
@@ -238,6 +243,7 @@ impl GlobalFeatures {
             pawn_imbalance: 0,
             move_count: self.move_count,
             elo_self: self.elo_self,
+            elo_oppo: self.elo_oppo,
             material_imbalance_history,
             is_puzzle: self.is_puzzle,
             is_in_check: self.is_in_check,
@@ -253,6 +259,11 @@ impl GlobalFeaturesInternal {
         // Normalize Elo to [0, 1] range (similar to dataset processing)
         let elo_self_normalized = if self.elo_self >= 800 && self.elo_self <= 2800 {
             (self.elo_self - 800) as f32 / (2800 - 800) as f32
+        } else {
+            0.5 // Default for out of range
+        };
+        let elo_oppo_normalized = if self.elo_oppo >= 800 && self.elo_oppo <= 2800 {
+            (self.elo_oppo - 800) as f32 / (2800 - 800) as f32
         } else {
             0.5 // Default for out of range
         };
@@ -273,7 +284,8 @@ impl GlobalFeaturesInternal {
             time_oppo_ratio: (self.time_remaining_oppo as f32 / base_time as f32).clamp(0.0, 1.0),
             increment_ratio: (self.increment as f32 / base_time as f32).clamp(0.0, 1.0),
             move_count_normalized: (self.move_count as f32 / 300.0).clamp(0.0, 1.0),
-            elo_normalized: elo_self_normalized,
+            elo_self_normalized,
+            elo_oppo_normalized,
             material_imbalance_normalized: material_imbalance_norm,
             momentum,
             volatility,
@@ -290,7 +302,8 @@ impl GlobalFeaturesInternal {
             normalized.time_oppo_ratio,
             normalized.increment_ratio,
             normalized.move_count_normalized,
-            normalized.elo_normalized,
+            normalized.elo_self_normalized,
+            normalized.elo_oppo_normalized,
             if self.is_puzzle { 1.0 } else { 0.0 },
             normalized.material_imbalance_normalized,
             (self.total_pieces as f32 / 32.0).clamp(0.0, 1.0),
@@ -309,6 +322,7 @@ impl Default for GlobalFeatures {
             increment: 0,
             move_count: 20,
             elo_self: 1500,
+            elo_oppo: 1500,
             is_puzzle: false,
             is_in_check: false,
             total_pieces: 32,
