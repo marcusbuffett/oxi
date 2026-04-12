@@ -1298,7 +1298,7 @@ fn write_scoresheet(
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
+    let warmup_iterations = (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
 
     let initial_adamw_lr =
         config.adamw_base_lr * adamw_dim_scale * batch_scale * config.lr_multiplier;
@@ -1308,7 +1308,7 @@ fn write_scoresheet(
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
+    let warmup_iterations = (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
 
     let train_size_display = if train_size == usize::MAX {
         "streaming".to_string()
@@ -1813,7 +1813,7 @@ where
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
+    let warmup_iterations = (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
     println!(
         "Effective batch size: {}, d_ref: {}, d: {}, adamw_dim_scale: {:.4}, muon_dim_scale: {:.4}",
         effective_batch_size,

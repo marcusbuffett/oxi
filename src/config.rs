@@ -1148,7 +1148,7 @@ impl Default for Config {
             gradnorm_aux_priority: 1.5,
             gradnorm_probe_size: 256,
             lr_min: 0.000001,
-            lr_window_size: 1000,
+            lr_window_size: 200,
             lr_plateau_t_threshold: 0.6,
             lr_reduction_factor: 0.7,
             lr_multiplier: 1.5,
