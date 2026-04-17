@@ -48,12 +48,16 @@ impl PlateauDetector {
             return None;
         }
 
-        let (sum1, sum_sq1) = self.window.iter().take(mid).fold((0.0, 0.0), |(s, sq), &v| {
-            (s + v, sq + v * v)
-        });
-        let (sum2, sum_sq2) = self.window.iter().skip(mid).fold((0.0, 0.0), |(s, sq), &v| {
-            (s + v, sq + v * v)
-        });
+        let (sum1, sum_sq1) = self
+            .window
+            .iter()
+            .take(mid)
+            .fold((0.0, 0.0), |(s, sq), &v| (s + v, sq + v * v));
+        let (sum2, sum_sq2) = self
+            .window
+            .iter()
+            .skip(mid)
+            .fold((0.0, 0.0), |(s, sq), &v| (s + v, sq + v * v));
 
         let mean1 = sum1 / n1;
         let mean2 = sum2 / n2;
@@ -94,8 +98,7 @@ impl PlateauDetector {
             return None;
         }
         let mid = self.window.len() / 2;
-        let first_half_mean: f64 =
-            self.window.iter().take(mid).sum::<f64>() / mid as f64;
+        let first_half_mean: f64 = self.window.iter().take(mid).sum::<f64>() / mid as f64;
         let second_half_mean: f64 =
             self.window.iter().skip(mid).sum::<f64>() / (self.window.len() - mid) as f64;
 

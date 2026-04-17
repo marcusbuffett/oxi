@@ -1,0 +1,3 @@
+[env]
+LIBTORCH = "/opt/homebrew/opt/pytorch"
+DYLD_LIBRARY_PATH = "/opt/homebrew/opt/pytorch/lib"

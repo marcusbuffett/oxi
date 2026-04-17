@@ -88,12 +88,7 @@ impl Metric for LrPlateauMetric {
 
         let formatted = format!(
             "LR: {}{} | {} (thresh: {:.2}) | fill: {:.0}% | reductions: {}",
-            lr_display,
-            warmup_display,
-            t_display,
-            self.t_threshold,
-            fill_pct,
-            self.num_reductions
+            lr_display, warmup_display, t_display, self.t_threshold, fill_pct, self.num_reductions
         );
 
         SerializedEntry::new(formatted.clone(), formatted)

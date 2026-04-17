@@ -45,3 +45,21 @@
 | 16 | Fix embedding optimizer misconfig from rename | 1.128454 (top1=0.4472, wdl=0.6915, aux=0.5059, cal=0.5858) | -0.0459 (top1=-0.0402, wdl=+0.0331, aux=-0.0374, cal=-0.0372) | ❌ |
 | 17 | Grouped Query Attention with 2 KV heads | 0.537733 (top1=0.2238, wdl=0.5061, aux=0.1455, cal=0.0796) | -0.6367 (top1=-0.2636, wdl=-0.1523, aux=-0.3978, cal=-0.5433) | ❌ |
 | 18 | Squeeze-and-Excitation channel gating in MLP blocks | 0.907889 (top1=0.3518, wdl=0.5997, aux=0.4435, cal=0.4189) | -0.2665 (top1=-0.1356, wdl=-0.0587, aux=-0.0997, cal=-0.2040) | ❌ |
+| 0 | Baseline (no changes) | 1.145448 (top1=0.4735, wdl=0.6870, aux=0.5189, cal=0.5617) | — | baseline |
+| 3 | PaLM-style parallel attention+MLP transformer blocks | 1.143450 (top1=0.4737, wdl=0.6785, aux=0.5147, cal=0.5688) | -0.0020 (top1=+0.0003, wdl=-0.0085, aux=-0.0042, cal=+0.0071) | ❌ |
+| 4 | Fix LR schedule: sqrt warmup + enable plateau detection | 1.167086 (top1=0.4661, wdl=0.6812, aux=0.5302, cal=0.6359) | +0.0216 (top1=-0.0074, wdl=-0.0058, aux=+0.0113, cal=+0.0742) | ✅ |
+| 5 | Fewer larger attention heads (6→4, head_dim 32→48) | 1.160671 (top1=0.4922, wdl=0.6145, aux=0.5424, cal=0.6318) | -0.0064 (top1=+0.0261, wdl=-0.0667, aux=+0.0122, cal=-0.0041) | ❌ |
+| 6 | Context-adaptive policy temperature from globals | 1.159387 (top1=0.4901, wdl=0.6136, aux=0.5435, cal=0.6345) | -0.0077 (top1=+0.0240, wdl=-0.0676, aux=+0.0133, cal=-0.0014) | ❌ |
+| 7 | Attention dropout 0.1 for multi-task regularization | 1.148549 (top1=0.4823, wdl=0.6110, aux=0.5383, cal=0.6327) | -0.0185 (top1=+0.0162, wdl=-0.0702, aux=+0.0082, cal=-0.0033) | ❌ |
+| 8 | Dual-pooling value head via concatenation | 1.168549 (top1=0.4888, wdl=0.6250, aux=0.5452, cal=0.6455) | +0.0015 (top1=+0.0227, wdl=-0.0562, aux=+0.0150, cal=+0.0096) | ❌ |
+| 9 | Widen SwiGLU MLP from 2.5× to 3.0× expansion | 1.150343 (top1=0.4859, wdl=0.6066, aux=0.5423, cal=0.6318) | -0.0167 (top1=+0.0198, wdl=-0.0746, aux=+0.0121, cal=-0.0041) | ❌ |
+| 10 | Composite-loss plateau detection with smaller window | 1.129118 (top1=0.4640, wdl=0.6044, aux=0.5293, cal=0.6427) | -0.0380 (top1=-0.0021, wdl=-0.0769, aux=-0.0008, cal=+0.0068) | ❌ |
+| 11 | Post-sub-layer RMSNorm for residual stream stability | 1.134572 (top1=0.4692, wdl=0.6028, aux=0.5223, cal=0.6487) | -0.0325 (top1=+0.0031, wdl=-0.0784, aux=-0.0079, cal=+0.0128) | ❌ |
+| 12 | Zero-init residual projections for curriculum training | 1.160016 (top1=0.4951, wdl=0.6163, aux=0.5421, cal=0.6208) | -0.0071 (top1=+0.0291, wdl=-0.0649, aux=+0.0119, cal=-0.0151) | ❌ |
+| 13 | More aggressive LR plateau schedule for smoother decay | 1.174950 (top1=0.4987, wdl=0.6166, aux=0.5552, cal=0.6424) | +0.0079 (top1=+0.0326, wdl=-0.0646, aux=+0.0250, cal=+0.0065) | ❌ |
+| 14 | Global board context embedding for tokens | 1.154495 (top1=0.4875, wdl=0.6195, aux=0.5435, cal=0.6214) | -0.0126 (top1=+0.0214, wdl=-0.0617, aux=+0.0133, cal=-0.0146) | ❌ |
+| 15 | Gated embedding skip connection to head blocks | 1.163299 (top1=0.4888, wdl=0.6220, aux=0.5482, cal=0.6347) | -0.0038 (top1=+0.0227, wdl=-0.0592, aux=+0.0180, cal=-0.0013) | ❌ |
+| 16 | Widen embedding hidden dim 256→512 for richer features | 1.158397 (top1=0.4864, wdl=0.6117, aux=0.5447, cal=0.6429) | -0.0087 (top1=+0.0204, wdl=-0.0695, aux=+0.0145, cal=+0.0070) | ❌ |
+| 17 | Horizontal board mirroring data augmentation | 1.152251 (top1=0.4882, wdl=0.6252, aux=0.5186, cal=0.6194) | -0.0148 (top1=+0.0221, wdl=-0.0560, aux=-0.0116, cal=-0.0165) | ❌ |
+| 18 | Elo-aware Smolgen attention biases via globals injection | 1.163749 (top1=0.4931, wdl=0.6161, aux=0.5417, cal=0.6356) | -0.0033 (top1=+0.0270, wdl=-0.0651, aux=+0.0115, cal=-0.0003) | ❌ |
+| 19 | Policy-only calibration loss removes head_ce gradient conflict | 1.169537 (top1=0.4919, wdl=0.6161, aux=0.5409, cal=0.6536) | +0.0025 (top1=+0.0258, wdl=-0.0651, aux=+0.0108, cal=+0.0177) | ❌ |

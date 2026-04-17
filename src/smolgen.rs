@@ -381,6 +381,129 @@ impl<B: Backend> SmolgenAttention<B> {
 
         output
     }
+
+    /// Inference-only forward pass that also returns post-softmax attention weights.
+    ///
+    /// This is a parallel path to `forward` used exclusively for introspection /
+    /// visualization. It duplicates the logic of `forward` verbatim and adds a single
+    /// `attn_weights.clone()` capture before the V-matmul. The training path (`forward`)
+    /// is left untouched so that training has zero attention-capture overhead.
+    ///
+    /// Returns `(output, attn_weights)` where `attn_weights` has shape
+    /// `[batch, num_heads, 64, 64]`.
+    pub fn forward_with_attn(
+        &self,
+        x: Tensor<B, 3>,
+        shared_weight_gen: &SmolgenWeightGen<B>,
+    ) -> (Tensor<B, 3>, Tensor<B, 4>) {
+        let config = get_global_config();
+        let device = x.device();
+        let [batch_size, seq_len, embed_dim] = x.dims();
+
+        debug_assert_eq!(
+            seq_len, 64,
+            "SmolgenAttention expects seq_len=64 (8x8 board)"
+        );
+        debug_assert_eq!(embed_dim, config.embed_dim());
+
+        let num_heads = config.num_heads();
+        let head_dim = config.head_dim();
+
+        log_tensor_stats("smolgen_attn.input", &x);
+
+        let qkv = {
+            let _t = TimingScope::new_with_sync::<B>("smolgen_attn_qkv", &device);
+            self.qkv_proj.forward(x.clone())
+        };
+
+        let (q, k, v) = {
+            let _t = TimingScope::new_with_sync::<B>("smolgen_attn_reshape", &device);
+            let q = qkv
+                .clone()
+                .narrow(2, 0, embed_dim)
+                .reshape([batch_size, seq_len, num_heads, head_dim])
+                .permute([0, 2, 1, 3]);
+            let k = qkv
+                .clone()
+                .narrow(2, embed_dim, embed_dim)
+                .reshape([batch_size, seq_len, num_heads, head_dim])
+                .permute([0, 2, 1, 3]);
+            let v = qkv
+                .narrow(2, 2 * embed_dim, embed_dim)
+                .reshape([batch_size, seq_len, num_heads, head_dim])
+                .permute([0, 2, 1, 3]);
+            (q, k, v)
+        };
+
+        // QK-Norm: normalize Q and K per-head before computing attention scores
+        // Reshape to [batch*heads*seq, head_dim] for RmsNorm, then reshape back
+        let q = {
+            let q_flat = q.reshape([batch_size * num_heads * seq_len, head_dim]);
+            let q_normed = self.q_norm.forward(q_flat);
+            q_normed.reshape([batch_size, num_heads, seq_len, head_dim])
+        };
+        let k = {
+            let k_flat = k.reshape([batch_size * num_heads * seq_len, head_dim]);
+            let k_normed = self.k_norm.forward(k_flat);
+            k_normed.reshape([batch_size, num_heads, seq_len, head_dim])
+        };
+
+        // Learnable per-head temperature: scale Q by exp(log_temperature) per head
+        // Shape: [num_heads] -> [1, num_heads, 1, 1] for broadcasting
+        let temperature = self
+            .log_temperature
+            .val()
+            .exp()
+            .reshape([1, num_heads, 1, 1]);
+        let q_scaled = q * temperature;
+
+        let attn_scores = {
+            let _t = TimingScope::new_with_sync::<B>("smolgen_attn_qk_matmul", &device);
+            q_scaled.matmul(k.clone().swap_dims(2, 3))
+        };
+        log_tensor_stats("smolgen_attn.base_scores", &attn_scores);
+
+        let per_head = {
+            let _t = TimingScope::new_with_sync::<B>("smolgen_forward", &device);
+            self.smolgen.forward(x)
+        };
+        let smolgen_bias = shared_weight_gen.forward(per_head);
+        log_tensor_stats("smolgen_attn.smolgen_bias", &smolgen_bias);
+
+        let attn_scores = attn_scores + smolgen_bias;
+        log_tensor_stats("smolgen_attn.combined_scores", &attn_scores);
+
+        let attn_weights = {
+            let _t = TimingScope::new_with_sync::<B>("smolgen_attn_softmax", &device);
+            softmax(attn_scores, 3)
+        };
+        log_tensor_stats("smolgen_attn.attn_weights", &attn_weights);
+
+        // Capture post-softmax attention weights for return. The clone here is the
+        // ONLY computational difference vs. the training `forward` path.
+        let captured_attn = attn_weights.clone();
+
+        let context = {
+            let _t = TimingScope::new_with_sync::<B>("smolgen_attn_v_matmul", &device);
+            attn_weights.matmul(v)
+        };
+        log_tensor_stats("smolgen_attn.context", &context);
+
+        let context_merged = {
+            let _t = TimingScope::new_with_sync::<B>("smolgen_attn_merge", &device);
+            context
+                .permute([0, 2, 1, 3])
+                .reshape([batch_size, seq_len, embed_dim])
+        };
+
+        let output = {
+            let _t = TimingScope::new_with_sync::<B>("smolgen_attn_o_proj", &device);
+            self.o_proj.forward(context_merged)
+        };
+        log_tensor_stats("smolgen_attn.output", &output);
+
+        (output, captured_attn)
+    }
 }
 
 #[cfg(test)]

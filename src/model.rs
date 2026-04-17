@@ -1,8 +1,6 @@
 use crate::calibration::calibration_skill_band_label;
 use crate::calibration::RegretBin;
-use crate::config::{
-    ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS,
-};
+use crate::config::{ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
 use crate::distribution_utils::beta_log_pdf;
 use crate::factorized_policy::FactorizedPolicyHead;
 use crate::relative_position_transformer::TransformerBlock;
@@ -252,6 +250,167 @@ impl<B: Backend> OXIModel<B> {
         (policy, value, side_info, time_usage)
     }
 
+    /// Inference-only forward pass that returns the same four outputs as `forward`
+    /// AND a per-layer vector of post-softmax attention weights for the main
+    /// encoder blocks.
+    ///
+    /// The returned `Vec<Tensor<B, 4>>` has length equal to `self.blocks.len()`
+    /// (num_layers), ordered from layer 0 to layer N-1. Each tensor has shape
+    /// `[batch, num_heads, 64, 64]`.
+    ///
+    /// This duplicates `forward_with_trunk`'s path (minus the returned trunk /
+    /// policy_tokens) and substitutes `TransformerBlock::forward_with_attn` for
+    /// `forward_with_film` in the encoder loop. The training path
+    /// (`forward`/`forward_with_trunk`) is untouched.
+    pub fn forward_with_attention(
+        &self,
+        board: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> (
+        Tensor<B, 3>,
+        Tensor<B, 2>,
+        Tensor<B, 2>,
+        Tensor<B, 2>,
+        Vec<Tensor<B, 4>>,
+    ) {
+        start_forward_pass();
+        let device = board.device();
+        let total_timing = TimingScope::new_with_sync::<B>("forward_total", &device);
+        let _norm_scope = NormDebugScope::start("OXIModel::forward_with_attention");
+        let _root_stream = StreamScope::enter("root");
+
+        log_tensor_stats("input.board_raw", &board);
+        log_tensor_stats("input.globals_raw", &globals);
+
+        let board_features = board.clone();
+        log_tensor_stats("input.board_features", &board_features);
+
+        // Two-layer nonlinear embedding: all 65 features → SiLU → embed_dim
+        let token_embeds = {
+            let _t = TimingScope::new_with_sync::<B>("token_embed", &device);
+            let hidden = silu(self.embed_proj1.forward(board_features));
+            let embeds = self.embed_proj2.forward(hidden);
+            // Add learnable per-square positional embeddings
+            embeds + self.square_embed.val().unsqueeze_dim::<3>(0)
+        };
+        log_tensor_stats("embed.token_embeds", &token_embeds);
+        debug_assert_eq!(
+            token_embeds.dims()[1],
+            64,
+            "Sequence length must be 64 for 8x8 board"
+        );
+
+        let mut x = self.token_norm.forward(token_embeds);
+        log_tensor_stats("encoder.input_tokens", &x);
+
+        // Multi-scale trunk: average outputs from the last half of layers
+        let num_layers = self.blocks.len();
+        let avg_start = num_layers / 2;
+        let mut layer_sum: Option<Tensor<B, 3>> = None;
+        let mut avg_count = 0;
+
+        // Collect per-layer attention weights in order.
+        let mut attention_maps: Vec<Tensor<B, 4>> = Vec::with_capacity(num_layers);
+
+        {
+            let _encoder_stream = StreamScope::enter("encoder");
+            let _encoder_timing = TimingScope::new_with_sync::<B>("encoder_blocks", &device);
+            for (layer_idx, block) in self.blocks.iter().enumerate() {
+                let _layer_scope = LayerScope::enter(layer_idx);
+                let _block_timing = TimingScope::new_with_sync::<B>("encoder_block", &device);
+                log_tensor_stats("encoder.pre_block", &x);
+
+                let (new_x, attn) =
+                    block.forward_with_attn(x, &self.smolgen_weight_gen, globals.clone());
+                x = new_x;
+                attention_maps.push(attn);
+                log_tensor_stats("encoder.post_block", &x);
+
+                if layer_idx >= avg_start {
+                    layer_sum = Some(match layer_sum {
+                        Some(sum) => sum + x.clone(),
+                        None => x.clone(),
+                    });
+                    avg_count += 1;
+                }
+            }
+        }
+
+        if let Some(sum) = layer_sum {
+            x = sum / (avg_count as f32);
+        }
+
+        x = self.norm.forward(x);
+        log_tensor_stats("encoder.post_norm", &x);
+
+        let policy_logits = {
+            let _stream = StreamScope::enter("policy");
+            let _timing = TimingScope::new_with_sync::<B>("policy_head", &device);
+            let tokens = {
+                let _t = TimingScope::new_with_sync::<B>("policy_block", &device);
+                self.policy_block.forward_with_film(
+                    x.clone(),
+                    &self.smolgen_weight_gen,
+                    globals.clone(),
+                )
+            };
+            log_tensor_stats("policy.tokens", &tokens);
+            let logits = {
+                let _t = TimingScope::new_with_sync::<B>("factorized_policy", &device);
+                self.policy_head.forward(tokens.clone(), globals.clone())
+            };
+            log_tensor_stats("policy.logits", &logits);
+            logits
+        };
+
+        let aux_batch_size = board.dims()[0];
+        let embed_dim = x.dims()[2];
+
+        // Value head: value_block → attention pooling → hidden → WDL logits
+        let value_logits = {
+            let _stream = StreamScope::enter("value");
+            let _timing = TimingScope::new_with_sync::<B>("value_head", &device);
+            let value_tokens = self.value_block.forward_with_film(
+                x.clone(),
+                &self.smolgen_weight_gen,
+                globals.clone(),
+            );
+            log_tensor_stats("value.tokens", &value_tokens);
+
+            let pool_hidden = silu(self.value_pool_fc1.forward(value_tokens.clone()));
+            let pool_logits = self
+                .value_pool_fc2
+                .forward(pool_hidden)
+                .reshape([aux_batch_size, 64]);
+            let scale = (embed_dim as f64).sqrt();
+            let pool_logits = pool_logits / scale;
+            let pool_weights = softmax(pool_logits, 1).reshape([aux_batch_size, 64, 1]);
+            let pooled = (value_tokens * pool_weights)
+                .sum_dim(1)
+                .reshape([aux_batch_size, embed_dim]);
+            log_tensor_stats("value.pooled", &pooled);
+
+            let with_globals = Tensor::cat(vec![pooled, globals.clone()], 1);
+            let hidden = silu(self.value_head_hidden.forward(with_globals));
+            self.value_head.forward(hidden)
+        };
+        log_tensor_stats("value.logits", &value_logits);
+
+        let trunk_pooled = x.clone().mean_dim(1).reshape([aux_batch_size, embed_dim]);
+        let side_info_logits = self.side_info_head.forward(trunk_pooled);
+        let time_usage_logits = Tensor::zeros([aux_batch_size, 2], &device);
+
+        drop(total_timing);
+        finish_and_log_forward_pass();
+        (
+            policy_logits,
+            value_logits,
+            side_info_logits,
+            time_usage_logits,
+            attention_maps,
+        )
+    }
+
     fn forward_with_trunk(
         &self,
         board: Tensor<B, 3>,
@@ -294,6 +453,13 @@ impl<B: Backend> OXIModel<B> {
         let mut x = self.token_norm.forward(token_embeds);
         log_tensor_stats("encoder.input_tokens", &x);
 
+        // Multi-scale trunk: average outputs from the last half of layers
+        // to provide richer multi-level features and gradient shortcuts.
+        let num_layers = self.blocks.len();
+        let avg_start = num_layers / 2; // Average the second half of layers
+        let mut layer_sum: Option<Tensor<B, 3>> = None;
+        let mut avg_count = 0;
+
         {
             let _encoder_stream = StreamScope::enter("encoder");
             let _encoder_timing = TimingScope::new_with_sync::<B>("encoder_blocks", &device);
@@ -304,7 +470,21 @@ impl<B: Backend> OXIModel<B> {
 
                 x = block.forward_with_film(x, &self.smolgen_weight_gen, globals.clone());
                 log_tensor_stats("encoder.post_block", &x);
+
+                // Accumulate outputs from the second half of layers
+                if layer_idx >= avg_start {
+                    layer_sum = Some(match layer_sum {
+                        Some(sum) => sum + x.clone(),
+                        None => x.clone(),
+                    });
+                    avg_count += 1;
+                }
             }
+        }
+
+        // Use averaged multi-scale representation instead of just final layer
+        if let Some(sum) = layer_sum {
+            x = sum / (avg_count as f32);
         }
 
         x = self.norm.forward(x);
@@ -482,8 +662,7 @@ impl<B: Backend> OXIModel<B> {
 
         // Only compute value loss if weight is non-zero
         let (base_value_loss, value_term) = if config.value_loss_weight > 0.0 {
-            let value_loss_per_sample =
-                ce_per_sample - entropy_bonus * config.value_entropy_weight;
+            let value_loss_per_sample = ce_per_sample - entropy_bonus * config.value_entropy_weight;
             let value_loss =
                 (value_loss_per_sample * value_weights.clone()).sum() / value_weight_sum.clone();
             let weighted = value_loss.clone() * config.value_loss_weight;
@@ -815,8 +994,12 @@ impl<B: Backend> OXIModel<B> {
                 // This prevents the model from wasting gradient budget on irredeemable miscalibrations
                 // and focuses optimization where the metric is most sensitive.
                 let policy_cp_error = (policy_expected_cp.clone() - target_cp.clone()).abs();
-                let policy_cal_metric = (policy_cp_error.neg().div_scalar(15.0f32)
-                    .exp().neg().add_scalar(1.0f32)
+                let policy_cal_metric = (policy_cp_error
+                    .neg()
+                    .div_scalar(15.0f32)
+                    .exp()
+                    .neg()
+                    .add_scalar(1.0f32)
                     * calibration_mask.clone())
                 .sum()
                     / mask_sum.clone();

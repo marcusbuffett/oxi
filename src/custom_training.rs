@@ -15,8 +15,8 @@ use burn::train::metric::LossMetric;
 use burn_train::metric::IterationSpeedMetric;
 use burn_train::metric::{Adaptor, Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 use burn_train::Interrupter;
-use rand::seq::{IteratorRandom, SliceRandom};
 use rand::rng;
+use rand::seq::{IteratorRandom, SliceRandom};
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -1298,7 +1298,8 @@ fn write_scoresheet(
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
+    let warmup_iterations =
+        (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
 
     let initial_adamw_lr =
         config.adamw_base_lr * adamw_dim_scale * batch_scale * config.lr_multiplier;
@@ -1308,7 +1309,8 @@ fn write_scoresheet(
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
+    let warmup_iterations =
+        (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
 
     let train_size_display = if train_size == usize::MAX {
         "streaming".to_string()
@@ -1813,7 +1815,8 @@ where
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
+    let warmup_iterations =
+        (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
     println!(
         "Effective batch size: {}, d_ref: {}, d: {}, adamw_dim_scale: {:.4}, muon_dim_scale: {:.4}",
         effective_batch_size,
@@ -2040,9 +2043,7 @@ where
     );
     println!(
         "LR window: {}, LR plateau t-threshold: {:.2}, LR reduction factor: {}",
-        config.lr_window_size,
-        config.lr_plateau_t_threshold,
-        config.lr_reduction_factor
+        config.lr_window_size, config.lr_plateau_t_threshold, config.lr_reduction_factor
     );
 
     // ==================== LR RANGE FINDER MODE ====================

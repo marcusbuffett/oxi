@@ -1292,7 +1292,9 @@ fn metric_display_priority(base_name: &str, split: &MetricSplit) -> u32 {
         160
     } else if name_lower.contains("aux") && name_lower.contains("mae") {
         170
-    } else if name_lower.contains("cp loss calibration by elo") || name_lower.contains("centipawn") && name_lower.contains("by elo") {
+    } else if name_lower.contains("cp loss calibration by elo")
+        || name_lower.contains("centipawn") && name_lower.contains("by elo")
+    {
         210
     } else if name_lower.contains("centipawn") || name_lower.contains("calibration") {
         200

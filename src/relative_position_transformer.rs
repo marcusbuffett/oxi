@@ -188,6 +188,59 @@ impl<B: Backend> TransformerBlock<B> {
 
         output
     }
+
+    /// Inference-only FiLM-conditioned forward pass that also returns this block's
+    /// post-softmax attention weights.
+    ///
+    /// Mirrors `forward_with_film` but routes through `SmolgenAttention::forward_with_attn`
+    /// to capture the attention map. The training paths (`forward`, `forward_with_film`)
+    /// are untouched.
+    ///
+    /// Returns `(block_output, attn_weights)` where `attn_weights` has shape
+    /// `[batch, num_heads, 64, 64]`.
+    pub fn forward_with_attn(
+        &self,
+        x: Tensor<B, 3>,
+        shared_weight_gen: &SmolgenWeightGen<B>,
+        globals: Tensor<B, 2>,
+    ) -> (Tensor<B, 3>, Tensor<B, 4>) {
+        let device = x.device();
+        log_tensor_stats("block.input", &x);
+
+        // Pre-norm: norm before attention, then residual add
+        let normed1 = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_attn", &device);
+            self.norm1.forward(x.clone(), globals.clone())
+        };
+        log_tensor_stats("block.norm1", &normed1);
+
+        let (attn_out, attn_weights) = {
+            let _t = TimingScope::new_with_sync::<B>("block_attention", &device);
+            self.attention.forward_with_attn(normed1, shared_weight_gen)
+        };
+        log_tensor_stats("block.attn_out", &attn_out);
+
+        let x = x + attn_out;
+        log_tensor_stats("block.post_attn_residual", &x);
+
+        // Pre-norm: norm before MLP, then residual add
+        let normed2 = {
+            let _t = TimingScope::new_with_sync::<B>("block_norm_mlp", &device);
+            self.norm2.forward(x.clone(), globals)
+        };
+        log_tensor_stats("block.norm2", &normed2);
+
+        let mlp_out = {
+            let _t = TimingScope::new_with_sync::<B>("block_mlp", &device);
+            self.mlp.forward(normed2)
+        };
+        log_tensor_stats("block.mlp_out", &mlp_out);
+
+        let output = x + mlp_out;
+        log_tensor_stats("block.output", &output);
+
+        (output, attn_weights)
+    }
 }
 
 /// SwiGLU MLP with fused gate+up projection for memory efficiency.

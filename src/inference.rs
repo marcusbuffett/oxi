@@ -142,11 +142,52 @@ pub struct OxiPrediction {
     pub time_usage: TimeUsagePrediction,
 }
 
+/// Per-layer post-softmax attention weights pulled to CPU.
+///
+/// Captured from one of the main encoder `TransformerBlock`s via the
+/// `forward_with_attention` inference path. This is exclusively used for
+/// introspection/visualization; the training forward path never produces one.
+///
+/// `data` is row-major with shape `[num_heads, 64, 64]`, flat-indexed as
+/// `head * 64 * 64 + query_sq * 64 + key_sq`. Square indices follow the
+/// model's internal (possibly mirrored-for-black) encoding used during the
+/// forward pass.
+///
+/// The batched `predict_with_attention_batch` path produces one
+/// `AttentionLayer` per input item by slicing each layer's
+/// `[N, num_heads, 64, 64]` output row-by-row on CPU.
+#[derive(Debug, Clone)]
+pub struct AttentionLayer {
+    pub num_heads: usize,
+    /// Row-major `[num_heads, 64, 64]`. Index: `head * 64 * 64 + query_sq * 64 + key_sq`.
+    pub data: Vec<f32>,
+}
+
 /// Reconstructed move and position history from SAN moves
 #[derive(Debug, Clone)]
 pub struct PositionHistory {
     pub positions: Vec<Chess>,
     pub uci_moves: Vec<String>,
+}
+
+/// A single item inside a batched prediction call
+/// (`predict_with_attention_batch` or `predict_batch`).
+///
+/// `positions` has the current position first, then previous positions (for
+/// temporal context). At minimum one element (the current position).
+/// `previous_moves` are the UCI moves leading to the current position
+/// (ordered most-recent first). `globals`, `temperature`, `top_k` are all
+/// per-item — the batched calls honor each item's own values.
+///
+/// Note: the batched prediction paths deliberately do NOT enforce a
+/// max batch size. Callers should chunk based on available GPU memory.
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    pub positions: Vec<Chess>,
+    pub previous_moves: Vec<String>,
+    pub globals: GlobalFeatures,
+    pub temperature: f32,
+    pub top_k: usize,
 }
 
 /// Global features for chess inference (public API)
@@ -520,141 +561,309 @@ where
         ))
     }
 
-    /// Predict best moves from positions in descending chronological order (most recent first)
-    /// Takes up to PREVIOUS_POSITIONS + 1 positions for encoding with history
-    /// Automatically handles board flipping for Black's perspective
-    pub fn predict(
-        &self,
-        positions: &[Chess],
-        global_features: &GlobalFeatures,
-        temperature: f32,
-        top_k: usize,
-    ) -> anyhow::Result<OxiPrediction>
+    /// Batched prediction that does NOT capture attention weights.
+    ///
+    /// Stacks the per-item `[1, 64, F]` board tensors along the batch axis into
+    /// a single `[N, 64, F]` tensor (and likewise for globals), runs ONE
+    /// forward pass with `forward`, then splits the `[N, ...]` outputs back
+    /// per item. Result ordering matches `items` order.
+    ///
+    /// This avoids materializing the per-layer attention tensors, so it is
+    /// strictly cheaper than `predict_with_attention_batch` when you don't
+    /// need saliency.
+    pub fn predict_batch(&self, items: &[BatchItem]) -> anyhow::Result<Vec<OxiPrediction>>
     where
         B::FloatElem: From<f32>,
     {
-        self.predict_with_history(positions, &[], global_features, temperature, top_k)
-    }
-
-    pub fn predict_with_history(
-        &self,
-        positions: &[Chess],
-        previous_moves: &[String],
-        global_features: &GlobalFeatures,
-        temperature: f32,
-        top_k: usize,
-    ) -> anyhow::Result<OxiPrediction>
-    where
-        B::FloatElem: From<f32>,
-    {
-        let (board_tensor, global_features_tensor, flipped_current, _material_imbalance_history) =
-            self.create_input_tensors(positions, previous_moves, global_features)?;
-
-        let current_position = &positions[0];
-        let is_black_to_move = current_position.turn() == Color::Black;
-
-        let (policy_logits, value_logits, _side_info_logits, time_usage_logits) =
-            self.model.forward(board_tensor, global_features_tensor);
-
-        // Get legal moves mask
-        let mut legal_moves_mask = vec![0.0f32; LEGAL_MOVES];
-        for legal_move in flipped_current.legal_moves() {
-            if let Some((from_idx, promo_idx)) =
-                encode_move(&legal_move.to_uci(shakmaty::CastlingMode::Standard))
-            {
-                let move_idx = from_idx as usize * 76 + promo_idx as usize;
-                legal_moves_mask[move_idx] = 1.0;
-            }
+        if items.is_empty() {
+            return Ok(Vec::new());
         }
 
+        let (batched_board, batched_globals, flipped_currents, is_black_to_move_flags, n) =
+            self.build_batched_inputs(items)?;
+
+        let (policy_logits, value_logits, _side_info_logits, time_usage_logits) =
+            self.model.forward(batched_board, batched_globals);
+
+        self.finalize_batched_predictions(
+            items,
+            n,
+            &flipped_currents,
+            &is_black_to_move_flags,
+            policy_logits,
+            value_logits,
+            time_usage_logits,
+        )
+    }
+
+    /// Batched prediction that also captures per-layer post-softmax attention
+    /// weights from the main encoder `TransformerBlock`s.
+    ///
+    /// Stacks the per-item `[1, 64, F]` board tensors along the batch axis into
+    /// a single `[N, 64, F]` tensor (and likewise for globals), runs ONE forward
+    /// pass with `forward_with_attention`, then splits the `[N, ...]` outputs
+    /// back per item. Result ordering matches `items` order.
+    ///
+    /// Each item's inputs go through the same per-item preprocessing:
+    /// `create_input_tensors` (which handles the black-to-move mirror so each
+    /// stacked row is in model-frame for its own side) and its own
+    /// `temperature`/`top_k` are applied in the post-processing per row. The
+    /// caller is responsible for un-flipping the attention saliency back to
+    /// absolute board coordinates when the corresponding item was black-to-move
+    /// (the returned attention tensors are in model frame).
+    ///
+    /// NOTE: No max batch size is enforced here. The caller should chunk
+    /// according to available GPU memory.
+    pub fn predict_with_attention_batch(
+        &self,
+        items: &[BatchItem],
+    ) -> anyhow::Result<Vec<(OxiPrediction, Vec<AttentionLayer>)>>
+    where
+        B::FloatElem: From<f32>,
+    {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (batched_board, batched_globals, flipped_currents, is_black_to_move_flags, n) =
+            self.build_batched_inputs(items)?;
+
+        let (policy_logits, value_logits, _side_info_logits, time_usage_logits, attn_maps) = self
+            .model
+            .forward_with_attention(batched_board, batched_globals);
+
+        // Pre-split attention tensors to CPU. Each attn layer is [N, num_heads, 64, 64];
+        // flatten to a single Vec<f32> of length N * num_heads * 64 * 64 so we can
+        // slice per-item without re-entering the backend.
+        let num_layers = attn_maps.len();
+        let mut attn_layer_buffers: Vec<(usize, Vec<f32>)> = Vec::with_capacity(num_layers);
+        for attn in attn_maps.into_iter() {
+            let dims = attn.dims();
+            debug_assert_eq!(dims[0], n, "attention batch dim must equal N");
+            debug_assert_eq!(dims[2], 64);
+            debug_assert_eq!(dims[3], 64);
+            let num_heads = dims[1];
+            let data = attn.to_data().to_vec::<f32>().map_err(|e| {
+                anyhow::anyhow!("Failed to convert attention tensor to f32: {:?}", e)
+            })?;
+            debug_assert_eq!(data.len(), n * num_heads * 64 * 64);
+            attn_layer_buffers.push((num_heads, data));
+        }
+
+        let predictions = self.finalize_batched_predictions(
+            items,
+            n,
+            &flipped_currents,
+            &is_black_to_move_flags,
+            policy_logits,
+            value_logits,
+            time_usage_logits,
+        )?;
+
+        // Combine predictions with per-item attention slices.
+        let mut out: Vec<(OxiPrediction, Vec<AttentionLayer>)> = Vec::with_capacity(n);
+        for (i, prediction) in predictions.into_iter().enumerate() {
+            // Attention: slice row i out of each layer's flat buffer. Each row
+            // is num_heads * 64 * 64 floats.
+            let mut attention_layers: Vec<AttentionLayer> = Vec::with_capacity(num_layers);
+            for (num_heads, buf) in attn_layer_buffers.iter() {
+                let row_len = num_heads * 64 * 64;
+                let start = i * row_len;
+                let end = start + row_len;
+                let data = buf[start..end].to_vec();
+                attention_layers.push(AttentionLayer {
+                    num_heads: *num_heads,
+                    data,
+                });
+            }
+            out.push((prediction, attention_layers));
+        }
+
+        Ok(out)
+    }
+
+    /// Shared batched-input construction for `predict_batch` and
+    /// `predict_with_attention_batch`. Each per-item board/globals tensor is
+    /// built via the same `create_input_tensors` used historically, then
+    /// concatenated along the batch axis.
+    fn build_batched_inputs(
+        &self,
+        items: &[BatchItem],
+    ) -> anyhow::Result<(Tensor<B, 3>, Tensor<B, 2>, Vec<Chess>, Vec<bool>, usize)>
+    where
+        B::FloatElem: From<f32>,
+    {
+        let n = items.len();
+        let mut board_tensors: Vec<Tensor<B, 3>> = Vec::with_capacity(n);
+        let mut global_tensors: Vec<Tensor<B, 2>> = Vec::with_capacity(n);
+        let mut flipped_currents: Vec<Chess> = Vec::with_capacity(n);
+        let mut is_black_to_move_flags: Vec<bool> = Vec::with_capacity(n);
+
+        for item in items.iter() {
+            if item.positions.is_empty() {
+                return Err(anyhow::anyhow!("BatchItem has an empty positions vec"));
+            }
+            let (board_tensor, global_tensor, flipped_current, _imbalance_history) =
+                self.create_input_tensors(&item.positions, &item.previous_moves, &item.globals)?;
+
+            let is_black_to_move = item.positions[0].turn() == Color::Black;
+
+            board_tensors.push(board_tensor);
+            global_tensors.push(global_tensor);
+            flipped_currents.push(flipped_current);
+            is_black_to_move_flags.push(is_black_to_move);
+        }
+
+        // Stack along batch axis. Each tensor is already [1, 64, F] / [1, G],
+        // so `cat(..., 0)` produces [N, 64, F] / [N, G] without needing an
+        // extra unsqueeze.
+        let batched_board = Tensor::cat(board_tensors, 0);
+        let batched_globals = Tensor::cat(global_tensors, 0);
+
+        Ok((
+            batched_board,
+            batched_globals,
+            flipped_currents,
+            is_black_to_move_flags,
+            n,
+        ))
+    }
+
+    /// Shared per-row post-processing for both batched paths. Converts model
+    /// outputs (policy / value / time-usage logits) into per-item
+    /// `OxiPrediction`s, applying legal-move masking, per-row temperature, and
+    /// un-mirroring the output moves when the row's item was black-to-move.
+    fn finalize_batched_predictions(
+        &self,
+        items: &[BatchItem],
+        n: usize,
+        flipped_currents: &[Chess],
+        is_black_to_move_flags: &[bool],
+        policy_logits: Tensor<B, 3>,
+        value_logits: Tensor<B, 2>,
+        time_usage_logits: Tensor<B, 2>,
+    ) -> anyhow::Result<Vec<OxiPrediction>>
+    where
+        B::FloatElem: From<f32>,
+    {
+        // Reshape policy logits to [N, LEGAL_MOVES].
+        let policy_logits_flat = policy_logits.reshape([n, LEGAL_MOVES]);
+
+        // Build the per-row legal-moves mask as a single [N, LEGAL_MOVES] tensor.
+        let mut legal_mask_flat: Vec<f32> = vec![0.0f32; n * LEGAL_MOVES];
+        for (i, flipped_current) in flipped_currents.iter().enumerate() {
+            let row_off = i * LEGAL_MOVES;
+            for legal_move in flipped_current.legal_moves() {
+                if let Some((from_idx, promo_idx)) =
+                    encode_move(&legal_move.to_uci(shakmaty::CastlingMode::Standard))
+                {
+                    let move_idx = from_idx as usize * 76 + promo_idx as usize;
+                    legal_mask_flat[row_off + move_idx] = 1.0;
+                }
+            }
+        }
         let legal_moves_tensor =
-            Tensor::<B, 1>::from_floats(legal_moves_mask.as_slice(), &self.device)
-                .reshape([1, LEGAL_MOVES]);
+            Tensor::<B, 1>::from_floats(legal_mask_flat.as_slice(), &self.device)
+                .reshape([n, LEGAL_MOVES]);
 
-        // Reshape policy logits to [batch, LEGAL_MOVES]
-        let policy_logits_flat = policy_logits.reshape([1, LEGAL_MOVES]);
-
-        // Apply legal move masking
-        let mask = legal_moves_tensor.clone().equal_elem(0.0);
+        let mask = legal_moves_tensor.equal_elem(0.0);
         let masked_logits = policy_logits_flat.mask_fill(mask, f32::NEG_INFINITY);
 
-        // Apply temperature and log_softmax (consistent with training)
-        let log_probs = if temperature != 1.0 {
-            log_softmax(masked_logits.div_scalar(temperature), 1)
+        // Apply per-row temperature by dividing each row by its own temperature
+        // via a [N, 1] tensor. If all temperatures are 1.0 we skip the div.
+        let all_temps_one = items.iter().all(|it| it.temperature == 1.0);
+        let temped_logits = if all_temps_one {
+            masked_logits
         } else {
-            log_softmax(masked_logits, 1)
+            let temp_vec: Vec<f32> = items.iter().map(|it| it.temperature).collect();
+            let temp_tensor =
+                Tensor::<B, 1>::from_floats(temp_vec.as_slice(), &self.device).reshape([n, 1]);
+            masked_logits.div(temp_tensor)
         };
 
-        // Convert to probabilities for move selection
+        let log_probs = log_softmax(temped_logits, 1);
         let probs = log_probs.exp();
 
-        // Extract top k moves
+        // Pull everything to CPU as flat f32 for slicing. Each tensor is
+        // [N, D] row-major.
         let probs_data = probs.to_data();
         let probs_slice = probs_data.as_slice::<f32>().unwrap();
-        let mut move_probs: Vec<(usize, f32)> = probs_slice[0..LEGAL_MOVES]
-            .iter()
-            .enumerate()
-            .filter(|(_, &prob)| prob > 0.0 && !prob.is_infinite())
-            .map(|(i, &p)| (i, p))
-            .collect();
 
-        move_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        let move_predictions: Vec<MovePrediction> = move_probs
-            .into_iter()
-            .take(top_k)
-            .filter_map(|(move_idx, prob)| {
-                let from_idx = (move_idx / 76) as u8;
-                let to_idx = (move_idx % 76) as u8;
-                decode_move(from_idx, to_idx).map(|uci_move| {
-                    let final_uci = if is_black_to_move {
-                        // Flip the move back to original coordinates
-                        mirror_move(&uci_move.to_string())
-                    } else {
-                        uci_move.to_string()
-                    };
-                    MovePrediction {
-                        uci_move: final_uci,
-                        probability: prob,
-                    }
-                })
-            })
-            .collect();
-
-        // Get WDL predictions (consistent with training using log_softmax)
         let value_log_probs = log_softmax(value_logits.clone(), 1);
         let value_probs = value_log_probs.exp();
         let value_data = value_probs.to_data();
         let value_slice = value_data.as_slice::<f32>().unwrap();
-        let wdl = WdlPrediction {
-            loss_prob: value_slice[0], // Index 0 = loss
-            draw_prob: value_slice[1], // Index 1 = draw
-            win_prob: value_slice[2],  // Index 2 = win
-        };
 
-        // Get time usage predictions
-        // NOTE: The model already maps raw logits into [min,max] via a sigmoid in model.rs, so outputs are parameters.
-        // Do NOT re-apply activations here; just read alpha/beta directly.
-        let params_data = time_usage_logits.to_data();
-        let params_slice = params_data.as_slice::<f32>().unwrap();
-        let alpha = params_slice[0];
-        let beta = params_slice[1];
-        let denom = alpha + beta;
-        let expected_fraction = if denom > 0.0 { alpha / denom } else { 0.0 };
-        let expected_seconds = expected_fraction * global_features.time_remaining_self as f32;
+        let time_params_data = time_usage_logits.to_data();
+        let time_params_slice = time_params_data.as_slice::<f32>().unwrap();
 
-        let time_usage = TimeUsagePrediction {
-            alpha,
-            beta,
-            expected_fraction,
-            expected_seconds,
-        };
+        let mut out: Vec<OxiPrediction> = Vec::with_capacity(n);
+        for i in 0..n {
+            let item = &items[i];
+            let is_black_to_move = is_black_to_move_flags[i];
 
-        Ok(OxiPrediction {
-            moves: move_predictions,
-            wdl,
-            time_usage,
-        })
+            // Top-k moves for row i.
+            let row_off = i * LEGAL_MOVES;
+            let mut move_probs: Vec<(usize, f32)> = probs_slice[row_off..row_off + LEGAL_MOVES]
+                .iter()
+                .enumerate()
+                .filter(|(_, &prob)| prob > 0.0 && !prob.is_infinite())
+                .map(|(j, &p)| (j, p))
+                .collect();
+
+            move_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+            let move_predictions: Vec<MovePrediction> = move_probs
+                .into_iter()
+                .take(item.top_k)
+                .filter_map(|(move_idx, prob)| {
+                    let from_idx = (move_idx / 76) as u8;
+                    let to_idx = (move_idx % 76) as u8;
+                    decode_move(from_idx, to_idx).map(|uci_move| {
+                        let final_uci = if is_black_to_move {
+                            mirror_move(&uci_move.to_string())
+                        } else {
+                            uci_move.to_string()
+                        };
+                        MovePrediction {
+                            uci_move: final_uci,
+                            probability: prob,
+                        }
+                    })
+                })
+                .collect();
+
+            // WDL for row i. Ordering: [loss, draw, win].
+            let v_off = i * 3;
+            let wdl = WdlPrediction {
+                loss_prob: value_slice[v_off],
+                draw_prob: value_slice[v_off + 1],
+                win_prob: value_slice[v_off + 2],
+            };
+
+            // Time usage params for row i (alpha, beta).
+            let t_off = i * 2;
+            let alpha = time_params_slice[t_off];
+            let beta = time_params_slice[t_off + 1];
+            let denom = alpha + beta;
+            let expected_fraction = if denom > 0.0 { alpha / denom } else { 0.0 };
+            let expected_seconds = expected_fraction * item.globals.time_remaining_self as f32;
+
+            let time_usage = TimeUsagePrediction {
+                alpha,
+                beta,
+                expected_fraction,
+                expected_seconds,
+            };
+
+            out.push(OxiPrediction {
+                moves: move_predictions,
+                wdl,
+                time_usage,
+            });
+        }
+
+        Ok(out)
     }
 
     /// Predict the full policy distribution over ALL legal moves.
@@ -745,257 +954,6 @@ where
         Ok(flipped_position)
     }
 
-    // Predict best move for a position (legacy method, kept for compatibility)
-    // pub fn predict(
-    //     &self,
-    //     fen: &str,
-    //     elo_self: i32,
-    //     elo_oppo: i32,
-    //     temperature: f32,
-    //     top_k: usize,
-    // ) -> anyhow::Result<Vec<MovePrediction>> {
-    //     let parsed_fen: Fen = fen.parse()?;
-    //     let pos: Chess = parsed_fen.into_position(shakmaty::CastlingMode::Standard)?;
-    //
-    //     // Encode position (no previous moves available in inference)
-    //     let board_encoded = encode_position_with_previous_moves(&pos, &[]);
-    //     // Convert to tensor
-    //     let data = TensorData::from(board_encoded.as_slice());
-    //     let tensor: Tensor<B, 1> = Tensor::from_data(data.convert::<B::FloatElem>(), &self.device);
-    //     let board_encoded = tensor.reshape([20, 8, 8]).unsqueeze();
-    //
-    //     // Get Elo bins
-    //     let elo_self_idx = get_elo_bin(elo_self, &self.config.elo_bins());
-    //     let elo_oppo_idx = get_elo_bin(elo_oppo, &self.config.elo_bins());
-    //
-    //     // Create tensors
-    //     let elo_self_data = TensorData::from([(elo_self_idx as i64).elem::<B::IntElem>()]);
-    //     let elo_self_tensor_1d: Tensor<B, 1, Int> = Tensor::from_data(elo_self_data, &self.device);
-    //     let elo_self_tensor = elo_self_tensor_1d.reshape([1, 1]);
-    //     let elo_oppo_data = TensorData::from([(elo_oppo_idx as i64).elem::<B::IntElem>()]);
-    //     let elo_oppo_tensor_1d: Tensor<B, 1, Int> = Tensor::from_data(elo_oppo_data, &self.device);
-    //     let elo_oppo_tensor = elo_oppo_tensor_1d.reshape([1, 1]);
-    //
-    //     // Forward pass
-    //     let (policy_logits, value_logits, _side_info) =
-    //         self.model
-    //             .forward(board_encoded, elo_self_tensor, elo_oppo_tensor);
-    //
-    //     // Get legal moves mask for 64x64 representation
-    //     let mut legal_moves_mask = vec![0f32; 4096;
-    //     for legal_move in pos.legal_moves() {
-    //         let uci = legal_move
-    //             .to_uci(shakmaty::CastlingMode::Standard)
-    //             .to_string();
-    //         if let Some((from_idx, to_idx)) = encode_move_az(&uci) {
-    //             let flat_idx = from_idx * 73 + to_idx;
-    //             legal_moves_mask[flat_idx] = 1.0;
-    //         }
-    //     }
-    //
-    //     let legal_moves_data = TensorData::from(legal_moves_mask.as_slice());
-    //     let legal_moves_tensor_1d: Tensor<B, 1> =
-    //         Tensor::from_data(legal_moves_data.convert::<B::FloatElem>(), &self.device);
-    //     let legal_moves_tensor = legal_moves_tensor_1d.reshape([1, 4096]);
-    //
-    //     // Apply legal move masking
-    //     let masked_logits = policy_logits + (legal_moves_tensor - 1.0) * 1e9;
-    //
-    //     // Apply temperature and softmax
-    //     let probs = if temperature != 1.0 {
-    //         activation::softmax(masked_logits / temperature, 1)
-    //     } else {
-    //         activation::softmax(masked_logits, 1)
-    //     };
-    //
-    //     // Get value predictions (win/draw/loss probabilities)
-    //     let value_probs = activation::softmax(value_logits, 1);
-    //     let value_data = value_probs.squeeze::<1>(0).into_data();
-    //     let value_slice = value_data.as_slice::<f32>().unwrap();
-    //     let win_prob = value_slice[0];
-    //     let draw_prob = value_slice[1];
-    //     let loss_prob = value_slice[2];
-    //
-    //     // Extract probabilities and get top k
-    //     let probs_tensor_data = probs.squeeze::<1>(0).into_data();
-    //     let probs_data = probs_tensor_data.as_slice::<f32>().unwrap().to_vec();
-    //     let mut move_probs: Vec<(usize, f32)> = probs_data
-    //         .into_iter()
-    //         .enumerate()
-    //         .filter(|(idx, prob)| *prob > 0.0)
-    //         .collect();
-    //
-    //     // Sort by probability
-    //     move_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    //
-    //     // Take top k
-    //     let predictions: Vec<MovePrediction> = move_probs
-    //         .into_iter()
-    //         .take(top_k)
-    //         .map(|(idx, prob)| {
-    //             // Convert flat index back to from-to indices
-    //             let from_idx = idx / 64;
-    //             let to_idx = idx % 64;
-    //             let uci_move = decode_move_spatial(from_idx, to_idx);
-    //             MovePrediction {
-    //                 uci_move,
-    //                 probability: prob,
-    //                 win_prob,
-    //                 draw_prob,
-    //                 loss_prob,
-    //             }
-    //         })
-    //         .collect();
-    //
-    //     Ok(predictions)
-    // }
-
-    // Batch prediction for multiple positions
-    // pub fn predict_batch(
-    //     &self,
-    //     positions: &[(String, i32, i32)], // (fen, elo_self, elo_oppo)
-    //     temperature: f32,
-    //     top_k: usize,
-    // ) -> anyhow::Result<Vec<Vec<MovePrediction>>> {
-    //     let mut all_boards = Vec::new();
-    //     let mut all_elo_self = Vec::new();
-    //     let mut all_elo_oppo = Vec::new();
-    //     let mut all_legal_masks = Vec::new();
-    //
-    //     // Process all positions
-    //     for (fen, elo_self, elo_oppo) in positions {
-    //         let parsed_fen: Fen = fen.parse()?;
-    //         let pos: Chess = parsed_fen.into_position(shakmaty::CastlingMode::Standard)?;
-    //
-    //         // Encode board (no previous moves available in batch inference)
-    //         let board_encoded = encode_position_with_previous_moves(&pos, &[]);
-    //         // Convert to tensor
-    //         let data = TensorData::from(board_encoded.as_slice());
-    //         let tensor: Tensor<B, 1> =
-    //             Tensor::from_data(data.convert::<B::FloatElem>(), &self.device);
-    //         let board = tensor.reshape([20, 8, 8]).unsqueeze();
-    //         all_boards.push(board);
-    //
-    //         // Elo bins
-    //         let elo_self_idx = get_elo_bin(*elo_self, &self.config.elo_bins());
-    //         let elo_oppo_idx = get_elo_bin(*elo_oppo, &self.config.elo_bins());
-    //
-    //         all_elo_self.push(elo_self_idx as i32);
-    //         all_elo_oppo.push(elo_oppo_idx as i32);
-    //
-    //         // Legal moves mask
-    //         let mut legal_mask = vec![0f32; 4096;
-    //         for legal_move in pos.legal_moves() {
-    //             let uci = legal_move
-    //                 .to_uci(shakmaty::CastlingMode::Standard)
-    //                 .to_string();
-    //             if let Some((from_idx, to_idx)) = encode_move_az(&uci) {
-    //                 let flat_idx = from_idx * 73 + to_idx;
-    //                 legal_mask[flat_idx] = 1.0;
-    //             }
-    //         }
-    //         all_legal_masks.push(legal_mask);
-    //     }
-    //
-    //     let batch_size = positions.len();
-    //
-    //     // Stack tensors
-    //     let boards = Tensor::cat(all_boards, 0);
-    //     let elo_self_data: Vec<_> = all_elo_self
-    //         .into_iter()
-    //         .map(|x| (x as i64).elem::<B::IntElem>())
-    //         .collect();
-    //     let elo_oppo_data: Vec<_> = all_elo_oppo
-    //         .into_iter()
-    //         .map(|x| (x as i64).elem::<B::IntElem>())
-    //         .collect();
-    //
-    //     let elo_self_tensor_data = TensorData::from(elo_self_data.as_slice());
-    //     let elo_self_tensor_1d: Tensor<B, 1, Int> =
-    //         Tensor::from_data(elo_self_tensor_data, &self.device);
-    //     let elo_self_tensor = elo_self_tensor_1d.reshape([batch_size, 1]);
-    //     let elo_oppo_tensor_data = TensorData::from(elo_oppo_data.as_slice());
-    //     let elo_oppo_tensor_1d: Tensor<B, 1, Int> =
-    //         Tensor::from_data(elo_oppo_tensor_data, &self.device);
-    //     let elo_oppo_tensor = elo_oppo_tensor_1d.reshape([batch_size, 1]);
-    //
-    //     // Forward pass
-    //     let (policy_logits, value_logits, _) =
-    //         self.model.forward(boards, elo_self_tensor, elo_oppo_tensor);
-    //
-    //     // Process each position's results
-    //     let mut results = Vec::new();
-    //     // Get value predictions for all positions in the batch
-    //     let value_probs = activation::softmax(value_logits, 1);
-    //     let values_data = value_probs.into_data();
-    //     let values_slice = values_data.as_slice::<f32>().unwrap();
-    //
-    //     // Extract win/draw/loss probabilities for each position
-    //     let mut all_value_probs = Vec::new();
-    //     for i in 0..batch_size {
-    //         let start_idx = i * 3;
-    //         all_value_probs.push((
-    //             values_slice[start_idx],     // win
-    //             values_slice[start_idx + 1], // draw
-    //             values_slice[start_idx + 2], // loss
-    //         ));
-    //     }
-    //
-    //     for (i, legal_mask) in all_legal_masks.into_iter().enumerate() {
-    //         // Get this position's logits
-    //         let pos_logits = policy_logits.clone().slice([i..i + 1, 0..4096]);
-    //
-    //         // Apply legal mask
-    //         let mask_data = TensorData::from(legal_mask.as_slice());
-    //         let mask_tensor_1d: Tensor<B, 1> =
-    //             Tensor::from_data(mask_data.convert::<B::FloatElem>(), &self.device);
-    //         let mask_tensor = mask_tensor_1d.reshape([1, 4096]);
-    //
-    //         let masked = pos_logits + (mask_tensor - 1.0) * 1e9;
-    //
-    //         // Apply temperature and softmax
-    //         let probs = if temperature != 1.0 {
-    //             activation::softmax(masked / temperature, 1)
-    //         } else {
-    //             activation::softmax(masked, 1)
-    //         };
-    //
-    //         // Extract top k moves
-    //         let probs_tensor_data = probs.squeeze::<1>(0).into_data();
-    //         let probs_data = probs_tensor_data.as_slice::<f32>().unwrap().to_vec();
-    //         let mut move_probs: Vec<(usize, f32)> = probs_data
-    //             .into_iter()
-    //             .enumerate()
-    //             .filter(|(idx, prob)| *prob > 0.0)
-    //             .collect();
-    //
-    //         move_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    //
-    //         let predictions: Vec<MovePrediction> = move_probs
-    //             .into_iter()
-    //             .take(top_k)
-    //             .map(|(idx, prob)| {
-    //                 // Convert flat index back to from-to indices
-    //                 let from_idx = idx / 64;
-    //                 let to_idx = idx % 64;
-    //                 let uci_move = decode_move_spatial(from_idx, to_idx);
-    //                 let (win_prob, draw_prob, loss_prob) = all_value_probs[i];
-    //                 MovePrediction {
-    //                     uci_move,
-    //                     probability: prob,
-    //                     win_prob,
-    //                     draw_prob,
-    //                     loss_prob,
-    //                 }
-    //             })
-    //             .collect();
-    //
-    //         results.push(predictions);
-    //     }
-    //
-    //     Ok(results)
-    // }
-
     /// Analyze a position from FEN and return detailed information
     pub fn analyze(
         &self,
@@ -1010,36 +968,23 @@ where
         let parsed_fen: Fen = fen.parse()?;
         let pos: Chess = parsed_fen.into_position(shakmaty::CastlingMode::Standard)?;
 
-        let prediction = self.predict(&[pos], global_features, temperature, top_k)?;
+        let item = BatchItem {
+            positions: vec![pos],
+            previous_moves: Vec::new(),
+            globals: global_features.clone(),
+            temperature,
+            top_k,
+        };
+        let mut predictions = self.predict_batch(&[item])?;
+        let prediction = predictions.pop().ok_or_else(|| {
+            anyhow::anyhow!("predict_batch returned no predictions for analyze()")
+        })?;
 
         Ok(PositionAnalysis {
             fen: fen.to_string(),
             prediction,
         })
     }
-
-    // Analyze a position and return detailed information (legacy method)
-    // pub fn analyze_legacy(
-    //     &self,
-    //     fen: &str,
-    //     elo_self: i32,
-    //     elo_oppo: i32,
-    // ) -> anyhow::Result<PositionAnalysis> {
-    //     let parsed_fen: Fen = fen.parse()?;
-    //     let pos: Chess = parsed_fen.into_position(shakmaty::CastlingMode::Standard)?;
-    //
-    //     // Get predictions
-    //     let prediction = self.predict(fen, 1.0, 10)?;
-    //
-    //     // Get side info for top move (implement proper side info extraction later)
-    //     let side_info = vec![0; 13];
-    //
-    //     Ok(PositionAnalysis {
-    //         fen: fen.to_string(),
-    //         prediction,
-    //         side_info,
-    //     })
-    // }
 }
 
 /// Detailed position analysis
@@ -1065,10 +1010,19 @@ mod tests {
         // Test prediction on starting position
         let starting_pos = Chess::default();
         let globals = GlobalFeatures::default();
-        let result = engine.predict(&[starting_pos], &globals, 1.0, 5);
+        let items = vec![BatchItem {
+            positions: vec![starting_pos],
+            previous_moves: Vec::new(),
+            globals,
+            temperature: 1.0,
+            top_k: 5,
+        }];
+        let result = engine.predict_batch(&items);
 
         assert!(result.is_ok());
-        let prediction = result.unwrap();
+        let mut predictions = result.unwrap();
+        assert_eq!(predictions.len(), 1);
+        let prediction = predictions.pop().unwrap();
         assert!(!prediction.moves.is_empty());
         assert!(prediction.moves.len() <= 5);
 
@@ -1105,6 +1059,97 @@ mod tests {
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
         );
         assert!(!analysis.prediction.moves.is_empty());
+    }
+
+    #[test]
+    fn test_predict_with_attention_batch_matches_sequential() {
+        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
+        let config = Config::default();
+        let _ = crate::config::set_global_config(config.clone());
+        let model = OXIModel::<InferenceBackend>::new(&device, &config);
+        let engine = InferenceEngine::new(model, config, device);
+
+        // Three different positions.
+        let p0 = Chess::default();
+        let p1 = san_line_to_positions(&["e4"])
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+        let p2 = san_line_to_positions(&["d4"])
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+
+        let globals = GlobalFeatures::default();
+        let items: Vec<BatchItem> = vec![p0.clone(), p1.clone(), p2.clone()]
+            .into_iter()
+            .map(|p| BatchItem {
+                positions: vec![p],
+                previous_moves: Vec::new(),
+                globals: globals.clone(),
+                temperature: 1.0,
+                top_k: 5,
+            })
+            .collect();
+
+        // Batched attention path: single forward pass with attention, 3 outputs.
+        let batched = engine
+            .predict_with_attention_batch(&items)
+            .expect("batched attention path should succeed");
+        assert_eq!(batched.len(), 3);
+
+        // Batched no-attention path: single forward pass without attention.
+        let sequential: Vec<OxiPrediction> = engine
+            .predict_batch(&items)
+            .expect("batched no-attention path should succeed");
+        assert_eq!(sequential.len(), 3);
+
+        // Compare top move + attention shape on the batched-attention side.
+        for i in 0..3 {
+            let (b_pred, b_attn) = &batched[i];
+            let s_pred = &sequential[i];
+
+            // Top move should be identical across the two batched paths.
+            assert!(!b_pred.moves.is_empty(), "batched[{}] has no moves", i);
+            assert!(!s_pred.moves.is_empty(), "sequential[{}] has no moves", i);
+            assert_eq!(
+                b_pred.moves[0].uci_move, s_pred.moves[0].uci_move,
+                "top move mismatch at position {}",
+                i
+            );
+
+            // Attention layer count and shape sanity.
+            assert_eq!(b_attn.len(), 8, "expected 8 encoder layers");
+            for (layer_idx, bl) in b_attn.iter().enumerate() {
+                assert_eq!(
+                    bl.data.len(),
+                    bl.num_heads * 64 * 64,
+                    "attention buffer size != num_heads*64*64 at position {} layer {}",
+                    i,
+                    layer_idx
+                );
+            }
+
+            // WDL values should match between the two batched paths (same
+            // forward pass at the model level, just with/without attention
+            // capture).
+            for (field, bv, sv) in [
+                ("win", b_pred.wdl.win_prob, s_pred.wdl.win_prob),
+                ("draw", b_pred.wdl.draw_prob, s_pred.wdl.draw_prob),
+                ("loss", b_pred.wdl.loss_prob, s_pred.wdl.loss_prob),
+            ] {
+                assert!(
+                    (bv - sv).abs() < 1e-4,
+                    "wdl.{} mismatch at position {}: batched={}, sequential={}",
+                    field,
+                    i,
+                    bv,
+                    sv,
+                );
+            }
+        }
     }
 
     #[test]
