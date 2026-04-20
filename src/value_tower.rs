@@ -9,7 +9,7 @@ use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 use burn::tensor::activation::{silu, softmax};
 
-use crate::config::{get_global_config, NUM_GLOBALS};
+use crate::config::{Config, NUM_GLOBALS};
 use crate::relative_position_transformer::TransformerBlock;
 use crate::smolgen::SmolgenWeightGen;
 
@@ -40,8 +40,7 @@ pub struct ValueTower<B: Backend> {
 }
 
 impl<B: Backend> ValueTower<B> {
-    pub fn new(device: &Device<B>) -> Self {
-        let config = get_global_config();
+    pub fn new(config: &Config, device: &Device<B>) -> Self {
         let embed_dim = config.embed_dim();
         let num_layers = config.value_tower_layers();
 
@@ -54,11 +53,11 @@ impl<B: Backend> ValueTower<B> {
         // Create transformer blocks for value tower
         let mut blocks = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            blocks.push(TransformerBlock::new(device));
+            blocks.push(TransformerBlock::new(config, device));
         }
 
         // Shared Smolgen weight generator for value tower
-        let smolgen_weight_gen = SmolgenWeightGen::new(device);
+        let smolgen_weight_gen = SmolgenWeightGen::new(config, device);
 
         // Final layer norm
         let norm = RmsNormConfig::new(embed_dim).init(device);
@@ -146,19 +145,13 @@ impl<B: Backend> ValueTower<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{set_global_config, Config};
     use crate::test_backend::{test_device, TestBackend};
-
-    fn ensure_config() {
-        let _ = set_global_config(Config::new(96, 2));
-    }
 
     #[test]
     fn value_tower_smoke_shapes() {
-        ensure_config();
         let device = test_device();
-        let config = get_global_config();
-        let tower = ValueTower::<TestBackend>::new(&device);
+        let config = Config::new(96, 2);
+        let tower = ValueTower::<TestBackend>::new(&config, &device);
 
         let batch_size = 2usize;
         let seq_len = 64usize;

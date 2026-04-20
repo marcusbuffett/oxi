@@ -102,18 +102,18 @@ impl<B: Backend> OXIModel<B> {
             None
         };
 
-        let smolgen_weight_gen = SmolgenWeightGen::new(device);
+        let smolgen_weight_gen = SmolgenWeightGen::new(config, device);
 
         let mut blocks = Vec::new();
         for _ in 0..config.num_layers() {
-            blocks.push(TransformerBlock::new(device));
+            blocks.push(TransformerBlock::new(config, device));
         }
 
         let token_norm = RmsNormConfig::new(embed_dim).init(device);
 
         let norm = RmsNormConfig::new(config.embed_dim()).init(device);
 
-        let policy_head = FactorizedPolicyHead::new(device);
+        let policy_head = FactorizedPolicyHead::new(config, device);
 
         // Value head components - standard initialization
         let value_pool_fc1 = LinearConfig::new(config.embed_dim(), config.embed_dim())
@@ -154,8 +154,8 @@ impl<B: Backend> OXIModel<B> {
         let side_info_uncertainty = Param::from_tensor(Tensor::zeros([1], device));
         let time_usage_uncertainty = Param::from_tensor(Tensor::zeros([1], device));
 
-        let policy_block = TransformerBlock::new_for_head(device);
-        let value_block = TransformerBlock::new_for_head(device);
+        let policy_block = TransformerBlock::new_for_head(config, device);
+        let value_block = TransformerBlock::new_for_head(config, device);
         // Disabled: time_block was unused in forward pass, wastes parameters
         // let time_block = TransformerBlock::new(device);
 
@@ -250,6 +250,38 @@ impl<B: Backend> OXIModel<B> {
         (policy, value, side_info, time_usage)
     }
 
+    /// Inference-only forward pass that returns the same four outputs as `forward`,
+    /// AND a per-layer vector of post-softmax attention weights, AND the post-
+    /// norm trunk tensor (the per-square embeddings fed into the policy/value
+    /// heads). Shape of the trunk is `[batch, 64, embed_dim]`.
+    ///
+    /// Intended for viz/analysis only (e.g. the `attention_viz` example). The
+    /// production bot path continues to use `forward_with_attention`, which is
+    /// untouched.
+    pub fn forward_with_attention_and_trunk(
+        &self,
+        board: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> (
+        Tensor<B, 3>,
+        Tensor<B, 2>,
+        Tensor<B, 2>,
+        Tensor<B, 2>,
+        Vec<Tensor<B, 4>>,
+        Tensor<B, 3>,
+    ) {
+        let (policy, value, side_info, time_usage, attn, trunk) =
+            self.forward_with_attention_inner(board, globals, true);
+        (
+            policy,
+            value,
+            side_info,
+            time_usage,
+            attn,
+            trunk.expect("trunk must be present when capture_trunk=true"),
+        )
+    }
+
     /// Inference-only forward pass that returns the same four outputs as `forward`
     /// AND a per-layer vector of post-softmax attention weights for the main
     /// encoder blocks.
@@ -272,6 +304,24 @@ impl<B: Backend> OXIModel<B> {
         Tensor<B, 2>,
         Tensor<B, 2>,
         Vec<Tensor<B, 4>>,
+    ) {
+        let (policy, value, side_info, time_usage, attn, _trunk) =
+            self.forward_with_attention_inner(board, globals, false);
+        (policy, value, side_info, time_usage, attn)
+    }
+
+    fn forward_with_attention_inner(
+        &self,
+        board: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+        capture_trunk: bool,
+    ) -> (
+        Tensor<B, 3>,
+        Tensor<B, 2>,
+        Tensor<B, 2>,
+        Tensor<B, 2>,
+        Vec<Tensor<B, 4>>,
+        Option<Tensor<B, 3>>,
     ) {
         start_forward_pass();
         let device = board.device();
@@ -400,6 +450,8 @@ impl<B: Backend> OXIModel<B> {
         let side_info_logits = self.side_info_head.forward(trunk_pooled);
         let time_usage_logits = Tensor::zeros([aux_batch_size, 2], &device);
 
+        let trunk_out = if capture_trunk { Some(x.clone()) } else { None };
+
         drop(total_timing);
         finish_and_log_forward_pass();
         (
@@ -408,6 +460,7 @@ impl<B: Backend> OXIModel<B> {
             side_info_logits,
             time_usage_logits,
             attention_maps,
+            trunk_out,
         )
     }
 

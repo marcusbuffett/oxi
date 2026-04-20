@@ -4,7 +4,7 @@ use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::{backend::Backend, Device, Tensor};
 
-use crate::config::get_global_config;
+use crate::config::Config;
 
 #[cfg(feature = "train")]
 use crate::forward_timing::TimingScope;
@@ -30,6 +30,11 @@ pub struct Smolgen<B: Backend> {
     /// Per-head projection: global_dim -> (num_heads * gen_size)
     dense2: Linear<B>,
     ln2: RmsNorm<B>,
+
+    /// Cached architectural params needed during forward (avoids global config lookup).
+    num_heads: usize,
+    smolgen_hidden: usize,
+    gen_size: usize,
 }
 
 /// Shared weight generator across all Smolgen instances in all transformer blocks.
@@ -43,8 +48,7 @@ pub struct SmolgenWeightGen<B: Backend> {
 }
 
 impl<B: Backend> Smolgen<B> {
-    pub fn new(device: &Device<B>) -> Self {
-        let config = get_global_config();
+    pub fn new(config: &Config, device: &Device<B>) -> Self {
         let embed_dim = config.embed_dim();
         let num_heads = config.num_heads();
         let smolgen_hidden = config.smolgen_hidden();
@@ -80,6 +84,9 @@ impl<B: Backend> Smolgen<B> {
             ln1,
             dense2,
             ln2,
+            num_heads,
+            smolgen_hidden,
+            gen_size,
         }
     }
 
@@ -87,12 +94,11 @@ impl<B: Backend> Smolgen<B> {
     /// Input: [batch, 64, embed_dim]
     /// Output: [batch, num_heads, gen_size]
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let config = get_global_config();
         let device = x.device();
         let [batch_size, seq_len, _embed_dim] = x.dims();
-        let num_heads = config.num_heads();
-        let gen_size = config.smolgen_gen_size();
-        let smolgen_hidden = config.smolgen_hidden();
+        let num_heads = self.num_heads;
+        let gen_size = self.gen_size;
+        let smolgen_hidden = self.smolgen_hidden;
 
         debug_assert_eq!(seq_len, 64, "Smolgen expects seq_len=64 (8x8 board)");
 
@@ -125,8 +131,7 @@ impl<B: Backend> Smolgen<B> {
 }
 
 impl<B: Backend> SmolgenWeightGen<B> {
-    pub fn new(device: &Device<B>) -> Self {
-        let config = get_global_config();
+    pub fn new(config: &Config, device: &Device<B>) -> Self {
         let gen_size = config.smolgen_gen_size();
 
         // Tame initialization for smolgen weight generator to keep initial biases small
@@ -174,11 +179,15 @@ pub struct SmolgenAttention<B: Backend> {
     /// With QK-norm, Q and K have fixed norms, removing per-head sharpness freedom.
     /// This parameter restores that freedom. Initialized so exp(log_temp) = 1/sqrt(head_dim).
     log_temperature: Param<Tensor<B, 1>>,
+
+    /// Cached architectural params needed during forward (avoids global config lookup).
+    embed_dim: usize,
+    num_heads: usize,
+    head_dim: usize,
 }
 
 impl<B: Backend> SmolgenAttention<B> {
-    pub fn new(device: &Device<B>) -> Self {
-        let config = get_global_config();
+    pub fn new(config: &Config, device: &Device<B>) -> Self {
         let embed_dim = config.embed_dim();
         let head_dim = config.head_dim();
         let num_heads = config.num_heads();
@@ -203,9 +212,9 @@ impl<B: Backend> SmolgenAttention<B> {
             .with_initializer(residual_init)
             .init(device);
 
-        let smolgen = Smolgen::new(device);
+        let smolgen = Smolgen::new(config, device);
 
-        // QK-Norm: per-head RMSNorm on Q and K for stable attention scores
+        // QK-Norm: per-head RmsNorm on Q and K for stable attention scores
         let q_norm = RmsNormConfig::new(head_dim).init(device);
         let k_norm = RmsNormConfig::new(head_dim).init(device);
 
@@ -222,12 +231,14 @@ impl<B: Backend> SmolgenAttention<B> {
             q_norm,
             k_norm,
             log_temperature,
+            embed_dim,
+            num_heads,
+            head_dim,
         }
     }
 
     /// Create SmolgenAttention for a single-block head with depth=1 residual scaling.
-    pub fn new_for_head(device: &Device<B>) -> Self {
-        let config = get_global_config();
+    pub fn new_for_head(config: &Config, device: &Device<B>) -> Self {
         let embed_dim = config.embed_dim();
         let head_dim = config.head_dim();
         let num_heads = config.num_heads();
@@ -251,7 +262,7 @@ impl<B: Backend> SmolgenAttention<B> {
             .with_initializer(residual_init)
             .init(device);
 
-        let smolgen = Smolgen::new(device);
+        let smolgen = Smolgen::new(config, device);
 
         let q_norm = RmsNormConfig::new(head_dim).init(device);
         let k_norm = RmsNormConfig::new(head_dim).init(device);
@@ -267,6 +278,9 @@ impl<B: Backend> SmolgenAttention<B> {
             q_norm,
             k_norm,
             log_temperature,
+            embed_dim,
+            num_heads,
+            head_dim,
         }
     }
 
@@ -277,7 +291,6 @@ impl<B: Backend> SmolgenAttention<B> {
         x: Tensor<B, 3>,
         shared_weight_gen: &SmolgenWeightGen<B>,
     ) -> Tensor<B, 3> {
-        let config = get_global_config();
         let device = x.device();
         let [batch_size, seq_len, embed_dim] = x.dims();
 
@@ -285,10 +298,10 @@ impl<B: Backend> SmolgenAttention<B> {
             seq_len, 64,
             "SmolgenAttention expects seq_len=64 (8x8 board)"
         );
-        debug_assert_eq!(embed_dim, config.embed_dim());
+        debug_assert_eq!(embed_dim, self.embed_dim);
 
-        let num_heads = config.num_heads();
-        let head_dim = config.head_dim();
+        let num_heads = self.num_heads;
+        let head_dim = self.head_dim;
 
         log_tensor_stats("smolgen_attn.input", &x);
 
@@ -396,7 +409,6 @@ impl<B: Backend> SmolgenAttention<B> {
         x: Tensor<B, 3>,
         shared_weight_gen: &SmolgenWeightGen<B>,
     ) -> (Tensor<B, 3>, Tensor<B, 4>) {
-        let config = get_global_config();
         let device = x.device();
         let [batch_size, seq_len, embed_dim] = x.dims();
 
@@ -404,10 +416,10 @@ impl<B: Backend> SmolgenAttention<B> {
             seq_len, 64,
             "SmolgenAttention expects seq_len=64 (8x8 board)"
         );
-        debug_assert_eq!(embed_dim, config.embed_dim());
+        debug_assert_eq!(embed_dim, self.embed_dim);
 
-        let num_heads = config.num_heads();
-        let head_dim = config.head_dim();
+        let num_heads = self.num_heads;
+        let head_dim = self.head_dim;
 
         log_tensor_stats("smolgen_attn.input", &x);
 
@@ -509,21 +521,16 @@ impl<B: Backend> SmolgenAttention<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{set_global_config, Config};
+    use crate::config::Config;
     use crate::test_backend::{test_device, TestBackend};
-
-    fn ensure_config() {
-        let _ = set_global_config(Config::new(96, 2));
-    }
 
     #[test]
     fn smolgen_shapes() {
-        ensure_config();
         let device = test_device();
 
-        let config = get_global_config();
-        let smolgen = Smolgen::<TestBackend>::new(&device);
-        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&device);
+        let config = Config::new(96, 2);
+        let smolgen = Smolgen::<TestBackend>::new(&config, &device);
+        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&config, &device);
 
         let batch_size = 2usize;
         let x = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
@@ -540,12 +547,11 @@ mod tests {
 
     #[test]
     fn smolgen_attention_shapes() {
-        ensure_config();
         let device = test_device();
 
-        let config = get_global_config();
-        let attention = SmolgenAttention::<TestBackend>::new(&device);
-        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&device);
+        let config = Config::new(96, 2);
+        let attention = SmolgenAttention::<TestBackend>::new(&config, &device);
+        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&config, &device);
 
         let batch_size = 2usize;
         let x = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);

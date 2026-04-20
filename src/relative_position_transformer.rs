@@ -4,7 +4,7 @@ use burn::tensor::activation::silu;
 use burn::tensor::Device;
 use burn::tensor::{backend::Backend, Tensor};
 
-use crate::config::get_global_config;
+use crate::config::Config;
 use crate::smolgen::{SmolgenAttention, SmolgenWeightGen};
 
 #[cfg(feature = "train")]
@@ -69,12 +69,11 @@ pub struct TransformerBlock<B: Backend> {
 }
 
 impl<B: Backend> TransformerBlock<B> {
-    pub fn new(device: &Device<B>) -> Self {
-        let config = get_global_config();
-        let attention = SmolgenAttention::new(device);
+    pub fn new(config: &Config, device: &Device<B>) -> Self {
+        let attention = SmolgenAttention::new(config, device);
         let norm1 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
         let norm2 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
-        let mlp = MLP::new(device);
+        let mlp = MLP::new(config, device);
         Self {
             attention,
             norm1,
@@ -85,12 +84,11 @@ impl<B: Backend> TransformerBlock<B> {
 
     /// Create a TransformerBlock for a single-block head (policy/value).
     /// Uses depth=1 residual scaling instead of depth=num_layers.
-    pub fn new_for_head(device: &Device<B>) -> Self {
-        let config = get_global_config();
-        let attention = SmolgenAttention::new_for_head(device);
+    pub fn new_for_head(config: &Config, device: &Device<B>) -> Self {
+        let attention = SmolgenAttention::new_for_head(config, device);
         let norm1 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
         let norm2 = FiLMRmsNorm::new(device, config.embed_dim(), crate::config::NUM_GLOBALS);
-        let mlp = MLP::new_for_head(device);
+        let mlp = MLP::new_for_head(config, device);
         Self {
             attention,
             norm1,
@@ -256,8 +254,7 @@ pub struct MLP<B: Backend> {
 }
 
 impl<B: Backend> MLP<B> {
-    pub fn new(device: &Device<B>) -> Self {
-        let config = get_global_config();
+    pub fn new(config: &Config, device: &Device<B>) -> Self {
         let hidden_dim = (config.embed_dim() as f32 * 2.5) as usize;
 
         // Standard initialization: Normal(0, 0.02)
@@ -286,8 +283,7 @@ impl<B: Backend> MLP<B> {
         }
     }
 
-    pub fn new_for_head(device: &Device<B>) -> Self {
-        let config = get_global_config();
+    pub fn new_for_head(config: &Config, device: &Device<B>) -> Self {
         let hidden_dim = (config.embed_dim() as f32 * 2.5) as usize;
 
         let std_init = Initializer::Normal {
@@ -340,20 +336,15 @@ impl<B: Backend> MLP<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{set_global_config, Config};
+    use crate::config::Config;
     use crate::test_backend::{test_device, TestBackend};
-
-    fn ensure_config() {
-        let _ = set_global_config(Config::new(96, 2));
-    }
 
     #[test]
     fn transformer_block_smoke_shapes() {
-        ensure_config();
         let device = test_device();
-        let config = get_global_config();
-        let block = TransformerBlock::<TestBackend>::new(&device);
-        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&device);
+        let config = Config::new(96, 2);
+        let block = TransformerBlock::<TestBackend>::new(&config, &device);
+        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&config, &device);
         let batch_size = 2usize;
         let seq_len = 64usize;
         let embed_dim = config.embed_dim();
@@ -365,11 +356,10 @@ mod tests {
     #[test]
     #[should_panic]
     fn transformer_block_panics_on_wrong_seq_len() {
-        ensure_config();
         let device = test_device();
-        let config = get_global_config();
-        let block = TransformerBlock::<TestBackend>::new(&device);
-        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&device);
+        let config = Config::new(96, 2);
+        let block = TransformerBlock::<TestBackend>::new(&config, &device);
+        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&config, &device);
         let batch_size = 1usize;
         let seq_len = 32usize;
         let embed_dim = config.embed_dim();
@@ -380,11 +370,10 @@ mod tests {
     #[test]
     #[ignore]
     fn transformer_block_large_batch_shapes() {
-        ensure_config();
         let device = test_device();
-        let config = get_global_config();
-        let block = TransformerBlock::<TestBackend>::new(&device);
-        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&device);
+        let config = Config::new(96, 2);
+        let block = TransformerBlock::<TestBackend>::new(&config, &device);
+        let weight_gen = SmolgenWeightGen::<TestBackend>::new(&config, &device);
         let batch_size = 1024usize;
         let seq_len = 64usize;
         let embed_dim = config.embed_dim();

@@ -142,6 +142,29 @@ pub struct OxiPrediction {
     pub time_usage: TimeUsagePrediction,
 }
 
+/// Mean-pooled + per-square trunk embeddings, pulled to CPU.
+///
+/// Captured from the encoder trunk (post-final-RmsNorm, pre policy/value heads)
+/// via the `forward_with_attention_and_trunk` inference path. Used by the
+/// `attention_viz` example to compare positions by embedding cosine similarity.
+///
+/// `per_square` is row-major with shape `[64, embed_dim]`, flat-indexed as
+/// `sq * embed_dim + d`. Square indices follow the ABSOLUTE board frame
+/// (a1 = 0 .. h8 = 63). For black-to-move positions the model internally
+/// mirrors the board vertically; the batched inference path un-flips the
+/// per-square embeddings via `model_sq ^ 56` before handing them back so
+/// callers don't need to know about the mirror. `mean_pooled` is invariant
+/// to the mirror (mean over all 64 squares).
+#[derive(Debug, Clone)]
+pub struct EmbeddingOutput {
+    /// Mean-pooled position embedding, shape `[embed_dim]`.
+    pub mean_pooled: Vec<f32>,
+    /// Per-square embeddings in absolute frame, shape `[64, embed_dim]` flattened
+    /// row-major. `per_square[sq * embed_dim + d]`.
+    pub per_square: Vec<f32>,
+    pub embed_dim: usize,
+}
+
 /// Per-layer post-softmax attention weights pulled to CPU.
 ///
 /// Captured from one of the main encoder `TransformerBlock`s via the
@@ -677,6 +700,140 @@ where
                 });
             }
             out.push((prediction, attention_layers));
+        }
+
+        Ok(out)
+    }
+
+    /// Batched prediction that also captures per-layer post-softmax attention
+    /// weights AND the trunk-level per-square embeddings.
+    ///
+    /// Intended for viz/analysis only (e.g. `examples/attention_viz.rs`). The
+    /// production bot path uses `predict_with_attention_batch`, which this
+    /// method does NOT replace — it simply adds the embedding output.
+    ///
+    /// Returns one `(OxiPrediction, Vec<AttentionLayer>, EmbeddingOutput)`
+    /// per input item, matching `items` order. The embedding is returned in
+    /// the ABSOLUTE board frame: for black-to-move items, the per-square
+    /// dimension is un-flipped via `sq ^ 56` so cross-position comparisons
+    /// are frame-consistent. `mean_pooled` is invariant to the mirror so it
+    /// needs no adjustment.
+    pub fn predict_with_attention_and_embedding_batch(
+        &self,
+        items: &[BatchItem],
+    ) -> anyhow::Result<Vec<(OxiPrediction, Vec<AttentionLayer>, EmbeddingOutput)>>
+    where
+        B::FloatElem: From<f32>,
+    {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (batched_board, batched_globals, flipped_currents, is_black_to_move_flags, n) =
+            self.build_batched_inputs(items)?;
+
+        let (
+            policy_logits,
+            value_logits,
+            _side_info_logits,
+            time_usage_logits,
+            attn_maps,
+            trunk,
+        ) = self
+            .model
+            .forward_with_attention_and_trunk(batched_board, batched_globals);
+
+        // Pre-split attention tensors to CPU (mirrors `predict_with_attention_batch`).
+        let num_layers = attn_maps.len();
+        let mut attn_layer_buffers: Vec<(usize, Vec<f32>)> = Vec::with_capacity(num_layers);
+        for attn in attn_maps.into_iter() {
+            let dims = attn.dims();
+            debug_assert_eq!(dims[0], n, "attention batch dim must equal N");
+            debug_assert_eq!(dims[2], 64);
+            debug_assert_eq!(dims[3], 64);
+            let num_heads = dims[1];
+            let data = attn.to_data().to_vec::<f32>().map_err(|e| {
+                anyhow::anyhow!("Failed to convert attention tensor to f32: {:?}", e)
+            })?;
+            debug_assert_eq!(data.len(), n * num_heads * 64 * 64);
+            attn_layer_buffers.push((num_heads, data));
+        }
+
+        // Pull trunk tensor to CPU once. Shape: [N, 64, embed_dim].
+        let trunk_dims = trunk.dims();
+        debug_assert_eq!(trunk_dims[0], n);
+        debug_assert_eq!(trunk_dims[1], 64);
+        let embed_dim = trunk_dims[2];
+        let trunk_flat = trunk
+            .to_data()
+            .to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("Failed to convert trunk tensor to f32: {:?}", e))?;
+        debug_assert_eq!(trunk_flat.len(), n * 64 * embed_dim);
+
+        let predictions = self.finalize_batched_predictions(
+            items,
+            n,
+            &flipped_currents,
+            &is_black_to_move_flags,
+            policy_logits,
+            value_logits,
+            time_usage_logits,
+        )?;
+
+        let mut out: Vec<(OxiPrediction, Vec<AttentionLayer>, EmbeddingOutput)> =
+            Vec::with_capacity(n);
+        for (i, prediction) in predictions.into_iter().enumerate() {
+            // Attention: slice row i out of each layer's flat buffer.
+            let mut attention_layers: Vec<AttentionLayer> = Vec::with_capacity(num_layers);
+            for (num_heads, buf) in attn_layer_buffers.iter() {
+                let row_len = num_heads * 64 * 64;
+                let start = i * row_len;
+                let end = start + row_len;
+                let data = buf[start..end].to_vec();
+                attention_layers.push(AttentionLayer {
+                    num_heads: *num_heads,
+                    data,
+                });
+            }
+
+            // Trunk: slice row i (model frame), un-flip per-square for black-to-move.
+            let row_start = i * 64 * embed_dim;
+            let model_frame = &trunk_flat[row_start..row_start + 64 * embed_dim];
+            let is_black = is_black_to_move_flags[i];
+            let mut per_square = vec![0.0f32; 64 * embed_dim];
+            if is_black {
+                for model_sq in 0..64usize {
+                    let absolute_sq = model_sq ^ 56;
+                    let src = model_sq * embed_dim;
+                    let dst = absolute_sq * embed_dim;
+                    per_square[dst..dst + embed_dim]
+                        .copy_from_slice(&model_frame[src..src + embed_dim]);
+                }
+            } else {
+                per_square.copy_from_slice(model_frame);
+            }
+
+            // Mean-pool across 64 squares (invariant to permutation).
+            let mut mean_pooled = vec![0.0f32; embed_dim];
+            for sq in 0..64usize {
+                let off = sq * embed_dim;
+                for d in 0..embed_dim {
+                    mean_pooled[d] += per_square[off + d];
+                }
+            }
+            for d in 0..embed_dim {
+                mean_pooled[d] /= 64.0;
+            }
+
+            out.push((
+                prediction,
+                attention_layers,
+                EmbeddingOutput {
+                    mean_pooled,
+                    per_square,
+                    embed_dim,
+                },
+            ));
         }
 
         Ok(out)

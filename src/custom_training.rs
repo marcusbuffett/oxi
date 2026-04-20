@@ -52,7 +52,7 @@ use crate::training_stream::build_human_training_stream;
 use crate::tui::OxiTuiRenderer;
 use crate::value_loss_metric::{ValueLossInput, ValueLossMetric};
 use crate::wdl_accuracy_metric::WdlAccuracyMetric;
-use crate::weight_decay::{ValueTowerGradientFilter, WeightDecayGroups};
+use crate::weight_decay::WeightDecayGroups;
 
 /// Simple CLI renderer for when TUI is disabled
 struct SimpleCliRenderer;
@@ -433,17 +433,6 @@ impl GradNormWeights {
             time: state.weight_for(GradNormTask::TimeUsage),
             aux: state.weight_for(GradNormTask::Auxiliary),
             calibration: state.weight_for(GradNormTask::Calibration),
-        }
-    }
-
-    /// Create weights for value tower only training: policy=0, time=0, aux=0
-    fn for_value_tower_only(state: &GradNormState) -> Self {
-        Self {
-            policy: 0.0,
-            value: state.weight_for(GradNormTask::Value),
-            time: 0.0,
-            aux: 0.0,
-            calibration: 0.0,
         }
     }
 }
@@ -1561,10 +1550,6 @@ where
         adamw_params,
     ) = weight_decay_groups.counts();
 
-    // Create value tower gradient filter for potential value tower only training
-    let value_tower_filter = ValueTowerGradientFilter::new::<B, _>(&model);
-    let value_tower_param_count = value_tower_filter.count();
-
     // Embedding LR ratio: embedding_lr / adamw_lr (computed from initial LRs)
     // This replaces the old sqrt(embed_dim) multiplier with μP-informed separate embedding LR
     let d = config.embed_dim() as f64;
@@ -1585,10 +1570,6 @@ where
     println!(
         "  Optimizer: {} Muon (2D+ weights), {} AdamW (biases/embeds/norms/heads)",
         muon_params, adamw_params
-    );
-    println!(
-        "  Value tower params: {} (for value tower only training)",
-        value_tower_param_count
     );
     println!(
         "  Embedding LR: {:.6} (base), ratio to AdamW: {:.2}x (μP: d/d_ref={:.2}x)",
@@ -1697,13 +1678,7 @@ where
     };
 
     // Set up puzzle iterator if puzzle sampling is enabled
-    // In value tower only mode, skip puzzles entirely
-    let puzzle_ratio = if config.skip_policy_loss() {
-        println!("Skipping puzzle mixing (value tower only mode)");
-        0.0
-    } else {
-        config.puzzle_sampling_ratio
-    };
+    let puzzle_ratio = config.puzzle_sampling_ratio;
     let examples_iter: Box<dyn Iterator<Item = ChessExample>> = if puzzle_ratio > 0.0 {
         let puzzle_path = config
             .puzzle_path
@@ -2324,21 +2299,6 @@ where
     let mut pretrain_batch_iter = pretrain_batches.into_iter();
     let max_samples = config.max_samples.unwrap_or(usize::MAX);
 
-    // Track if we're in value tower only mode (skip_policy_loss or after main training completes)
-    let mut value_tower_only_mode = config.skip_policy_loss();
-    if value_tower_only_mode {
-        println!("VALUE TOWER ONLY MODE: Enabled via skip_policy_loss flag");
-        println!("  - Only value tower parameters will be updated");
-        println!("  - Policy loss weight set to 0");
-        println!("  - Puzzles disabled");
-        println!("  - LR reset to initial value");
-        tracing::info!(
-            "Value tower only mode enabled: skip_policy_loss={}, value_tower_params={}",
-            config.skip_policy_loss(),
-            value_tower_param_count
-        );
-    }
-
     println!(
         "Starting training loop: {} pretrain batches, shuffle buffer: {} examples",
         pretrain_batch_count,
@@ -2370,42 +2330,15 @@ where
         }
 
         if lr_scheduler.should_stop() {
-            if value_tower_only_mode {
-                // Already in value tower only mode, stop training
-                println!(
-                    "Training stopped: reached min LR in value tower only mode (plateau: t < {:.2})",
-                    config.lr_plateau_t_threshold
-                );
-                tracing::info!(
-                    "EXIT_CONDITION: lr_min_reached_value_tower at iteration {} (current_lr={:.2e}, min_lr={:.2e})",
-                    loop_iteration, lr_scheduler.get_lr(), config.lr_min
-                );
-                break;
-            } else {
-                // Transition from main training to value tower only mode
-                tracing::info!("========================================");
-                tracing::info!("TRANSITIONING TO VALUE TOWER ONLY MODE");
-                tracing::info!("========================================");
-                tracing::info!(
-                    "Main training reached min LR (plateau: t < {:.2})",
-                    config.lr_plateau_t_threshold
-                );
-                tracing::info!("Now training only value tower parameters");
-                tracing::info!("  - Resetting LR to initial value");
-                tracing::info!("  - Setting policy loss weight to 0");
-                tracing::info!("  - Only updating value tower params");
-                tracing::info!("========================================");
-                tracing::info!(
-                    "STAGE_TRANSITION: main_to_value_tower at iteration {} (lr was {:.2e}, resetting to {:.2e})",
-                    loop_iteration, lr_scheduler.get_lr(), initial_lr
-                );
-
-                value_tower_only_mode = true;
-                lr_scheduler.reset_to_initial();
-
-                // Continue training instead of breaking
-                continue;
-            }
+            println!(
+                "Training stopped: reached min LR (plateau: t < {:.2})",
+                config.lr_plateau_t_threshold
+            );
+            tracing::info!(
+                "EXIT_CONDITION: lr_min_reached at iteration {} (current_lr={:.2e}, min_lr={:.2e})",
+                loop_iteration, lr_scheduler.get_lr(), config.lr_min
+            );
+            break;
         }
 
         if items_processed >= max_samples {
@@ -2493,11 +2426,7 @@ where
 
         // Split batch across devices for parallel execution
         let device_splits = split_items_across_devices(&items_all, devices.len());
-        let gradnorm_weights = if value_tower_only_mode {
-            GradNormWeights::for_value_tower_only(&gradnorm_state)
-        } else {
-            GradNormWeights::from_state(&gradnorm_state)
-        };
+        let gradnorm_weights = GradNormWeights::from_state(&gradnorm_state);
         let mut active_workers = Vec::new();
 
         for (device_index, device_items) in device_splits.into_iter().enumerate() {
@@ -2565,21 +2494,10 @@ where
         let t_post_main_loop = Instant::now();
         gradnorm_state.record_batch_losses(iteration, &output);
 
-        // Record batch in ReduceOnPlateau scheduler:
-        // - Main training: use raw policy loss (so GradNorm weighting on other heads cannot prematurely trigger LR reductions)
-        // - Value tower only: use value loss (since policy loss is 0)
-        let plateau_loss = if value_tower_only_mode {
-            let value_loss_tensor = output.base_value_loss.clone();
-            let loss = value_loss_tensor.into_scalar().elem::<f32>() as f64;
-            if iteration % 100 == 0 {
-                tracing::info!(
-                    "Value tower plateau tracking: iteration={}, value_loss={:.6}",
-                    iteration,
-                    loss
-                );
-            }
-            loss
-        } else {
+        // Record batch in ReduceOnPlateau scheduler using raw policy loss (so
+        // GradNorm weighting on other heads cannot prematurely trigger LR
+        // reductions).
+        let plateau_loss = {
             let policy_loss_tensor = output
                 .raw_policy_loss
                 .clone()
@@ -2619,17 +2537,7 @@ where
             let next_step = optimizer_step + 1;
 
             let t_split = Instant::now();
-            // In value tower only mode, filter gradients to only value tower params
-            let grads_to_split = if value_tower_only_mode {
-                let filtered = value_tower_filter.filter_grads::<B, _>(&model, grads);
-                tracing::debug!(
-                    "Value tower only: filtered grads count = {}",
-                    filtered.len()
-                );
-                filtered
-            } else {
-                grads
-            };
+            let grads_to_split = grads;
             split_grads_time = t_split.elapsed();
 
             // Compute gradient norm on the gradients we're actually using
@@ -2639,15 +2547,6 @@ where
                 compute_gradient_norm_with_breakdown(&grads_to_split, &model, need_breakdown);
             grad_norm_compute_time = t_grad_norm.elapsed();
             let gradient_norm_value = gradient_breakdown.total();
-
-            if value_tower_only_mode && next_step % 100 == 0 {
-                tracing::info!(
-                    "Value tower only step {}: grad_norm={:.6e}, grads_count={}",
-                    next_step,
-                    gradient_norm_value,
-                    grads_to_split.len()
-                );
-            }
 
             if need_breakdown {
                 let bd_adamw_lr = current_lr;
@@ -2703,8 +2602,7 @@ where
                 value: grad_norm_numeric,
             });
 
-            // Skip GradNorm probing in value tower only mode (only one loss is active)
-            if !value_tower_only_mode && gradnorm_state.should_update_weights(next_step) {
+            if gradnorm_state.should_update_weights(next_step) {
                 let probe_items = sample_gradnorm_items(&items_all, config.gradnorm_probe_size());
                 if !probe_items.is_empty() {
                     let probe_device_index = if devices.len() > 1 { 1 } else { 0 };
@@ -3225,12 +3123,10 @@ where
         });
 
         // Determine if we're in the pretrain phase (using mixed batches with easy examples)
-        let is_in_pretrain_phase = iteration <= num_pretrain_batches && !value_tower_only_mode;
+        let is_in_pretrain_phase = iteration <= num_pretrain_batches;
 
         let stage_input = TrainingStageInput {
-            stage: if value_tower_only_mode {
-                TrainingStage::ValueTowerOnly
-            } else if is_in_pretrain_phase {
+            stage: if is_in_pretrain_phase {
                 let progress =
                     ((iteration - 1) as f64 / (num_pretrain_batches - 1).max(1) as f64).min(1.0);
                 let tcec_percentage = 1.0 - progress;

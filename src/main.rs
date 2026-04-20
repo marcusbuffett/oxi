@@ -472,6 +472,13 @@ async fn main() -> Result<()> {
                 }
                 let _guard = oxi::custom_training::init_train_logging(config.log_dir.as_deref());
                 tracing::info!("Starting training with config: {:?}", config);
+                if let Some(max_ply) = config.max_ply {
+                    tracing::info!(
+                        "Training data ply filter: max_ply={} (samples with ply > {} will be skipped)",
+                        max_ply,
+                        max_ply
+                    );
+                }
                 set_global_config(config.clone()).unwrap();
 
                 use burn::backend::Autodiff;

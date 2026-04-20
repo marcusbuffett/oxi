@@ -242,6 +242,11 @@ pub struct Config {
     /// Probability of dropping positions based on ply (80% at ply 0, 0% at ply 10+)
     pub enable_ply_sampling: Option<bool>,
 
+    /// Maximum ply (inclusive) to include training samples for. Samples with
+    /// `current_ply > max_ply` are skipped. `None` disables the upper bound.
+    #[serde(default)]
+    pub max_ply: Option<usize>,
+
     /// Probability of dropping games based on Elo (75% at 1000 Elo, 0% at 2000+ Elo)
     pub enable_elo_sampling: Option<bool>,
 
@@ -596,6 +601,11 @@ pub struct ConfigOverrides {
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub enable_ply_sampling: Option<bool>,
 
+    /// Maximum ply (inclusive) to include training samples for. Samples with
+    /// `current_ply > max_ply` are skipped. Omit to disable the upper bound.
+    #[arg(long)]
+    pub max_ply: Option<usize>,
+
     /// Enable Elo-based game sampling
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub enable_elo_sampling: Option<bool>,
@@ -854,6 +864,9 @@ impl Config {
         }
         if let Some(v) = overrides.enable_ply_sampling {
             config.enable_ply_sampling = Some(v);
+        }
+        if let Some(v) = overrides.max_ply {
+            config.max_ply = Some(v);
         }
         if let Some(v) = overrides.enable_elo_sampling {
             config.enable_elo_sampling = Some(v);
@@ -1184,6 +1197,7 @@ impl Default for Config {
             num_devices: 1,
             focal_loss_gamma: 0.0,
             enable_ply_sampling: Some(true),
+            max_ply: None,
             enable_elo_sampling: Some(true),
             checkpoint_interval: 100,
             pretrain_samples: 0,
@@ -1296,6 +1310,13 @@ pub fn shd_log<F: FnOnce()>(f: F) {
 /// Check if a position should be kept based on ply and random sampling
 pub fn should_keep_position_by_ply(ply: usize, rng_value: f64) -> bool {
     let config = get_global_config();
+    // Apply the hard upper ply bound (if configured) regardless of whether the
+    // probabilistic ply-sampling pipeline is enabled.
+    if let Some(max_ply) = config.max_ply {
+        if ply > max_ply {
+            return false;
+        }
+    }
     if !config.enable_ply_sampling.unwrap_or(true) {
         return true;
     }

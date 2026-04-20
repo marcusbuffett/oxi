@@ -3,7 +3,7 @@ use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::backend::Backend;
 
-use crate::config::{get_global_config, NUM_GLOBALS};
+use crate::config::{Config, NUM_GLOBALS};
 
 const NUM_PROMO_PIECES: usize = 4;
 
@@ -20,8 +20,7 @@ pub struct FactorizedPolicyHead<B: Backend> {
 }
 
 impl<B: Backend> FactorizedPolicyHead<B> {
-    pub fn new(device: &B::Device) -> Self {
-        let config = get_global_config();
+    pub fn new(config: &Config, device: &B::Device) -> Self {
         let embed_dim = config.embed_dim();
 
         // Standard initialization: Normal(0, 0.02)
@@ -226,20 +225,14 @@ impl<B: Backend> FactorizedPolicyHead<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{set_global_config, Config};
     use crate::test_backend::{test_device, TestBackend};
-
-    fn ensure_config() {
-        let _ = set_global_config(Config::new(96, 2));
-    }
 
     #[test]
     fn test_factorized_policy_output_shape() {
-        ensure_config();
         let device = test_device();
-        let config = get_global_config();
+        let config = Config::new(96, 2);
 
-        let head = FactorizedPolicyHead::<TestBackend>::new(&device);
+        let head = FactorizedPolicyHead::<TestBackend>::new(&config, &device);
         let batch_size = 2usize;
         let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
         let globals = Tensor::zeros([batch_size, NUM_GLOBALS], &device);
@@ -250,11 +243,10 @@ mod tests {
 
     #[test]
     fn test_base_logits_shape() {
-        ensure_config();
         let device = test_device();
-        let config = get_global_config();
+        let config = Config::new(96, 2);
 
-        let head = FactorizedPolicyHead::<TestBackend>::new(&device);
+        let head = FactorizedPolicyHead::<TestBackend>::new(&config, &device);
         let batch_size = 2usize;
         let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
         let globals = Tensor::zeros([batch_size, NUM_GLOBALS], &device);
@@ -265,11 +257,10 @@ mod tests {
 
     #[test]
     fn test_promo_logits_shape() {
-        ensure_config();
         let device = test_device();
-        let config = get_global_config();
+        let config = Config::new(96, 2);
 
-        let head = FactorizedPolicyHead::<TestBackend>::new(&device);
+        let head = FactorizedPolicyHead::<TestBackend>::new(&config, &device);
         let batch_size = 2usize;
         let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
 
