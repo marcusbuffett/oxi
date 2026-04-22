@@ -71,6 +71,14 @@ pub struct ChessOutput<B: Backend> {
     pub calibration_labeled_fraction: f32,
     pub calibration_overall_score: f32,
     pub calibration_policy_signed_error_by_elo: Vec<(String, f32)>,
+    /// Base (unweighted) policy-regret loss tensor: E_{m~policy}[cp_loss(m)] scaled by Elo.
+    pub base_policy_regret_loss: Tensor<B, 1>,
+    /// Weighted policy-regret loss tensor that contributes to `loss`.
+    pub policy_regret_loss: Tensor<B, 1>,
+    /// Scalar snapshot of the unweighted policy-regret loss (for display).
+    pub policy_regret_loss_f32: f32,
+    /// Mean cp-loss of the model's argmax predicted move, bucketed by Elo skill band.
+    pub argmax_cp_loss_by_elo: Vec<(String, f32)>,
 }
 
 impl<B: Backend> ChessOutput<B> {
@@ -94,6 +102,8 @@ impl<B: Backend> ChessOutput<B> {
         let base_time_usage_loss = time_usage_loss.clone();
         let base_aux_loss = aux_loss.clone();
         let base_calibration_loss = calibration_loss.clone();
+        let base_policy_regret_loss = loss.clone() * 0.0;
+        let policy_regret_loss = loss.clone() * 0.0;
 
         Self {
             loss,
@@ -131,6 +141,10 @@ impl<B: Backend> ChessOutput<B> {
             calibration_labeled_fraction: 0.0,
             calibration_overall_score: 0.0,
             calibration_policy_signed_error_by_elo: Vec::new(),
+            base_policy_regret_loss,
+            policy_regret_loss,
+            policy_regret_loss_f32: 0.0,
+            argmax_cp_loss_by_elo: Vec::new(),
         }
     }
 
@@ -229,6 +243,20 @@ impl<B: Backend> ChessOutput<B> {
         self
     }
 
+    pub fn with_policy_regret(
+        mut self,
+        base_policy_regret_loss: Tensor<B, 1>,
+        policy_regret_loss: Tensor<B, 1>,
+        policy_regret_loss_f32: f32,
+        argmax_cp_loss_by_elo: Vec<(String, f32)>,
+    ) -> Self {
+        self.base_policy_regret_loss = base_policy_regret_loss;
+        self.policy_regret_loss = policy_regret_loss;
+        self.policy_regret_loss_f32 = policy_regret_loss_f32;
+        self.argmax_cp_loss_by_elo = argmax_cp_loss_by_elo;
+        self
+    }
+
     /// Get the total loss used for metrics display (sum of raw losses if available)
     /// This is the same calculation used by LossMetric
     pub fn total_loss(&self) -> Tensor<B, 1> {
@@ -243,6 +271,7 @@ impl<B: Backend> ChessOutput<B> {
                 + raw_time.clone()
                 + self.aux_loss.clone()
                 + self.calibration_loss.clone()
+                + self.policy_regret_loss.clone()
         } else {
             // Fallback to combined loss
             self.loss.clone()
@@ -287,6 +316,10 @@ impl<B: Backend> ChessOutput<B> {
             calibration_labeled_fraction: self.calibration_labeled_fraction,
             calibration_overall_score: self.calibration_overall_score,
             calibration_policy_signed_error_by_elo: self.calibration_policy_signed_error_by_elo,
+            base_policy_regret_loss: self.base_policy_regret_loss.detach(),
+            policy_regret_loss: self.policy_regret_loss.detach(),
+            policy_regret_loss_f32: self.policy_regret_loss_f32,
+            argmax_cp_loss_by_elo: self.argmax_cp_loss_by_elo,
         }
     }
 }
@@ -384,11 +417,13 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
         let calibration_labeled_fraction = self.calibration_labeled_fraction;
         let calibration_overall_score = self.calibration_overall_score;
         let calibration_policy_signed_error_by_elo = self.calibration_policy_signed_error_by_elo;
+        let policy_regret_loss_f32 = self.policy_regret_loss_f32;
+        let argmax_cp_loss_by_elo = self.argmax_cp_loss_by_elo;
         let raw_policy_loss = self.raw_policy_loss;
         let raw_value_loss = self.raw_value_loss;
         let raw_time_usage_loss = self.raw_time_usage_loss;
 
-        let [loss, policy_loss, value_loss, time_usage_loss, aux_loss, calibration_loss, policy_output, policy_targets, value_output, value_targets, legal_moves_mask] =
+        let [loss, policy_loss, value_loss, time_usage_loss, aux_loss, calibration_loss, policy_regret_loss, base_policy_regret_loss, policy_output, policy_targets, value_output, value_targets, legal_moves_mask] =
             Transaction::default()
                 .register(self.loss)
                 .register(self.policy_loss)
@@ -396,6 +431,8 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
                 .register(self.time_usage_loss)
                 .register(self.aux_loss)
                 .register(self.calibration_loss)
+                .register(self.policy_regret_loss)
+                .register(self.base_policy_regret_loss)
                 .register(self.policy_output)
                 .register(self.policy_targets)
                 .register(self.value_output)
@@ -470,6 +507,10 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             calibration_labeled_fraction,
             calibration_overall_score,
             calibration_policy_signed_error_by_elo,
+            base_policy_regret_loss: Tensor::from_data(base_policy_regret_loss, device),
+            policy_regret_loss: Tensor::from_data(policy_regret_loss, device),
+            policy_regret_loss_f32,
+            argmax_cp_loss_by_elo,
         }
     }
 }

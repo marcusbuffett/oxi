@@ -5,6 +5,10 @@ use crate::chess_output::ChessOutput;
 use crate::config::Config;
 
 const EPS: f32 = 1e-8;
+/// Absolute floor on any gradnorm-managed weight. Prevents weights from
+/// collapsing to zero (and being numerically unrecoverable) without tying the
+/// floor to the initial config value.
+const WEIGHT_FLOOR: f32 = 1e-6;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(usize)]
@@ -14,6 +18,7 @@ pub enum GradNormTask {
     TimeUsage = 2,
     Auxiliary = 3,
     Calibration = 4,
+    PolicyRegret = 5,
 }
 
 impl GradNormTask {
@@ -24,6 +29,7 @@ impl GradNormTask {
             GradNormTask::TimeUsage,
             GradNormTask::Auxiliary,
             GradNormTask::Calibration,
+            GradNormTask::PolicyRegret,
         ]
         .into_iter()
     }
@@ -35,6 +41,7 @@ impl GradNormTask {
             GradNormTask::TimeUsage => "time_usage",
             GradNormTask::Auxiliary => "auxiliary",
             GradNormTask::Calibration => "calibration",
+            GradNormTask::PolicyRegret => "policy_regret",
         }
     }
 }
@@ -139,6 +146,10 @@ impl GradNormState {
                         config.calibration_loss_weight(),
                         config.gradnorm_calibration_priority(),
                     ),
+                    GradNormTask::PolicyRegret => (
+                        config.policy_regret_loss_weight(),
+                        config.gradnorm_policy_regret_priority(),
+                    ),
                 };
                 TaskState::new(task, weight, priority)
             })
@@ -180,6 +191,7 @@ impl GradNormState {
                 GradNormTask::TimeUsage => config.time_usage_loss_weight,
                 GradNormTask::Auxiliary => config.aux_loss_weight,
                 GradNormTask::Calibration => config.calibration_loss_weight(),
+                GradNormTask::PolicyRegret => config.policy_regret_loss_weight(),
             };
             task_state.weight = weight;
             task_state.enabled = weight > 0.0;
@@ -232,6 +244,10 @@ impl GradNormState {
                     &output.base_calibration_loss,
                     output.calibration_labeled_fraction > 0.0,
                 ),
+                GradNormTask::PolicyRegret => (
+                    &output.base_policy_regret_loss,
+                    output.calibration_labeled_fraction > 0.0,
+                ),
             };
 
             let base_loss = if enabled_by_output {
@@ -261,17 +277,21 @@ impl GradNormState {
         let time_weight = self.weight_for(GradNormTask::TimeUsage);
         let aux_weight = self.weight_for(GradNormTask::Auxiliary);
         let calibration_weight = self.weight_for(GradNormTask::Calibration);
+        let policy_regret_weight = self.weight_for(GradNormTask::PolicyRegret);
 
         output.policy_loss = output.base_policy_loss.clone() * policy_weight;
         output.value_loss = output.base_value_loss.clone() * value_weight;
         output.time_usage_loss = output.base_time_usage_loss.clone() * time_weight;
         output.aux_loss = output.base_aux_loss.clone() * aux_weight;
         output.calibration_loss = output.base_calibration_loss.clone() * calibration_weight;
+        output.policy_regret_loss =
+            output.base_policy_regret_loss.clone() * policy_regret_weight;
         output.loss = output.policy_loss.clone()
             + output.value_loss.clone()
             + output.time_usage_loss.clone()
             + output.aux_loss.clone()
-            + output.calibration_loss.clone();
+            + output.calibration_loss.clone()
+            + output.policy_regret_loss.clone();
     }
 
     pub fn apply_probe_results(
@@ -347,14 +367,16 @@ impl GradNormState {
 
         self.renormalize_weights();
 
-        // Clamp weights AFTER renormalization to enforce hard floors/ceilings.
-        // Previously clamping happened before renorm, which allowed renorm to
-        // push weights below their clamp floors (e.g., aux weight ending up at
-        // 0.005 despite a 0.006 floor when policy weight was at its ceiling).
+        // Clamp weights AFTER renormalization. The ceiling is tied to the initial
+        // weight (prevents any task from dominating during noisy bootstrap probes
+        // by more than 10x its intended scale). The floor is an absolute value —
+        // operator intent no longer constrains how low gradnorm can drive a task,
+        // which keeps behavior predictable when initial weights are set on
+        // different scales (e.g. raw-cp hinge vs O(1) CE losses).
         for task in &mut self.tasks {
             if task.enabled {
                 let initial = task.initial_weight.max(EPS);
-                task.weight = task.weight.clamp(initial * 0.1, initial * 10.0);
+                task.weight = task.weight.clamp(WEIGHT_FLOOR, initial * 10.0);
             }
         }
 

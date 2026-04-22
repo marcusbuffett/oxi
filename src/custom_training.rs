@@ -423,6 +423,7 @@ struct GradNormWeights {
     time: f32,
     aux: f32,
     calibration: f32,
+    policy_regret: f32,
 }
 
 impl GradNormWeights {
@@ -433,6 +434,7 @@ impl GradNormWeights {
             time: state.weight_for(GradNormTask::TimeUsage),
             aux: state.weight_for(GradNormTask::Auxiliary),
             calibration: state.weight_for(GradNormTask::Calibration),
+            policy_regret: state.weight_for(GradNormTask::PolicyRegret),
         }
     }
 }
@@ -478,6 +480,10 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         calibration_labeled_fraction: output.calibration_labeled_fraction,
         calibration_overall_score: output.calibration_overall_score,
         calibration_policy_signed_error_by_elo: output.calibration_policy_signed_error_by_elo,
+        base_policy_regret_loss: output.base_policy_regret_loss.to_device(device),
+        policy_regret_loss: output.policy_regret_loss.to_device(device),
+        policy_regret_loss_f32: output.policy_regret_loss_f32,
+        argmax_cp_loss_by_elo: output.argmax_cp_loss_by_elo,
     }
     .detach()
 }
@@ -491,11 +497,14 @@ fn apply_gradnorm_weights_to_output<B: Backend>(
     output.time_usage_loss = output.base_time_usage_loss.clone() * weights.time;
     output.aux_loss = output.base_aux_loss.clone() * weights.aux;
     output.calibration_loss = output.base_calibration_loss.clone() * weights.calibration;
+    output.policy_regret_loss =
+        output.base_policy_regret_loss.clone() * weights.policy_regret;
     output.loss = output.policy_loss.clone()
         + output.value_loss.clone()
         + output.time_usage_loss.clone()
         + output.aux_loss.clone()
-        + output.calibration_loss.clone();
+        + output.calibration_loss.clone()
+        + output.policy_regret_loss.clone();
 }
 
 fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -> ChessOutput<B> {
@@ -511,11 +520,13 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_time_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_aux_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_calibration_loss = Tensor::<B, 1>::zeros([1], device);
+    let mut sum_policy_regret_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_policy_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_value_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_time_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_aux_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_calibration_loss = Tensor::<B, 1>::zeros([1], device);
+    let mut sum_base_policy_regret_loss = Tensor::<B, 1>::zeros([1], device);
 
     let mut sum_aux_mobility_loss = 0.0f32;
     let mut sum_aux_material_loss = 0.0f32;
@@ -531,6 +542,7 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_calibration_head_mae = 0.0f32;
     let mut sum_calibration_labeled_fraction = 0.0f32;
     let mut sum_calibration_overall_score = 0.0f32;
+    let mut sum_policy_regret_loss_f32 = 0.0f32;
 
     let all_raw_policy = outputs.iter().all(|o| o.raw_policy_loss.is_some());
     let all_raw_value = outputs.iter().all(|o| o.raw_value_loss.is_some());
@@ -582,6 +594,12 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_calibration_head_mae += output.calibration_head_mae * batch_scalar;
         sum_calibration_labeled_fraction += output.calibration_labeled_fraction * batch_scalar;
         sum_calibration_overall_score += output.calibration_overall_score * batch_scalar;
+        sum_policy_regret_loss_f32 += output.policy_regret_loss_f32 * batch_scalar;
+
+        sum_policy_regret_loss =
+            sum_policy_regret_loss + output.policy_regret_loss.clone() * batch_scalar;
+        sum_base_policy_regret_loss = sum_base_policy_regret_loss
+            + output.base_policy_regret_loss.clone() * batch_scalar;
 
         if let Some(sum) = sum_raw_policy_loss.as_mut() {
             if let Some(raw) = output.raw_policy_loss.as_ref() {
@@ -623,6 +641,8 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let base_time_usage_loss = sum_base_time_loss / total_scalar;
     let base_aux_loss = sum_base_aux_loss / total_scalar;
     let base_calibration_loss = sum_base_calibration_loss / total_scalar;
+    let policy_regret_loss = sum_policy_regret_loss / total_scalar;
+    let base_policy_regret_loss = sum_base_policy_regret_loss / total_scalar;
 
     let raw_policy_loss = sum_raw_policy_loss.map(|sum| sum / total_scalar);
     let raw_value_loss = sum_raw_value_loss.map(|sum| sum / total_scalar);
@@ -647,6 +667,19 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         }
     }
     let calibration_policy_signed_error_by_elo = calibration_policy_error_by_elo
+        .into_iter()
+        .filter_map(|(bucket, (sum, count))| (count > 0).then_some((bucket, sum / count as f32)))
+        .collect::<Vec<_>>();
+
+    let mut argmax_cp_sums = std::collections::BTreeMap::<String, (f32, usize)>::new();
+    for output in outputs {
+        for (bucket, cp_loss) in &output.argmax_cp_loss_by_elo {
+            let entry = argmax_cp_sums.entry(bucket.clone()).or_insert((0.0, 0));
+            entry.0 += *cp_loss;
+            entry.1 += 1;
+        }
+    }
+    let argmax_cp_loss_by_elo = argmax_cp_sums
         .into_iter()
         .filter_map(|(bucket, (sum, count))| (count > 0).then_some((bucket, sum / count as f32)))
         .collect::<Vec<_>>();
@@ -687,6 +720,10 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         calibration_labeled_fraction: sum_calibration_labeled_fraction / total_scalar,
         calibration_overall_score: sum_calibration_overall_score / total_scalar,
         calibration_policy_signed_error_by_elo,
+        base_policy_regret_loss,
+        policy_regret_loss,
+        policy_regret_loss_f32: sum_policy_regret_loss_f32 / total_scalar,
+        argmax_cp_loss_by_elo,
     }
     .detach()
 }
@@ -708,6 +745,7 @@ where
         (GradNormTask::TimeUsage, weights.time),
         (GradNormTask::Auxiliary, weights.aux),
         (GradNormTask::Calibration, weights.calibration),
+        (GradNormTask::PolicyRegret, weights.policy_regret),
     ];
 
     for (task, weight) in tasks {
@@ -716,7 +754,9 @@ where
         }
 
         let output = model.forward_classification(batch.clone());
-        if task == GradNormTask::Calibration && output.calibration_labeled_fraction <= 0.0 {
+        if matches!(task, GradNormTask::Calibration | GradNormTask::PolicyRegret)
+            && output.calibration_labeled_fraction <= 0.0
+        {
             continue;
         }
         let base_loss_tensor = match task {
@@ -725,6 +765,7 @@ where
             GradNormTask::TimeUsage => output.base_time_usage_loss.clone(),
             GradNormTask::Auxiliary => output.base_aux_loss.clone(),
             GradNormTask::Calibration => output.base_calibration_loss.clone(),
+            GradNormTask::PolicyRegret => output.base_policy_regret_loss.clone(),
         };
         let base_loss_value = base_loss_tensor.clone().into_scalar().elem::<f32>();
         // Use base (unweighted) loss for gradient norm measurement.
@@ -2927,6 +2968,35 @@ where
                 });
                 let metric_name = format!("cp_loss_calibration_{}", bucket.to_lowercase());
                 metric_logger.log(&metric_name, iteration, signed_error_cp);
+            }
+
+            // Policy regret hinge loss scalar.
+            let policy_regret = output.policy_regret_loss_f32 as f64;
+            renderer.update_train(MetricState::Numeric {
+                name: "Centipawn Loss Calibration|Policy Regret Hinge".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Policy Regret: {policy_regret:.2} cp"),
+                    format!("{policy_regret:.4}"),
+                ),
+                value: NumericEntry::Value(policy_regret),
+            });
+            metric_logger.log("policy_regret_hinge", iteration, policy_regret);
+
+            // Argmax predicted move cp loss, bucketed by Elo band. Tracks whether the
+            // model's TOP-1 prediction is becoming tactically sounder over time, which
+            // is what the policy-regret hinge is supposed to drive.
+            for (bucket, cp_loss) in &output.argmax_cp_loss_by_elo {
+                let cp_loss = (*cp_loss as f64).clamp(0.0, 500.0);
+                renderer.update_train(MetricState::Numeric {
+                    name: format!("Argmax CP Loss By Elo|{bucket}"),
+                    entry: SerializedEntry::new(
+                        format!("{bucket}: {cp_loss:.2} cp"),
+                        format!("{cp_loss:.4}"),
+                    ),
+                    value: NumericEntry::Value(cp_loss),
+                });
+                let metric_name = format!("argmax_cp_loss_{}", bucket.to_lowercase());
+                metric_logger.log(&metric_name, iteration, cp_loss);
             }
         }
 

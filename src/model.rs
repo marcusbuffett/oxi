@@ -654,17 +654,23 @@ impl<B: Backend> OXIModel<B> {
         let log_policy = log_softmax(policy_logits_flat.clone(), 1);
         let log_policy = log_policy.mask_fill(mask.clone(), 0.0);
 
-        // Label smoothing over legal moves only
+        // Label smoothing over legal moves only. Disabled by default (eps == 0):
+        // uniform-over-legal smoothing puts floor probability on every legal move,
+        // including tactical blunders, which directly works against the policy-regret
+        // hinge. Keep the knob so this can be re-enabled experimentally.
         let eps = config.policy_label_smoothing;
-        let legal_counts = batch
-            .legal_moves
-            .clone()
-            .sum_dim(1)
-            .reshape([batch_size, 1])
-            .clamp_min(1.0);
-        let uniform_over_legal = batch.legal_moves.clone() / legal_counts;
-        let targets_smoothed =
-            batch.move_distributions.clone() * (1.0 - eps) + uniform_over_legal * eps;
+        let targets_smoothed = if eps > 0.0 {
+            let legal_counts = batch
+                .legal_moves
+                .clone()
+                .sum_dim(1)
+                .reshape([batch_size, 1])
+                .clamp_min(1.0);
+            let uniform_over_legal = batch.legal_moves.clone() / legal_counts;
+            batch.move_distributions.clone() * (1.0 - eps) + uniform_over_legal * eps
+        } else {
+            batch.move_distributions.clone()
+        };
 
         // Standard cross-entropy loss per sample
         let ce_loss_per_sample = (targets_smoothed.clone() * log_policy.clone())
@@ -986,7 +992,12 @@ impl<B: Backend> OXIModel<B> {
             calibration_labeled_fraction_f32,
             calibration_overall_score_f32,
             calibration_policy_signed_error_by_elo,
-        ) = if config.calibration_loss_weight() > 0.0 {
+            base_policy_regret_loss,
+            policy_regret_loss_f32,
+            argmax_cp_loss_by_elo,
+        ) = if config.calibration_loss_weight() > 0.0
+            || config.policy_regret_loss_weight() > 0.0
+        {
             let calibration_mask = batch.calibration_mask.clone();
             let labeled_count = calibration_mask.clone().sum().into_scalar().elem::<f32>();
             if labeled_count > 0.0 {
@@ -1029,9 +1040,10 @@ impl<B: Backend> OXIModel<B> {
                     .reshape([batch_size]);
 
                 let policy_probs = log_policy.clone().exp().mask_fill(mask.clone(), 0.0);
-                let policy_expected_cp = (policy_probs * batch.calibration_move_cp_losses.clone())
-                    .sum_dim(1)
-                    .reshape([batch_size]);
+                let policy_expected_cp =
+                    (policy_probs.clone() * batch.calibration_move_cp_losses.clone())
+                        .sum_dim(1)
+                        .reshape([batch_size]);
 
                 let target_cp = batch.calibration_target_cp_loss.clone();
                 let mask_sum = calibration_mask.clone().sum().clamp_min(1.0);
@@ -1099,6 +1111,79 @@ impl<B: Backend> OXIModel<B> {
                         (count > 0).then_some((bucket, sum / count as f32))
                     })
                     .collect::<Vec<_>>();
+
+                // --- Per-move policy-regret hinge ---
+                // For each position, penalize probability mass the policy places on moves
+                // that are WORSE than the move the human actually played at this position.
+                // Per-move form: sum_m policy(m) * max(0, cp_loss(m) - cp_loss(human)).
+                // The per-position target cp_loss(human) already encodes player skill
+                // (high-Elo humans have low target_cp → tight threshold → more moves fire
+                // the hinge; low-Elo humans have loose threshold), so no extra Elo scale.
+                let target_cp_broadcast = batch
+                    .calibration_target_cp_loss
+                    .clone()
+                    .reshape([batch_size, 1]);
+                let per_move_excess = (batch.calibration_move_cp_losses.clone()
+                    - target_cp_broadcast)
+                    .clamp_min(0.0);
+                let regret_per_sample = (policy_probs.clone() * per_move_excess)
+                    .sum_dim(1)
+                    .reshape([batch_size]);
+                let base_policy_regret_loss_tensor =
+                    (regret_per_sample * calibration_mask.clone()).sum().reshape([1])
+                        / mask_sum.clone();
+                let policy_regret_loss_f32 = base_policy_regret_loss_tensor
+                    .clone()
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap_or_default()
+                    .first()
+                    .copied()
+                    .unwrap_or(0.0);
+
+                // --- Argmax predicted move cp loss, bucketed by Elo band ---
+                // For each position, look up the Stockfish cp loss of the model's
+                // argmax predicted move. Average by Elo skill band.
+                let argmax_indices = policy_logits_flat
+                    .clone()
+                    .argmax(1)
+                    .squeeze_dim::<1>(1)
+                    .into_data()
+                    .convert::<i32>()
+                    .to_vec::<i32>()
+                    .unwrap_or_default();
+                let move_cp_losses_values = batch
+                    .calibration_move_cp_losses
+                    .clone()
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap_or_default();
+                let mut argmax_cp_sums =
+                    std::collections::BTreeMap::<String, (f32, usize)>::new();
+                for (idx, item) in batch.items.iter().enumerate() {
+                    if calibration_mask_values.get(idx).copied().unwrap_or(0.0) <= 0.0 {
+                        continue;
+                    }
+                    let move_idx = argmax_indices.get(idx).copied().unwrap_or(0) as usize;
+                    if move_idx >= LEGAL_MOVES {
+                        continue;
+                    }
+                    let cp_loss = move_cp_losses_values
+                        .get(idx * LEGAL_MOVES + move_idx)
+                        .copied()
+                        .unwrap_or(0.0);
+                    let bucket = calibration_skill_band_label(item.elo_self).to_string();
+                    let entry = argmax_cp_sums.entry(bucket).or_insert((0.0, 0));
+                    entry.0 += cp_loss;
+                    entry.1 += 1;
+                }
+                let argmax_cp_loss_by_elo = argmax_cp_sums
+                    .into_iter()
+                    .filter_map(|(bucket, (sum, count))| {
+                        (count > 0).then_some((bucket, sum / count as f32))
+                    })
+                    .collect::<Vec<_>>();
+
                 let calibration_overall_score = {
                     let mut total_score = 0.0f32;
                     let mut total_count = 0usize;
@@ -1149,20 +1234,48 @@ impl<B: Backend> OXIModel<B> {
                     labeled_count / batch_size as f32,
                     calibration_overall_score,
                     calibration_policy_signed_error_by_elo,
+                    base_policy_regret_loss_tensor,
+                    policy_regret_loss_f32,
+                    argmax_cp_loss_by_elo,
                 )
             } else {
-                (zero_like(), 0.0, 0.0, 0.0, 0.0, 0.0, Vec::new())
+                (
+                    zero_like(),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    Vec::new(),
+                    zero_like(),
+                    0.0,
+                    Vec::new(),
+                )
             }
         } else {
-            (zero_like(), 0.0, 0.0, 0.0, 0.0, 0.0, Vec::new())
+            (
+                zero_like(),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                Vec::new(),
+                zero_like(),
+                0.0,
+                Vec::new(),
+            )
         };
         let calibration_term = base_calibration_loss.clone() * config.calibration_loss_weight();
+        let policy_regret_term =
+            base_policy_regret_loss.clone() * config.policy_regret_loss_weight();
 
         let loss = config_weighted_policy_loss.clone()
             + value_term.clone()
             + time_usage_term.clone()
             + aux_term.clone()
-            + calibration_term.clone();
+            + calibration_term.clone()
+            + policy_regret_term.clone();
 
         // Accuracy
         let targets = batch.move_distributions.clone().argmax(1).squeeze_dim(1);
@@ -1215,6 +1328,12 @@ impl<B: Backend> OXIModel<B> {
             aux_to_sq_loss_f32,
             aux_from_sq_acc_f32,
             aux_to_sq_acc_f32,
+        )
+        .with_policy_regret(
+            base_policy_regret_loss,
+            policy_regret_term,
+            policy_regret_loss_f32,
+            argmax_cp_loss_by_elo,
         )
     }
 

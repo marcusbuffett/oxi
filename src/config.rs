@@ -284,9 +284,26 @@ pub struct Config {
     #[serde(default = "default_calibration_loss_weight")]
     pub calibration_loss_weight: f32,
 
+    /// Weight for the per-move policy regret hinge:
+    ///   L = (Σ_m policy(m) * max(0, cp_loss(m) - cp_loss(human))) averaged over
+    ///   positions with calibration labels.
+    /// Punishes probability mass placed on moves worse than the move the human
+    /// actually played. The per-position `cp_loss(human)` target already encodes
+    /// player skill, so no extra Elo scaling is applied.
+    ///
+    /// The hinge is measured in raw centipawns (~50-150 at steady state), so the
+    /// weight is deliberately small to match the effective gradient magnitude of
+    /// the existing calibration loss. Set to 0 to disable.
+    #[serde(default = "default_policy_regret_loss_weight")]
+    pub policy_regret_loss_weight: f32,
+
     /// Priority multiplier applied to calibration GradNorm target
     #[serde(default = "default_gradnorm_calibration_priority")]
     pub gradnorm_calibration_priority: f32,
+
+    /// Priority multiplier applied to policy-regret GradNorm target
+    #[serde(default = "default_gradnorm_policy_regret_priority")]
+    pub gradnorm_policy_regret_priority: f32,
 
     // === VALUE TOWER CONFIGURATION ===
     /// Number of transformer layers in the value tower (separate from trunk)
@@ -304,12 +321,6 @@ pub struct Config {
     /// Whether to train value head on puzzle positions
     #[serde(default)]
     pub value_train_on_puzzles: Option<bool>,
-
-    /// Skip the policy training stage and go directly to value tower only training.
-    /// This freezes all params except value tower, resets LR to initial, disables puzzles,
-    /// and sets policy loss weight to zero.
-    #[serde(default)]
-    pub skip_policy_loss: Option<bool>,
 
     /// Run LR range finder instead of training
     #[serde(default)]
@@ -360,7 +371,18 @@ fn default_aux_loss_weight() -> f32 {
 fn default_calibration_loss_weight() -> f32 {
     0.10
 }
+fn default_policy_regret_loss_weight() -> f32 {
+    // Seed weight for GradNorm; it rebalances based on measured gradient norms
+    // (target priority 2.0, same as calibration). An absolute floor in gradnorm.rs
+    // prevents collapse to zero, so the initial value is just a starting point —
+    // GradNorm typically drives the per-move hinge down to ~1e-3 within a few
+    // probes because its raw-cp gradient scale dominates.
+    0.01
+}
 fn default_gradnorm_calibration_priority() -> f32 {
+    2.0
+}
+fn default_gradnorm_policy_regret_priority() -> f32 {
     2.0
 }
 /// Command-line overrides for Config. All fields are optional.
@@ -649,7 +671,13 @@ pub struct ConfigOverrides {
     pub calibration_loss_weight: Option<f32>,
 
     #[arg(long)]
+    pub policy_regret_loss_weight: Option<f32>,
+
+    #[arg(long)]
     pub gradnorm_calibration_priority: Option<f32>,
+
+    #[arg(long)]
+    pub gradnorm_policy_regret_priority: Option<f32>,
 
     /// Number of transformer layers in the value tower
     #[arg(long)]
@@ -666,10 +694,6 @@ pub struct ConfigOverrides {
     /// Whether to train value head on puzzle positions
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub value_train_on_puzzles: Option<bool>,
-
-    /// Skip the policy training stage and go directly to value tower only training
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
-    pub skip_policy_loss: Option<bool>,
 
     /// Use Muon optimizer for 2D+ weight matrices (false = AdamW for everything)
     #[arg(long, default_missing_value="true", num_args=0..=1)]
@@ -901,8 +925,14 @@ impl Config {
         if let Some(v) = overrides.calibration_loss_weight {
             config.calibration_loss_weight = v;
         }
+        if let Some(v) = overrides.policy_regret_loss_weight {
+            config.policy_regret_loss_weight = v;
+        }
         if let Some(v) = overrides.gradnorm_calibration_priority {
             config.gradnorm_calibration_priority = v;
+        }
+        if let Some(v) = overrides.gradnorm_policy_regret_priority {
+            config.gradnorm_policy_regret_priority = v;
         }
         if let Some(v) = overrides.value_tower_layers {
             config.value_tower_layers = v;
@@ -915,9 +945,6 @@ impl Config {
         }
         if let Some(v) = overrides.value_train_on_puzzles {
             config.value_train_on_puzzles = Some(v);
-        }
-        if let Some(v) = overrides.skip_policy_loss {
-            config.skip_policy_loss = Some(v);
         }
         if let Some(v) = overrides.lr_range_finder {
             config.lr_range_finder = Some(v);
@@ -1037,6 +1064,10 @@ impl Config {
         self.gradnorm_calibration_priority.max(0.0)
     }
 
+    pub fn gradnorm_policy_regret_priority(&self) -> f32 {
+        self.gradnorm_policy_regret_priority.max(0.0)
+    }
+
     pub fn gradnorm_probe_size(&self) -> usize {
         self.gradnorm_probe_size.max(1)
     }
@@ -1091,10 +1122,6 @@ impl Config {
         self.value_train_on_puzzles.unwrap_or(false)
     }
 
-    pub fn skip_policy_loss(&self) -> bool {
-        self.skip_policy_loss.unwrap_or(false)
-    }
-
     pub fn calibration_db_path(&self) -> Option<std::path::PathBuf> {
         if let Some(path) = &self.calibration_db_path {
             return Some(path.clone());
@@ -1107,6 +1134,10 @@ impl Config {
 
     pub fn calibration_loss_weight(&self) -> f32 {
         self.calibration_loss_weight.max(0.0)
+    }
+
+    pub fn policy_regret_loss_weight(&self) -> f32 {
+        self.policy_regret_loss_weight.max(0.0)
     }
 
     /// Calculate value example weight based on ply (0 before start, ramps to 1 at full)
@@ -1170,7 +1201,7 @@ impl Default for Config {
             embedding_base_lr: default_embedding_base_lr(),
             warmup_multiplier: 2.0,
             policy_loss_weight: 0.30,
-            policy_label_smoothing: 0.005,
+            policy_label_smoothing: 0.0,
             value_loss_weight: 0.10,
             value_entropy_weight: 0.0,
             embed_dim: 192,
@@ -1209,12 +1240,13 @@ impl Default for Config {
             puzzle_path: None,
             calibration_db_path: None,
             calibration_loss_weight: default_calibration_loss_weight(),
+            policy_regret_loss_weight: default_policy_regret_loss_weight(),
             gradnorm_calibration_priority: default_gradnorm_calibration_priority(),
+            gradnorm_policy_regret_priority: default_gradnorm_policy_regret_priority(),
             value_tower_layers: 2,
             value_ply_ramp_start: 10,
             value_ply_ramp_full: 30,
             value_train_on_puzzles: Some(false),
-            skip_policy_loss: Some(false),
             lr_range_finder: Some(false),
 
             use_muon: Some(true),
