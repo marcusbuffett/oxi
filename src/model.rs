@@ -1282,19 +1282,6 @@ impl<B: Backend> OXIModel<B> {
         let base_aux_loss = base_aux_loss + maia_loss;
         let aux_term = base_aux_loss.clone() * config.aux_loss_weight;
 
-        let retrieval_policy_probs = if config.retrieval_uses_policy_overlap() {
-            let temperature = config.retrieval_policy_temperature();
-            let logits = policy_logits_flat.clone() / temperature;
-            let probs = log_softmax(logits, 1)
-                .mask_fill(mask.clone(), 0.0)
-                .exp()
-                .mask_fill(mask.clone(), 0.0)
-                .detach();
-            Some(probs)
-        } else {
-            None
-        };
-
         let (
             base_retrieval_loss,
             retrieval_loss_f32,
@@ -1302,22 +1289,77 @@ impl<B: Backend> OXIModel<B> {
             retrieval_positive_count_f32,
             retrieval_positive_sim_f32,
             retrieval_negative_sim_f32,
-        ) = self.compute_retrieval_loss(
-            trunk_output.clone(),
-            &batch.items,
-            retrieval_policy_probs.clone(),
-        );
-        let (
             trunk_retrieval_loss_f32,
             trunk_retrieval_pair_count_f32,
             trunk_retrieval_positive_count_f32,
             trunk_retrieval_positive_sim_f32,
             trunk_retrieval_negative_sim_f32,
-        ) = self.compute_trunk_retrieval_metrics(
-            trunk_output.clone(),
-            &batch.items,
-            retrieval_policy_probs,
-        );
+        ) = if config.retrieval_loss_weight() > 0.0 {
+            let retrieval_policy_probs = if config.retrieval_uses_policy_overlap() {
+                let temperature = config.retrieval_policy_temperature();
+                let logits = policy_logits_flat.clone() / temperature;
+                let probs = log_softmax(logits, 1)
+                    .mask_fill(mask.clone(), 0.0)
+                    .exp()
+                    .mask_fill(mask.clone(), 0.0)
+                    .detach();
+                Some(probs)
+            } else {
+                None
+            };
+
+            let (
+                base_retrieval_loss,
+                retrieval_loss_f32,
+                retrieval_pair_count_f32,
+                retrieval_positive_count_f32,
+                retrieval_positive_sim_f32,
+                retrieval_negative_sim_f32,
+            ) = self.compute_retrieval_loss(
+                trunk_output.clone(),
+                &batch.items,
+                retrieval_policy_probs.clone(),
+            );
+            let (
+                trunk_retrieval_loss_f32,
+                trunk_retrieval_pair_count_f32,
+                trunk_retrieval_positive_count_f32,
+                trunk_retrieval_positive_sim_f32,
+                trunk_retrieval_negative_sim_f32,
+            ) = self.compute_trunk_retrieval_metrics(
+                trunk_output.clone(),
+                &batch.items,
+                retrieval_policy_probs,
+            );
+
+            (
+                base_retrieval_loss,
+                retrieval_loss_f32,
+                retrieval_pair_count_f32,
+                retrieval_positive_count_f32,
+                retrieval_positive_sim_f32,
+                retrieval_negative_sim_f32,
+                trunk_retrieval_loss_f32,
+                trunk_retrieval_pair_count_f32,
+                trunk_retrieval_positive_count_f32,
+                trunk_retrieval_positive_sim_f32,
+                trunk_retrieval_negative_sim_f32,
+            )
+        } else {
+            (
+                zero_like(),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        };
 
         let (
             base_calibration_loss,
