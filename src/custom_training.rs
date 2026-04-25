@@ -3115,14 +3115,6 @@ where
                 value: NumericEntry::Value(retrieval_loss),
             });
             renderer.update_train(MetricState::Numeric {
-                name: "Retrieval Loss|Pairs".to_string(),
-                entry: SerializedEntry::new(
-                    format!("Pairs: {retrieval_pairs:.0} (+{retrieval_positives:.0})"),
-                    format!("{retrieval_pairs:.0}"),
-                ),
-                value: NumericEntry::Value(retrieval_pairs),
-            });
-            renderer.update_train(MetricState::Numeric {
                 name: "Retrieval Cosine|Positive".to_string(),
                 entry: SerializedEntry::new(
                     format!("Positive: {retrieval_positive_sim:.4}"),
@@ -3191,16 +3183,6 @@ where
                     format!("{trunk_retrieval_loss:.4}"),
                 ),
                 value: NumericEntry::Value(trunk_retrieval_loss),
-            });
-            renderer.update_train(MetricState::Numeric {
-                name: "Trunk Retrieval|Pairs".to_string(),
-                entry: SerializedEntry::new(
-                    format!(
-                        "Trunk pairs: {trunk_retrieval_pairs:.0} (+{trunk_retrieval_positives:.0})"
-                    ),
-                    format!("{trunk_retrieval_pairs:.0}"),
-                ),
-                value: NumericEntry::Value(trunk_retrieval_pairs),
             });
             renderer.update_train(MetricState::Numeric {
                 name: "Trunk Retrieval|Positive".to_string(),
