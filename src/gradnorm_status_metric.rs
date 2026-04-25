@@ -69,6 +69,7 @@ fn format_status(status: &GradNormTaskStatus) -> String {
         GradNormTask::Auxiliary => "aux",
         GradNormTask::Calibration => "cp_loss",
         GradNormTask::PolicyRegret => "regret",
+        GradNormTask::Retrieval => "retrieval",
     };
 
     if !status.enabled {

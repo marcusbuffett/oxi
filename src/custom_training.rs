@@ -424,6 +424,7 @@ struct GradNormWeights {
     aux: f32,
     calibration: f32,
     policy_regret: f32,
+    retrieval: f32,
 }
 
 impl GradNormWeights {
@@ -435,6 +436,7 @@ impl GradNormWeights {
             aux: state.weight_for(GradNormTask::Auxiliary),
             calibration: state.weight_for(GradNormTask::Calibration),
             policy_regret: state.weight_for(GradNormTask::PolicyRegret),
+            retrieval: state.weight_for(GradNormTask::Retrieval),
         }
     }
 }
@@ -447,11 +449,13 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         time_usage_loss: output.time_usage_loss.to_device(device),
         aux_loss: output.aux_loss.to_device(device),
         calibration_loss: output.calibration_loss.to_device(device),
+        retrieval_loss: output.retrieval_loss.to_device(device),
         base_policy_loss: output.base_policy_loss.to_device(device),
         base_value_loss: output.base_value_loss.to_device(device),
         base_time_usage_loss: output.base_time_usage_loss.to_device(device),
         base_aux_loss: output.base_aux_loss.to_device(device),
         base_calibration_loss: output.base_calibration_loss.to_device(device),
+        base_retrieval_loss: output.base_retrieval_loss.to_device(device),
         policy_output: output.policy_output.to_device(device),
         policy_targets: output.policy_targets.to_device(device),
         value_output: output.value_output.to_device(device),
@@ -484,6 +488,16 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         policy_regret_loss: output.policy_regret_loss.to_device(device),
         policy_regret_loss_f32: output.policy_regret_loss_f32,
         argmax_cp_loss_by_elo: output.argmax_cp_loss_by_elo,
+        retrieval_loss_f32: output.retrieval_loss_f32,
+        retrieval_pair_count: output.retrieval_pair_count,
+        retrieval_positive_count: output.retrieval_positive_count,
+        retrieval_positive_sim: output.retrieval_positive_sim,
+        retrieval_negative_sim: output.retrieval_negative_sim,
+        trunk_retrieval_loss_f32: output.trunk_retrieval_loss_f32,
+        trunk_retrieval_pair_count: output.trunk_retrieval_pair_count,
+        trunk_retrieval_positive_count: output.trunk_retrieval_positive_count,
+        trunk_retrieval_positive_sim: output.trunk_retrieval_positive_sim,
+        trunk_retrieval_negative_sim: output.trunk_retrieval_negative_sim,
     }
     .detach()
 }
@@ -497,14 +511,15 @@ fn apply_gradnorm_weights_to_output<B: Backend>(
     output.time_usage_loss = output.base_time_usage_loss.clone() * weights.time;
     output.aux_loss = output.base_aux_loss.clone() * weights.aux;
     output.calibration_loss = output.base_calibration_loss.clone() * weights.calibration;
-    output.policy_regret_loss =
-        output.base_policy_regret_loss.clone() * weights.policy_regret;
+    output.policy_regret_loss = output.base_policy_regret_loss.clone() * weights.policy_regret;
+    output.retrieval_loss = output.base_retrieval_loss.clone() * weights.retrieval;
     output.loss = output.policy_loss.clone()
         + output.value_loss.clone()
         + output.time_usage_loss.clone()
         + output.aux_loss.clone()
         + output.calibration_loss.clone()
-        + output.policy_regret_loss.clone();
+        + output.policy_regret_loss.clone()
+        + output.retrieval_loss.clone();
 }
 
 fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -> ChessOutput<B> {
@@ -521,12 +536,14 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_aux_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_calibration_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_policy_regret_loss = Tensor::<B, 1>::zeros([1], device);
+    let mut sum_retrieval_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_policy_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_value_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_time_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_aux_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_calibration_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_policy_regret_loss = Tensor::<B, 1>::zeros([1], device);
+    let mut sum_base_retrieval_loss = Tensor::<B, 1>::zeros([1], device);
 
     let mut sum_aux_mobility_loss = 0.0f32;
     let mut sum_aux_material_loss = 0.0f32;
@@ -543,6 +560,16 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_calibration_labeled_fraction = 0.0f32;
     let mut sum_calibration_overall_score = 0.0f32;
     let mut sum_policy_regret_loss_f32 = 0.0f32;
+    let mut sum_retrieval_loss_f32 = 0.0f32;
+    let mut sum_retrieval_pair_count = 0.0f32;
+    let mut sum_retrieval_positive_count = 0.0f32;
+    let mut sum_retrieval_positive_sim_weighted = 0.0f32;
+    let mut sum_retrieval_negative_sim_weighted = 0.0f32;
+    let mut sum_trunk_retrieval_loss_f32 = 0.0f32;
+    let mut sum_trunk_retrieval_pair_count = 0.0f32;
+    let mut sum_trunk_retrieval_positive_count = 0.0f32;
+    let mut sum_trunk_retrieval_positive_sim_weighted = 0.0f32;
+    let mut sum_trunk_retrieval_negative_sim_weighted = 0.0f32;
 
     let all_raw_policy = outputs.iter().all(|o| o.raw_policy_loss.is_some());
     let all_raw_value = outputs.iter().all(|o| o.raw_value_loss.is_some());
@@ -570,6 +597,7 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_aux_loss = sum_aux_loss + output.aux_loss.clone() * batch_scalar;
         sum_calibration_loss =
             sum_calibration_loss + output.calibration_loss.clone() * batch_scalar;
+        sum_retrieval_loss = sum_retrieval_loss + output.retrieval_loss.clone() * batch_scalar;
 
         sum_base_policy_loss =
             sum_base_policy_loss + output.base_policy_loss.clone() * batch_scalar;
@@ -579,6 +607,8 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_base_aux_loss = sum_base_aux_loss + output.base_aux_loss.clone() * batch_scalar;
         sum_base_calibration_loss =
             sum_base_calibration_loss + output.base_calibration_loss.clone() * batch_scalar;
+        sum_base_retrieval_loss =
+            sum_base_retrieval_loss + output.base_retrieval_loss.clone() * batch_scalar;
 
         sum_aux_mobility_loss += output.aux_mobility_loss * batch_scalar;
         sum_aux_material_loss += output.aux_material_loss * batch_scalar;
@@ -595,11 +625,29 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_calibration_labeled_fraction += output.calibration_labeled_fraction * batch_scalar;
         sum_calibration_overall_score += output.calibration_overall_score * batch_scalar;
         sum_policy_regret_loss_f32 += output.policy_regret_loss_f32 * batch_scalar;
+        sum_retrieval_loss_f32 += output.retrieval_loss_f32 * batch_scalar;
+        sum_retrieval_pair_count += output.retrieval_pair_count;
+        sum_retrieval_positive_count += output.retrieval_positive_count;
+        let retrieval_negative_count =
+            (output.retrieval_pair_count - output.retrieval_positive_count).max(0.0);
+        sum_retrieval_positive_sim_weighted +=
+            output.retrieval_positive_sim * output.retrieval_positive_count;
+        sum_retrieval_negative_sim_weighted +=
+            output.retrieval_negative_sim * retrieval_negative_count;
+        sum_trunk_retrieval_loss_f32 += output.trunk_retrieval_loss_f32 * batch_scalar;
+        sum_trunk_retrieval_pair_count += output.trunk_retrieval_pair_count;
+        sum_trunk_retrieval_positive_count += output.trunk_retrieval_positive_count;
+        let trunk_retrieval_negative_count =
+            (output.trunk_retrieval_pair_count - output.trunk_retrieval_positive_count).max(0.0);
+        sum_trunk_retrieval_positive_sim_weighted +=
+            output.trunk_retrieval_positive_sim * output.trunk_retrieval_positive_count;
+        sum_trunk_retrieval_negative_sim_weighted +=
+            output.trunk_retrieval_negative_sim * trunk_retrieval_negative_count;
 
         sum_policy_regret_loss =
             sum_policy_regret_loss + output.policy_regret_loss.clone() * batch_scalar;
-        sum_base_policy_regret_loss = sum_base_policy_regret_loss
-            + output.base_policy_regret_loss.clone() * batch_scalar;
+        sum_base_policy_regret_loss =
+            sum_base_policy_regret_loss + output.base_policy_regret_loss.clone() * batch_scalar;
 
         if let Some(sum) = sum_raw_policy_loss.as_mut() {
             if let Some(raw) = output.raw_policy_loss.as_ref() {
@@ -635,6 +683,7 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let time_usage_loss = sum_time_loss / total_scalar;
     let aux_loss = sum_aux_loss / total_scalar;
     let calibration_loss = sum_calibration_loss / total_scalar;
+    let retrieval_loss = sum_retrieval_loss / total_scalar;
 
     let base_policy_loss = sum_base_policy_loss / total_scalar;
     let base_value_loss = sum_base_value_loss / total_scalar;
@@ -643,6 +692,7 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let base_calibration_loss = sum_base_calibration_loss / total_scalar;
     let policy_regret_loss = sum_policy_regret_loss / total_scalar;
     let base_policy_regret_loss = sum_base_policy_regret_loss / total_scalar;
+    let base_retrieval_loss = sum_base_retrieval_loss / total_scalar;
 
     let raw_policy_loss = sum_raw_policy_loss.map(|sum| sum / total_scalar);
     let raw_value_loss = sum_raw_value_loss.map(|sum| sum / total_scalar);
@@ -691,11 +741,13 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         time_usage_loss,
         aux_loss,
         calibration_loss,
+        retrieval_loss,
         base_policy_loss,
         base_value_loss,
         base_time_usage_loss,
         base_aux_loss,
         base_calibration_loss,
+        base_retrieval_loss,
         policy_output,
         policy_targets,
         value_output,
@@ -724,6 +776,36 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         policy_regret_loss,
         policy_regret_loss_f32: sum_policy_regret_loss_f32 / total_scalar,
         argmax_cp_loss_by_elo,
+        retrieval_loss_f32: sum_retrieval_loss_f32 / total_scalar,
+        retrieval_pair_count: sum_retrieval_pair_count,
+        retrieval_positive_count: sum_retrieval_positive_count,
+        retrieval_positive_sim: if sum_retrieval_positive_count > 0.0 {
+            sum_retrieval_positive_sim_weighted / sum_retrieval_positive_count
+        } else {
+            0.0
+        },
+        retrieval_negative_sim: if sum_retrieval_pair_count > sum_retrieval_positive_count {
+            sum_retrieval_negative_sim_weighted
+                / (sum_retrieval_pair_count - sum_retrieval_positive_count)
+        } else {
+            0.0
+        },
+        trunk_retrieval_loss_f32: sum_trunk_retrieval_loss_f32 / total_scalar,
+        trunk_retrieval_pair_count: sum_trunk_retrieval_pair_count,
+        trunk_retrieval_positive_count: sum_trunk_retrieval_positive_count,
+        trunk_retrieval_positive_sim: if sum_trunk_retrieval_positive_count > 0.0 {
+            sum_trunk_retrieval_positive_sim_weighted / sum_trunk_retrieval_positive_count
+        } else {
+            0.0
+        },
+        trunk_retrieval_negative_sim: if sum_trunk_retrieval_pair_count
+            > sum_trunk_retrieval_positive_count
+        {
+            sum_trunk_retrieval_negative_sim_weighted
+                / (sum_trunk_retrieval_pair_count - sum_trunk_retrieval_positive_count)
+        } else {
+            0.0
+        },
     }
     .detach()
 }
@@ -746,6 +828,7 @@ where
         (GradNormTask::Auxiliary, weights.aux),
         (GradNormTask::Calibration, weights.calibration),
         (GradNormTask::PolicyRegret, weights.policy_regret),
+        (GradNormTask::Retrieval, weights.retrieval),
     ];
 
     for (task, weight) in tasks {
@@ -759,6 +842,9 @@ where
         {
             continue;
         }
+        if matches!(task, GradNormTask::Retrieval) && output.retrieval_pair_count <= 0.0 {
+            continue;
+        }
         let base_loss_tensor = match task {
             GradNormTask::Policy => output.base_policy_loss.clone(),
             GradNormTask::Value => output.base_value_loss.clone(),
@@ -766,6 +852,7 @@ where
             GradNormTask::Auxiliary => output.base_aux_loss.clone(),
             GradNormTask::Calibration => output.base_calibration_loss.clone(),
             GradNormTask::PolicyRegret => output.base_policy_regret_loss.clone(),
+            GradNormTask::Retrieval => output.base_retrieval_loss.clone(),
         };
         let base_loss_value = base_loss_tensor.clone().into_scalar().elem::<f32>();
         // Use base (unweighted) loss for gradient norm measurement.
@@ -1988,6 +2075,7 @@ where
                                 "Loaded GradNorm state from {}",
                                 gradnorm_path.display()
                             );
+                            state.reconcile_with_config(&config);
                             if !config.gradnorm_enabled() {
                                 state.set_enabled(false);
                                 state.reset_weights_to_config(&config);
@@ -2377,7 +2465,9 @@ where
             );
             tracing::info!(
                 "EXIT_CONDITION: lr_min_reached at iteration {} (current_lr={:.2e}, min_lr={:.2e})",
-                loop_iteration, lr_scheduler.get_lr(), config.lr_min
+                loop_iteration,
+                lr_scheduler.get_lr(),
+                config.lr_min
             );
             break;
         }
@@ -2998,6 +3088,136 @@ where
                 let metric_name = format!("argmax_cp_loss_{}", bucket.to_lowercase());
                 metric_logger.log(&metric_name, iteration, cp_loss);
             }
+        }
+
+        if output.retrieval_pair_count > 0.0 {
+            let retrieval_loss = output.retrieval_loss_f32 as f64;
+            let retrieval_pairs = output.retrieval_pair_count as f64;
+            let retrieval_positives = output.retrieval_positive_count as f64;
+            let retrieval_positive_sim = output.retrieval_positive_sim as f64;
+            let retrieval_negative_sim = output.retrieval_negative_sim as f64;
+            let retrieval_gradnorm = gradnorm_snapshot
+                .iter()
+                .find(|status| status.task == GradNormTask::Retrieval);
+
+            renderer.update_train(MetricState::Numeric {
+                name: "Retrieval Loss|BCE".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Retrieval BCE: {retrieval_loss:.4}"),
+                    format!("{retrieval_loss:.4}"),
+                ),
+                value: NumericEntry::Value(retrieval_loss),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Retrieval Loss|Pairs".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Pairs: {retrieval_pairs:.0} (+{retrieval_positives:.0})"),
+                    format!("{retrieval_pairs:.0}"),
+                ),
+                value: NumericEntry::Value(retrieval_pairs),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Retrieval Cosine|Positive".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Positive: {retrieval_positive_sim:.4}"),
+                    format!("{retrieval_positive_sim:.4}"),
+                ),
+                value: NumericEntry::Value(retrieval_positive_sim),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Retrieval Cosine|Negative".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Negative: {retrieval_negative_sim:.4}"),
+                    format!("{retrieval_negative_sim:.4}"),
+                ),
+                value: NumericEntry::Value(retrieval_negative_sim),
+            });
+            if let Some(status) = retrieval_gradnorm {
+                let weight = status.weight as f64;
+                renderer.update_train(MetricState::Numeric {
+                    name: "Retrieval Loss|GradNorm Weight".to_string(),
+                    entry: SerializedEntry::new(
+                        format!("Weight: {weight:.6}"),
+                        format!("{weight:.6}"),
+                    ),
+                    value: NumericEntry::Value(weight),
+                });
+                metric_logger.log("retrieval_gradnorm_weight", iteration, weight);
+                if let Some(grad_norm) = status.last_grad_norm {
+                    metric_logger.log("retrieval_gradnorm_grad", iteration, grad_norm as f64);
+                }
+            }
+
+            metric_logger.log("retrieval_loss", iteration, retrieval_loss);
+            metric_logger.log("retrieval_pair_count", iteration, retrieval_pairs);
+            metric_logger.log("retrieval_positive_count", iteration, retrieval_positives);
+            metric_logger.log("retrieval_positive_sim", iteration, retrieval_positive_sim);
+            metric_logger.log("retrieval_negative_sim", iteration, retrieval_negative_sim);
+        }
+
+        if output.trunk_retrieval_pair_count > 0.0 {
+            let trunk_retrieval_loss = output.trunk_retrieval_loss_f32 as f64;
+            let trunk_retrieval_pairs = output.trunk_retrieval_pair_count as f64;
+            let trunk_retrieval_positives = output.trunk_retrieval_positive_count as f64;
+            let trunk_retrieval_positive_sim = output.trunk_retrieval_positive_sim as f64;
+            let trunk_retrieval_negative_sim = output.trunk_retrieval_negative_sim as f64;
+
+            renderer.update_train(MetricState::Numeric {
+                name: "Trunk Retrieval|BCE".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Trunk BCE: {trunk_retrieval_loss:.4}"),
+                    format!("{trunk_retrieval_loss:.4}"),
+                ),
+                value: NumericEntry::Value(trunk_retrieval_loss),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Trunk Retrieval|Pairs".to_string(),
+                entry: SerializedEntry::new(
+                    format!(
+                        "Trunk pairs: {trunk_retrieval_pairs:.0} (+{trunk_retrieval_positives:.0})"
+                    ),
+                    format!("{trunk_retrieval_pairs:.0}"),
+                ),
+                value: NumericEntry::Value(trunk_retrieval_pairs),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Trunk Retrieval|Positive".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Trunk positive: {trunk_retrieval_positive_sim:.4}"),
+                    format!("{trunk_retrieval_positive_sim:.4}"),
+                ),
+                value: NumericEntry::Value(trunk_retrieval_positive_sim),
+            });
+            renderer.update_train(MetricState::Numeric {
+                name: "Trunk Retrieval|Negative".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Trunk negative: {trunk_retrieval_negative_sim:.4}"),
+                    format!("{trunk_retrieval_negative_sim:.4}"),
+                ),
+                value: NumericEntry::Value(trunk_retrieval_negative_sim),
+            });
+
+            metric_logger.log("trunk_retrieval_loss", iteration, trunk_retrieval_loss);
+            metric_logger.log(
+                "trunk_retrieval_pair_count",
+                iteration,
+                trunk_retrieval_pairs,
+            );
+            metric_logger.log(
+                "trunk_retrieval_positive_count",
+                iteration,
+                trunk_retrieval_positives,
+            );
+            metric_logger.log(
+                "trunk_retrieval_positive_sim",
+                iteration,
+                trunk_retrieval_positive_sim,
+            );
+            metric_logger.log(
+                "trunk_retrieval_negative_sim",
+                iteration,
+                trunk_retrieval_negative_sim,
+            );
         }
 
         let t_top1 = Instant::now();

@@ -19,6 +19,7 @@ pub enum GradNormTask {
     Auxiliary = 3,
     Calibration = 4,
     PolicyRegret = 5,
+    Retrieval = 6,
 }
 
 impl GradNormTask {
@@ -30,6 +31,7 @@ impl GradNormTask {
             GradNormTask::Auxiliary,
             GradNormTask::Calibration,
             GradNormTask::PolicyRegret,
+            GradNormTask::Retrieval,
         ]
         .into_iter()
     }
@@ -42,6 +44,7 @@ impl GradNormTask {
             GradNormTask::Auxiliary => "auxiliary",
             GradNormTask::Calibration => "calibration",
             GradNormTask::PolicyRegret => "policy_regret",
+            GradNormTask::Retrieval => "retrieval",
         }
     }
 }
@@ -150,6 +153,10 @@ impl GradNormState {
                         config.policy_regret_loss_weight(),
                         config.gradnorm_policy_regret_priority(),
                     ),
+                    GradNormTask::Retrieval => (
+                        config.retrieval_loss_weight(),
+                        config.gradnorm_retrieval_priority(),
+                    ),
                 };
                 TaskState::new(task, weight, priority)
             })
@@ -175,6 +182,86 @@ impl GradNormState {
         }
     }
 
+    pub fn reconcile_with_config(&mut self, config: &Config) {
+        for task in GradNormTask::iter() {
+            if self.tasks.iter().any(|state| state.task == task) {
+                continue;
+            }
+            let (weight, priority) = match task {
+                GradNormTask::Policy => {
+                    (config.policy_loss_weight, config.gradnorm_policy_priority())
+                }
+                GradNormTask::Value => (config.value_loss_weight, config.gradnorm_value_priority()),
+                GradNormTask::TimeUsage => (
+                    config.time_usage_loss_weight,
+                    config.gradnorm_time_priority(),
+                ),
+                GradNormTask::Auxiliary => (config.aux_loss_weight, config.gradnorm_aux_priority()),
+                GradNormTask::Calibration => (
+                    config.calibration_loss_weight(),
+                    config.gradnorm_calibration_priority(),
+                ),
+                GradNormTask::PolicyRegret => (
+                    config.policy_regret_loss_weight(),
+                    config.gradnorm_policy_regret_priority(),
+                ),
+                GradNormTask::Retrieval => (
+                    config.retrieval_loss_weight(),
+                    config.gradnorm_retrieval_priority(),
+                ),
+            };
+            self.tasks.push(TaskState::new(task, weight, priority));
+        }
+
+        self.tasks.sort_by_key(|state| state.task as usize);
+        for task_state in &mut self.tasks {
+            let (configured_weight, priority) = match task_state.task {
+                GradNormTask::Policy => {
+                    (config.policy_loss_weight, config.gradnorm_policy_priority())
+                }
+                GradNormTask::Value => (config.value_loss_weight, config.gradnorm_value_priority()),
+                GradNormTask::TimeUsage => (
+                    config.time_usage_loss_weight,
+                    config.gradnorm_time_priority(),
+                ),
+                GradNormTask::Auxiliary => (config.aux_loss_weight, config.gradnorm_aux_priority()),
+                GradNormTask::Calibration => (
+                    config.calibration_loss_weight(),
+                    config.gradnorm_calibration_priority(),
+                ),
+                GradNormTask::PolicyRegret => (
+                    config.policy_regret_loss_weight(),
+                    config.gradnorm_policy_regret_priority(),
+                ),
+                GradNormTask::Retrieval => (
+                    config.retrieval_loss_weight(),
+                    config.gradnorm_retrieval_priority(),
+                ),
+            };
+
+            task_state.priority = priority.max(EPS);
+            if configured_weight <= 0.0 {
+                task_state.weight = 0.0;
+                task_state.initial_weight = 0.0;
+                task_state.enabled = false;
+            } else if task_state.initial_weight <= 0.0 {
+                task_state.weight = configured_weight;
+                task_state.initial_weight = configured_weight;
+                task_state.enabled = true;
+            }
+        }
+        self.reference_total_weight = self
+            .tasks
+            .iter()
+            .filter(|task| task.enabled)
+            .map(|task| task.weight)
+            .sum::<f32>()
+            .max(0.0);
+        self.enabled = config.gradnorm_enabled()
+            && self.tasks.iter().filter(|task| task.enabled).count() > 1
+            && self.reference_total_weight > 0.0;
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -192,6 +279,7 @@ impl GradNormState {
                 GradNormTask::Auxiliary => config.aux_loss_weight,
                 GradNormTask::Calibration => config.calibration_loss_weight(),
                 GradNormTask::PolicyRegret => config.policy_regret_loss_weight(),
+                GradNormTask::Retrieval => config.retrieval_loss_weight(),
             };
             task_state.weight = weight;
             task_state.enabled = weight > 0.0;
@@ -248,6 +336,10 @@ impl GradNormState {
                     &output.base_policy_regret_loss,
                     output.calibration_labeled_fraction > 0.0,
                 ),
+                GradNormTask::Retrieval => (
+                    &output.base_retrieval_loss,
+                    output.retrieval_pair_count > 0.0,
+                ),
             };
 
             let base_loss = if enabled_by_output {
@@ -278,20 +370,22 @@ impl GradNormState {
         let aux_weight = self.weight_for(GradNormTask::Auxiliary);
         let calibration_weight = self.weight_for(GradNormTask::Calibration);
         let policy_regret_weight = self.weight_for(GradNormTask::PolicyRegret);
+        let retrieval_weight = self.weight_for(GradNormTask::Retrieval);
 
         output.policy_loss = output.base_policy_loss.clone() * policy_weight;
         output.value_loss = output.base_value_loss.clone() * value_weight;
         output.time_usage_loss = output.base_time_usage_loss.clone() * time_weight;
         output.aux_loss = output.base_aux_loss.clone() * aux_weight;
         output.calibration_loss = output.base_calibration_loss.clone() * calibration_weight;
-        output.policy_regret_loss =
-            output.base_policy_regret_loss.clone() * policy_regret_weight;
+        output.policy_regret_loss = output.base_policy_regret_loss.clone() * policy_regret_weight;
+        output.retrieval_loss = output.base_retrieval_loss.clone() * retrieval_weight;
         output.loss = output.policy_loss.clone()
             + output.value_loss.clone()
             + output.time_usage_loss.clone()
             + output.aux_loss.clone()
             + output.calibration_loss.clone()
-            + output.policy_regret_loss.clone();
+            + output.policy_regret_loss.clone()
+            + output.retrieval_loss.clone();
     }
 
     pub fn apply_probe_results(

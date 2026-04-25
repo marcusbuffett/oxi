@@ -481,4 +481,3 @@ fn normalize_path(path: &str) -> String {
         .collect::<Vec<_>>()
         .join(".")
 }
-

@@ -297,6 +297,22 @@ pub struct Config {
     #[serde(default = "default_policy_regret_loss_weight")]
     pub policy_regret_loss_weight: f32,
 
+    /// Weight for the retrieval embedding auxiliary loss. When zero, the
+    /// pairwise retrieval metrics are still logged during training, but the
+    /// retrieval loss has no effect on optimization. The embedding inference
+    /// path always returns the retrieval-head projection.
+    #[serde(default)]
+    pub retrieval_loss_weight: f32,
+
+    /// Logit scale for the retrieval pairwise BCE objective.
+    #[serde(default = "default_retrieval_logit_scale")]
+    pub retrieval_logit_scale: f32,
+
+    /// Cosine margin used by the retrieval BCE objective. Positive pairs are
+    /// pushed above this margin, mutually-legal negative pairs below it.
+    #[serde(default = "default_retrieval_margin")]
+    pub retrieval_margin: f32,
+
     /// Priority multiplier applied to calibration GradNorm target
     #[serde(default = "default_gradnorm_calibration_priority")]
     pub gradnorm_calibration_priority: f32,
@@ -304,6 +320,10 @@ pub struct Config {
     /// Priority multiplier applied to policy-regret GradNorm target
     #[serde(default = "default_gradnorm_policy_regret_priority")]
     pub gradnorm_policy_regret_priority: f32,
+
+    /// Priority multiplier applied to retrieval-loss GradNorm target
+    #[serde(default = "default_gradnorm_retrieval_priority")]
+    pub gradnorm_retrieval_priority: f32,
 
     // === VALUE TOWER CONFIGURATION ===
     /// Number of transformer layers in the value tower (separate from trunk)
@@ -379,10 +399,25 @@ fn default_policy_regret_loss_weight() -> f32 {
     // probes because its raw-cp gradient scale dominates.
     0.01
 }
+pub fn default_retrieval_logit_scale_for_serde() -> f32 {
+    10.0
+}
+pub fn default_retrieval_margin_for_serde() -> f32 {
+    0.5
+}
+fn default_retrieval_logit_scale() -> f32 {
+    default_retrieval_logit_scale_for_serde()
+}
+fn default_retrieval_margin() -> f32 {
+    default_retrieval_margin_for_serde()
+}
 fn default_gradnorm_calibration_priority() -> f32 {
     2.0
 }
 fn default_gradnorm_policy_regret_priority() -> f32 {
+    2.0
+}
+fn default_gradnorm_retrieval_priority() -> f32 {
     2.0
 }
 /// Command-line overrides for Config. All fields are optional.
@@ -674,10 +709,22 @@ pub struct ConfigOverrides {
     pub policy_regret_loss_weight: Option<f32>,
 
     #[arg(long)]
+    pub retrieval_loss_weight: Option<f32>,
+
+    #[arg(long)]
+    pub retrieval_logit_scale: Option<f32>,
+
+    #[arg(long)]
+    pub retrieval_margin: Option<f32>,
+
+    #[arg(long)]
     pub gradnorm_calibration_priority: Option<f32>,
 
     #[arg(long)]
     pub gradnorm_policy_regret_priority: Option<f32>,
+
+    #[arg(long)]
+    pub gradnorm_retrieval_priority: Option<f32>,
 
     /// Number of transformer layers in the value tower
     #[arg(long)]
@@ -928,11 +975,23 @@ impl Config {
         if let Some(v) = overrides.policy_regret_loss_weight {
             config.policy_regret_loss_weight = v;
         }
+        if let Some(v) = overrides.retrieval_loss_weight {
+            config.retrieval_loss_weight = v;
+        }
+        if let Some(v) = overrides.retrieval_logit_scale {
+            config.retrieval_logit_scale = v;
+        }
+        if let Some(v) = overrides.retrieval_margin {
+            config.retrieval_margin = v;
+        }
         if let Some(v) = overrides.gradnorm_calibration_priority {
             config.gradnorm_calibration_priority = v;
         }
         if let Some(v) = overrides.gradnorm_policy_regret_priority {
             config.gradnorm_policy_regret_priority = v;
+        }
+        if let Some(v) = overrides.gradnorm_retrieval_priority {
+            config.gradnorm_retrieval_priority = v;
         }
         if let Some(v) = overrides.value_tower_layers {
             config.value_tower_layers = v;
@@ -1068,6 +1127,10 @@ impl Config {
         self.gradnorm_policy_regret_priority.max(0.0)
     }
 
+    pub fn gradnorm_retrieval_priority(&self) -> f32 {
+        self.gradnorm_retrieval_priority.max(0.0)
+    }
+
     pub fn gradnorm_probe_size(&self) -> usize {
         self.gradnorm_probe_size.max(1)
     }
@@ -1140,6 +1203,18 @@ impl Config {
         self.policy_regret_loss_weight.max(0.0)
     }
 
+    pub fn retrieval_loss_weight(&self) -> f32 {
+        self.retrieval_loss_weight.max(0.0)
+    }
+
+    pub fn retrieval_logit_scale(&self) -> f32 {
+        self.retrieval_logit_scale.max(1e-3)
+    }
+
+    pub fn retrieval_margin(&self) -> f32 {
+        self.retrieval_margin.clamp(-1.0, 1.0)
+    }
+
     /// Calculate value example weight based on ply (0 before start, ramps to 1 at full)
     pub fn value_ply_weight(&self, ply: usize) -> f32 {
         if ply < self.value_ply_ramp_start {
@@ -1163,6 +1238,10 @@ pub fn set_global_config(config: Config) -> Result<(), Config> {
 /// Get the global config, falling back to default if not set
 pub fn get_global_config() -> &'static Config {
     GLOBAL_CONFIG.get().unwrap()
+}
+
+pub fn global_config() -> Option<&'static Config> {
+    GLOBAL_CONFIG.get()
 }
 
 impl Default for Config {
@@ -1241,8 +1320,12 @@ impl Default for Config {
             calibration_db_path: None,
             calibration_loss_weight: default_calibration_loss_weight(),
             policy_regret_loss_weight: default_policy_regret_loss_weight(),
+            retrieval_loss_weight: 0.0,
+            retrieval_logit_scale: default_retrieval_logit_scale(),
+            retrieval_margin: default_retrieval_margin(),
             gradnorm_calibration_priority: default_gradnorm_calibration_priority(),
             gradnorm_policy_regret_priority: default_gradnorm_policy_regret_priority(),
+            gradnorm_retrieval_priority: default_gradnorm_retrieval_priority(),
             value_tower_layers: 2,
             value_ply_ramp_start: 10,
             value_ply_ramp_full: 30,

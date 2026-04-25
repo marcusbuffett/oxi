@@ -415,6 +415,12 @@ struct ModelParams {
     pub smolgen_global_dim: usize,
     #[serde(default = "default_smolgen_gen_size")]
     pub smolgen_gen_size: usize,
+    #[serde(default)]
+    pub retrieval_loss_weight: f32,
+    #[serde(default = "oxi::config::default_retrieval_logit_scale_for_serde")]
+    pub retrieval_logit_scale: f32,
+    #[serde(default = "oxi::config::default_retrieval_margin_for_serde")]
+    pub retrieval_margin: f32,
 }
 
 fn default_smolgen_hidden() -> usize {
@@ -447,6 +453,9 @@ fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
         smolgen_hidden: params.smolgen_hidden,
         smolgen_global_dim: params.smolgen_global_dim,
         smolgen_gen_size: params.smolgen_gen_size,
+        retrieval_loss_weight: params.retrieval_loss_weight,
+        retrieval_logit_scale: params.retrieval_logit_scale,
+        retrieval_margin: params.retrieval_margin,
         ..Default::default()
     })
 }

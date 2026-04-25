@@ -67,6 +67,7 @@ pub struct OXIModel<B: Backend> {
     aux_trunk_to_square_hidden: Linear<B>,
     cp_loss_head_hidden: Linear<B>,
     cp_loss_head: Linear<B>,
+    retrieval_head: Linear<B>,
 }
 
 impl<B: Backend> OXIModel<B> {
@@ -198,6 +199,9 @@ impl<B: Backend> OXIModel<B> {
         let cp_loss_head = LinearConfig::new(config.embed_dim(), RegretBin::COUNT)
             .with_initializer(std_init.clone())
             .init(device);
+        let retrieval_head = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
 
         Self {
             embed_proj1,
@@ -237,7 +241,187 @@ impl<B: Backend> OXIModel<B> {
             aux_trunk_to_square_hidden,
             cp_loss_head_hidden,
             cp_loss_head,
+            retrieval_head,
         }
+    }
+
+    fn retrieval_embedding_from_pooled(&self, pooled: Tensor<B, 2>) -> Tensor<B, 2> {
+        let projected = self.retrieval_head.forward(pooled);
+        let norm = projected
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(1)
+            .sqrt()
+            .clamp_min(1e-6);
+        projected / norm
+    }
+
+    fn normalized_mean_pooled_trunk(&self, trunk: Tensor<B, 3>) -> Tensor<B, 2> {
+        let batch_size = trunk.dims()[0];
+        let embed_dim = trunk.dims()[2];
+        let pooled = trunk.mean_dim(1).reshape([batch_size, embed_dim]);
+        let norm = pooled
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(1)
+            .sqrt()
+            .clamp_min(1e-6);
+        pooled / norm
+    }
+
+    fn retrieval_embedding_from_trunk(&self, trunk: Tensor<B, 3>) -> Tensor<B, 2> {
+        let batch_size = trunk.dims()[0];
+        let embed_dim = trunk.dims()[2];
+        let pooled = trunk.mean_dim(1).reshape([batch_size, embed_dim]);
+        self.retrieval_embedding_from_pooled(pooled)
+    }
+
+    #[cfg(feature = "train")]
+    fn compute_retrieval_loss_from_embeddings(
+        &self,
+        embeddings: Tensor<B, 2>,
+        items: &[crate::dataset::ChessItem],
+    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
+    where
+        B::FloatElem: From<f32>,
+    {
+        let batch_size = embeddings.dims()[0];
+        let device = embeddings.device();
+        let zero = || Tensor::<B, 1>::zeros([1], &device);
+        if batch_size < 2 || items.len() != batch_size {
+            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+
+        let target_indices = items
+            .iter()
+            .map(|item| item.move_distribution.iter().position(|p| *p > 0.0))
+            .collect::<Vec<_>>();
+
+        let mut positive_mask_data = vec![0.0f32; batch_size * batch_size];
+        let mut negative_mask_data = vec![0.0f32; batch_size * batch_size];
+        let mut positive_count = 0.0f32;
+        let mut negative_count = 0.0f32;
+
+        for i in 0..batch_size {
+            let Some(query_move) = target_indices[i] else {
+                continue;
+            };
+            for j in 0..batch_size {
+                if i == j {
+                    continue;
+                }
+                let Some(neighbor_move) = target_indices[j] else {
+                    continue;
+                };
+                let query_legal_at_neighbor =
+                    items[j].legal_moves.get(query_move).copied().unwrap_or(0.0) > 0.0;
+                let neighbor_legal_at_query = items[i]
+                    .legal_moves
+                    .get(neighbor_move)
+                    .copied()
+                    .unwrap_or(0.0)
+                    > 0.0;
+                if !query_legal_at_neighbor || !neighbor_legal_at_query {
+                    continue;
+                }
+
+                let offset = i * batch_size + j;
+                if query_move == neighbor_move {
+                    positive_mask_data[offset] = 1.0;
+                    positive_count += 1.0;
+                } else {
+                    negative_mask_data[offset] = 1.0;
+                    negative_count += 1.0;
+                }
+            }
+        }
+
+        let pair_count = positive_count + negative_count;
+        if pair_count <= 0.0 {
+            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+
+        let positive_mask =
+            Tensor::<B, 1>::from_data(TensorData::from(positive_mask_data.as_slice()), &device)
+                .reshape([batch_size, batch_size]);
+        let negative_mask =
+            Tensor::<B, 1>::from_data(TensorData::from(negative_mask_data.as_slice()), &device)
+                .reshape([batch_size, batch_size]);
+
+        let sim = embeddings.clone().matmul(embeddings.transpose());
+        let config = get_global_config();
+        let logits = (sim.clone() - config.retrieval_margin()) * config.retrieval_logit_scale();
+
+        // BCEWithLogits for labels in {0,1}. Logits are bounded by cosine scale,
+        // so the direct softplus form is stable enough and lets us mask pairs.
+        let bce = (logits.clone().exp() + 1.0).log() - logits * positive_mask.clone();
+
+        let positive_loss = (bce.clone() * positive_mask.clone()).sum() / positive_count.max(1.0);
+        let negative_loss = (bce * negative_mask.clone()).sum() / negative_count.max(1.0);
+        let positive_active = if positive_count > 0.0 { 1.0 } else { 0.0 };
+        let negative_active = if negative_count > 0.0 { 1.0 } else { 0.0 };
+        let active_terms: f32 = positive_active + negative_active;
+        let loss = (positive_loss * positive_active + negative_loss * negative_active)
+            / active_terms.max(1.0);
+
+        let positive_sim = if positive_count > 0.0 {
+            ((sim.clone() * positive_mask).sum() / positive_count)
+                .into_scalar()
+                .elem::<f32>()
+        } else {
+            0.0
+        };
+        let negative_sim = if negative_count > 0.0 {
+            ((sim * negative_mask).sum() / negative_count)
+                .into_scalar()
+                .elem::<f32>()
+        } else {
+            0.0
+        };
+        let loss_f32 = loss.clone().into_scalar().elem::<f32>();
+
+        (
+            loss,
+            loss_f32,
+            pair_count,
+            positive_count,
+            positive_sim,
+            negative_sim,
+        )
+    }
+
+    #[cfg(feature = "train")]
+    fn compute_retrieval_loss(
+        &self,
+        trunk_output: Tensor<B, 3>,
+        items: &[crate::dataset::ChessItem],
+    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
+    where
+        B::FloatElem: From<f32>,
+    {
+        let retrieval_z = self.retrieval_embedding_from_trunk(trunk_output);
+        self.compute_retrieval_loss_from_embeddings(retrieval_z, items)
+    }
+
+    #[cfg(feature = "train")]
+    fn compute_trunk_retrieval_metrics(
+        &self,
+        trunk_output: Tensor<B, 3>,
+        items: &[crate::dataset::ChessItem],
+    ) -> (f32, f32, f32, f32, f32)
+    where
+        B::FloatElem: From<f32>,
+    {
+        let trunk_z = self.normalized_mean_pooled_trunk(trunk_output.detach());
+        let (_, loss_f32, pair_count, positive_count, positive_sim, negative_sim) =
+            self.compute_retrieval_loss_from_embeddings(trunk_z, items);
+        (
+            loss_f32,
+            pair_count,
+            positive_count,
+            positive_sim,
+            negative_sim,
+        )
     }
 
     pub fn forward(
@@ -255,9 +439,8 @@ impl<B: Backend> OXIModel<B> {
     /// norm trunk tensor (the per-square embeddings fed into the policy/value
     /// heads). Shape of the trunk is `[batch, 64, embed_dim]`.
     ///
-    /// Intended for viz/analysis only (e.g. the `attention_viz` example). The
-    /// production bot path continues to use `forward_with_attention`, which is
-    /// untouched.
+    /// Used by analysis/bot paths that need attention plus the retrieval
+    /// position embedding.
     pub fn forward_with_attention_and_trunk(
         &self,
         board: Tensor<B, 3>,
@@ -269,8 +452,9 @@ impl<B: Backend> OXIModel<B> {
         Tensor<B, 2>,
         Vec<Tensor<B, 4>>,
         Tensor<B, 3>,
+        Tensor<B, 2>,
     ) {
-        let (policy, value, side_info, time_usage, attn, trunk) =
+        let (policy, value, side_info, time_usage, attn, trunk, embedding) =
             self.forward_with_attention_inner(board, globals, true);
         (
             policy,
@@ -279,6 +463,7 @@ impl<B: Backend> OXIModel<B> {
             time_usage,
             attn,
             trunk.expect("trunk must be present when capture_trunk=true"),
+            embedding.expect("embedding must be present when capture_trunk=true"),
         )
     }
 
@@ -305,7 +490,7 @@ impl<B: Backend> OXIModel<B> {
         Tensor<B, 2>,
         Vec<Tensor<B, 4>>,
     ) {
-        let (policy, value, side_info, time_usage, attn, _trunk) =
+        let (policy, value, side_info, time_usage, attn, _trunk, _embedding) =
             self.forward_with_attention_inner(board, globals, false);
         (policy, value, side_info, time_usage, attn)
     }
@@ -322,6 +507,7 @@ impl<B: Backend> OXIModel<B> {
         Tensor<B, 2>,
         Vec<Tensor<B, 4>>,
         Option<Tensor<B, 3>>,
+        Option<Tensor<B, 2>>,
     ) {
         start_forward_pass();
         let device = board.device();
@@ -393,6 +579,15 @@ impl<B: Backend> OXIModel<B> {
         x = self.norm.forward(x);
         log_tensor_stats("encoder.post_norm", &x);
 
+        let embedding_out = if capture_trunk {
+            let batch_size = x.dims()[0];
+            let embed_dim = x.dims()[2];
+            let pooled = x.clone().mean_dim(1).reshape([batch_size, embed_dim]);
+            Some(self.retrieval_embedding_from_pooled(pooled))
+        } else {
+            None
+        };
+
         let policy_logits = {
             let _stream = StreamScope::enter("policy");
             let _timing = TimingScope::new_with_sync::<B>("policy_head", &device);
@@ -461,6 +656,7 @@ impl<B: Backend> OXIModel<B> {
             time_usage_logits,
             attention_maps,
             trunk_out,
+            embedding_out,
         )
     }
 
@@ -985,6 +1181,22 @@ impl<B: Backend> OXIModel<B> {
         let aux_term = base_aux_loss.clone() * config.aux_loss_weight;
 
         let (
+            base_retrieval_loss,
+            retrieval_loss_f32,
+            retrieval_pair_count_f32,
+            retrieval_positive_count_f32,
+            retrieval_positive_sim_f32,
+            retrieval_negative_sim_f32,
+        ) = self.compute_retrieval_loss(trunk_output.clone(), &batch.items);
+        let (
+            trunk_retrieval_loss_f32,
+            trunk_retrieval_pair_count_f32,
+            trunk_retrieval_positive_count_f32,
+            trunk_retrieval_positive_sim_f32,
+            trunk_retrieval_negative_sim_f32,
+        ) = self.compute_trunk_retrieval_metrics(trunk_output.clone(), &batch.items);
+
+        let (
             base_calibration_loss,
             calibration_head_loss_f32,
             calibration_policy_mae_f32,
@@ -995,9 +1207,7 @@ impl<B: Backend> OXIModel<B> {
             base_policy_regret_loss,
             policy_regret_loss_f32,
             argmax_cp_loss_by_elo,
-        ) = if config.calibration_loss_weight() > 0.0
-            || config.policy_regret_loss_weight() > 0.0
-        {
+        ) = if config.calibration_loss_weight() > 0.0 || config.policy_regret_loss_weight() > 0.0 {
             let calibration_mask = batch.calibration_mask.clone();
             let labeled_count = calibration_mask.clone().sum().into_scalar().elem::<f32>();
             if labeled_count > 0.0 {
@@ -1040,10 +1250,10 @@ impl<B: Backend> OXIModel<B> {
                     .reshape([batch_size]);
 
                 let policy_probs = log_policy.clone().exp().mask_fill(mask.clone(), 0.0);
-                let policy_expected_cp =
-                    (policy_probs.clone() * batch.calibration_move_cp_losses.clone())
-                        .sum_dim(1)
-                        .reshape([batch_size]);
+                let policy_expected_cp = (policy_probs.clone()
+                    * batch.calibration_move_cp_losses.clone())
+                .sum_dim(1)
+                .reshape([batch_size]);
 
                 let target_cp = batch.calibration_target_cp_loss.clone();
                 let mask_sum = calibration_mask.clone().sum().clamp_min(1.0);
@@ -1123,15 +1333,15 @@ impl<B: Backend> OXIModel<B> {
                     .calibration_target_cp_loss
                     .clone()
                     .reshape([batch_size, 1]);
-                let per_move_excess = (batch.calibration_move_cp_losses.clone()
-                    - target_cp_broadcast)
-                    .clamp_min(0.0);
+                let per_move_excess =
+                    (batch.calibration_move_cp_losses.clone() - target_cp_broadcast).clamp_min(0.0);
                 let regret_per_sample = (policy_probs.clone() * per_move_excess)
                     .sum_dim(1)
                     .reshape([batch_size]);
-                let base_policy_regret_loss_tensor =
-                    (regret_per_sample * calibration_mask.clone()).sum().reshape([1])
-                        / mask_sum.clone();
+                let base_policy_regret_loss_tensor = (regret_per_sample * calibration_mask.clone())
+                    .sum()
+                    .reshape([1])
+                    / mask_sum.clone();
                 let policy_regret_loss_f32 = base_policy_regret_loss_tensor
                     .clone()
                     .into_data()
@@ -1158,8 +1368,7 @@ impl<B: Backend> OXIModel<B> {
                     .into_data()
                     .to_vec::<f32>()
                     .unwrap_or_default();
-                let mut argmax_cp_sums =
-                    std::collections::BTreeMap::<String, (f32, usize)>::new();
+                let mut argmax_cp_sums = std::collections::BTreeMap::<String, (f32, usize)>::new();
                 for (idx, item) in batch.items.iter().enumerate() {
                     if calibration_mask_values.get(idx).copied().unwrap_or(0.0) <= 0.0 {
                         continue;
@@ -1269,13 +1478,15 @@ impl<B: Backend> OXIModel<B> {
         let calibration_term = base_calibration_loss.clone() * config.calibration_loss_weight();
         let policy_regret_term =
             base_policy_regret_loss.clone() * config.policy_regret_loss_weight();
+        let retrieval_term = base_retrieval_loss.clone() * config.retrieval_loss_weight();
 
         let loss = config_weighted_policy_loss.clone()
             + value_term.clone()
             + time_usage_term.clone()
             + aux_term.clone()
             + calibration_term.clone()
-            + policy_regret_term.clone();
+            + policy_regret_term.clone()
+            + retrieval_term.clone();
 
         // Accuracy
         let targets = batch.move_distributions.clone().argmax(1).squeeze_dim(1);
@@ -1290,6 +1501,7 @@ impl<B: Backend> OXIModel<B> {
             time_usage_term.clone(),
             aux_term,
             calibration_term.clone(),
+            retrieval_term.clone(),
             policy_logits_flat,
             targets,
             value_logits,
@@ -1334,6 +1546,22 @@ impl<B: Backend> OXIModel<B> {
             policy_regret_term,
             policy_regret_loss_f32,
             argmax_cp_loss_by_elo,
+        )
+        .with_retrieval_metrics(
+            base_retrieval_loss,
+            retrieval_term,
+            retrieval_loss_f32,
+            retrieval_pair_count_f32,
+            retrieval_positive_count_f32,
+            retrieval_positive_sim_f32,
+            retrieval_negative_sim_f32,
+        )
+        .with_trunk_retrieval_metrics(
+            trunk_retrieval_loss_f32,
+            trunk_retrieval_pair_count_f32,
+            trunk_retrieval_positive_count_f32,
+            trunk_retrieval_positive_sim_f32,
+            trunk_retrieval_negative_sim_f32,
         )
     }
 

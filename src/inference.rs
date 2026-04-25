@@ -142,23 +142,23 @@ pub struct OxiPrediction {
     pub time_usage: TimeUsagePrediction,
 }
 
-/// Mean-pooled + per-square trunk embeddings, pulled to CPU.
+/// Retrieval + per-square trunk embeddings, pulled to CPU.
 ///
-/// Captured from the encoder trunk (post-final-RmsNorm, pre policy/value heads)
-/// via the `forward_with_attention_and_trunk` inference path. Used by the
-/// `attention_viz` example to compare positions by embedding cosine similarity.
+/// Captured from the encoder trunk path via `forward_with_attention_and_trunk`.
+/// `embedding` is the trained L2-normalized retrieval projection used for
+/// cosine KNN. `per_square` remains the raw post-final-RmsNorm trunk output for
+/// attention/debug views.
 ///
 /// `per_square` is row-major with shape `[64, embed_dim]`, flat-indexed as
 /// `sq * embed_dim + d`. Square indices follow the ABSOLUTE board frame
 /// (a1 = 0 .. h8 = 63). For black-to-move positions the model internally
 /// mirrors the board vertically; the batched inference path un-flips the
 /// per-square embeddings via `model_sq ^ 56` before handing them back so
-/// callers don't need to know about the mirror. `mean_pooled` is invariant
-/// to the mirror (mean over all 64 squares).
+/// callers don't need to know about the mirror.
 #[derive(Debug, Clone)]
 pub struct EmbeddingOutput {
-    /// Mean-pooled position embedding, shape `[embed_dim]`.
-    pub mean_pooled: Vec<f32>,
+    /// Retrieval position embedding, shape `[embed_dim]`.
+    pub embedding: Vec<f32>,
     /// Per-square embeddings in absolute frame, shape `[64, embed_dim]` flattened
     /// row-major. `per_square[sq * embed_dim + d]`.
     pub per_square: Vec<f32>,
@@ -708,16 +708,16 @@ where
     /// Batched prediction that also captures per-layer post-softmax attention
     /// weights AND the trunk-level per-square embeddings.
     ///
-    /// Intended for viz/analysis only (e.g. `examples/attention_viz.rs`). The
-    /// production bot path uses `predict_with_attention_batch`, which this
-    /// method does NOT replace — it simply adds the embedding output.
+    /// Used by viz/analysis and the bot `/predict` path when embedding output is
+    /// requested. This keeps the attention response shape while adding the
+    /// retrieval embedding output.
     ///
     /// Returns one `(OxiPrediction, Vec<AttentionLayer>, EmbeddingOutput)`
     /// per input item, matching `items` order. The embedding is returned in
     /// the ABSOLUTE board frame: for black-to-move items, the per-square
     /// dimension is un-flipped via `sq ^ 56` so cross-position comparisons
-    /// are frame-consistent. `mean_pooled` is invariant to the mirror so it
-    /// needs no adjustment.
+    /// are frame-consistent. The retrieval embedding is position-level and
+    /// needs no square-frame adjustment.
     pub fn predict_with_attention_and_embedding_batch(
         &self,
         items: &[BatchItem],
@@ -739,6 +739,7 @@ where
             time_usage_logits,
             attn_maps,
             trunk,
+            retrieval_embedding,
         ) = self
             .model
             .forward_with_attention_and_trunk(batched_board, batched_globals);
@@ -769,6 +770,15 @@ where
             .to_vec::<f32>()
             .map_err(|e| anyhow::anyhow!("Failed to convert trunk tensor to f32: {:?}", e))?;
         debug_assert_eq!(trunk_flat.len(), n * 64 * embed_dim);
+
+        let embedding_dims = retrieval_embedding.dims();
+        debug_assert_eq!(embedding_dims[0], n);
+        let output_embed_dim = embedding_dims[1];
+        let embedding_flat = retrieval_embedding
+            .to_data()
+            .to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("Failed to convert embedding tensor to f32: {:?}", e))?;
+        debug_assert_eq!(embedding_flat.len(), n * output_embed_dim);
 
         let predictions = self.finalize_batched_predictions(
             items,
@@ -813,25 +823,16 @@ where
                 per_square.copy_from_slice(model_frame);
             }
 
-            // Mean-pool across 64 squares (invariant to permutation).
-            let mut mean_pooled = vec![0.0f32; embed_dim];
-            for sq in 0..64usize {
-                let off = sq * embed_dim;
-                for d in 0..embed_dim {
-                    mean_pooled[d] += per_square[off + d];
-                }
-            }
-            for d in 0..embed_dim {
-                mean_pooled[d] /= 64.0;
-            }
+            let emb_start = i * output_embed_dim;
+            let embedding = embedding_flat[emb_start..emb_start + output_embed_dim].to_vec();
 
             out.push((
                 prediction,
                 attention_layers,
                 EmbeddingOutput {
-                    mean_pooled,
+                    embedding,
                     per_square,
-                    embed_dim,
+                    embed_dim: output_embed_dim,
                 },
             ));
         }
