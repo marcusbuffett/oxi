@@ -1,6 +1,8 @@
 use crate::calibration::calibration_skill_band_label;
 use crate::calibration::RegretBin;
-use crate::config::{ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
+use crate::config::{
+    ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS, RETRIEVAL_OBJECTIVE_POLICY_OVERLAP,
+};
 use crate::distribution_utils::beta_log_pdf;
 use crate::factorized_policy::FactorizedPolicyHead;
 use crate::relative_position_transformer::TransformerBlock;
@@ -277,7 +279,7 @@ impl<B: Backend> OXIModel<B> {
     }
 
     #[cfg(feature = "train")]
-    fn compute_retrieval_loss_from_embeddings(
+    fn compute_same_move_retrieval_loss_from_embeddings(
         &self,
         embeddings: Tensor<B, 2>,
         items: &[crate::dataset::ChessItem],
@@ -391,16 +393,115 @@ impl<B: Backend> OXIModel<B> {
     }
 
     #[cfg(feature = "train")]
+    fn off_diagonal_mask(&self, batch_size: usize, device: &B::Device) -> (Tensor<B, 2>, f32) {
+        let mut mask_data = vec![1.0f32; batch_size * batch_size];
+        for i in 0..batch_size {
+            mask_data[i * batch_size + i] = 0.0;
+        }
+        let mask = Tensor::<B, 1>::from_data(TensorData::from(mask_data.as_slice()), device)
+            .reshape([batch_size, batch_size]);
+        (mask, (batch_size * batch_size - batch_size) as f32)
+    }
+
+    #[cfg(feature = "train")]
+    fn compute_policy_overlap_retrieval_loss_from_embeddings(
+        &self,
+        embeddings: Tensor<B, 2>,
+        policy_probs: Tensor<B, 2>,
+    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
+    where
+        B::FloatElem: From<f32>,
+    {
+        let batch_size = embeddings.dims()[0];
+        let device = embeddings.device();
+        let zero = || Tensor::<B, 1>::zeros([1], &device);
+        if batch_size < 2 || policy_probs.dims()[0] != batch_size {
+            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+
+        let (pair_mask, pair_count) = self.off_diagonal_mask(batch_size, &device);
+        let probs_i = policy_probs.clone().detach().unsqueeze_dim::<3>(1);
+        let probs_j = policy_probs.detach().unsqueeze_dim::<3>(0);
+        let target = probs_i
+            .min_pair(probs_j)
+            .sum_dim(2)
+            .reshape([batch_size, batch_size])
+            .detach();
+
+        let sim = embeddings.clone().matmul(embeddings.transpose());
+        let diff = sim.clone() - target.clone();
+        let loss = (diff.powf_scalar(2.0) * pair_mask.clone()).sum() / pair_count;
+
+        let config = get_global_config();
+        let positive_mask = target
+            .greater_elem(config.retrieval_policy_positive_threshold())
+            .float()
+            * pair_mask.clone();
+        let positive_count = positive_mask.clone().sum().into_scalar().elem::<f32>();
+        let negative_mask = pair_mask - positive_mask.clone();
+        let negative_count = (pair_count - positive_count).max(0.0);
+
+        let positive_sim = if positive_count > 0.0 {
+            ((sim.clone() * positive_mask).sum() / positive_count)
+                .into_scalar()
+                .elem::<f32>()
+        } else {
+            0.0
+        };
+        let negative_sim = if negative_count > 0.0 {
+            ((sim * negative_mask).sum() / negative_count)
+                .into_scalar()
+                .elem::<f32>()
+        } else {
+            0.0
+        };
+        let loss_f32 = loss.clone().into_scalar().elem::<f32>();
+
+        (
+            loss,
+            loss_f32,
+            pair_count,
+            positive_count,
+            positive_sim,
+            negative_sim,
+        )
+    }
+
+    #[cfg(feature = "train")]
+    fn compute_retrieval_loss_from_embeddings(
+        &self,
+        embeddings: Tensor<B, 2>,
+        items: &[crate::dataset::ChessItem],
+        policy_probs: Option<Tensor<B, 2>>,
+    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
+    where
+        B::FloatElem: From<f32>,
+    {
+        let config = get_global_config();
+        if config.retrieval_objective() == RETRIEVAL_OBJECTIVE_POLICY_OVERLAP {
+            if let Some(policy_probs) = policy_probs {
+                return self.compute_policy_overlap_retrieval_loss_from_embeddings(
+                    embeddings,
+                    policy_probs,
+                );
+            }
+        }
+
+        self.compute_same_move_retrieval_loss_from_embeddings(embeddings, items)
+    }
+
+    #[cfg(feature = "train")]
     fn compute_retrieval_loss(
         &self,
         trunk_output: Tensor<B, 3>,
         items: &[crate::dataset::ChessItem],
+        policy_probs: Option<Tensor<B, 2>>,
     ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
     where
         B::FloatElem: From<f32>,
     {
         let retrieval_z = self.retrieval_embedding_from_trunk(trunk_output);
-        self.compute_retrieval_loss_from_embeddings(retrieval_z, items)
+        self.compute_retrieval_loss_from_embeddings(retrieval_z, items, policy_probs)
     }
 
     #[cfg(feature = "train")]
@@ -408,13 +509,14 @@ impl<B: Backend> OXIModel<B> {
         &self,
         trunk_output: Tensor<B, 3>,
         items: &[crate::dataset::ChessItem],
+        policy_probs: Option<Tensor<B, 2>>,
     ) -> (f32, f32, f32, f32, f32)
     where
         B::FloatElem: From<f32>,
     {
         let trunk_z = self.normalized_mean_pooled_trunk(trunk_output.detach());
         let (_, loss_f32, pair_count, positive_count, positive_sim, negative_sim) =
-            self.compute_retrieval_loss_from_embeddings(trunk_z, items);
+            self.compute_retrieval_loss_from_embeddings(trunk_z, items, policy_probs);
         (
             loss_f32,
             pair_count,
@@ -1180,6 +1282,19 @@ impl<B: Backend> OXIModel<B> {
         let base_aux_loss = base_aux_loss + maia_loss;
         let aux_term = base_aux_loss.clone() * config.aux_loss_weight;
 
+        let retrieval_policy_probs = if config.retrieval_uses_policy_overlap() {
+            let temperature = config.retrieval_policy_temperature();
+            let logits = policy_logits_flat.clone() / temperature;
+            let probs = log_softmax(logits, 1)
+                .mask_fill(mask.clone(), 0.0)
+                .exp()
+                .mask_fill(mask.clone(), 0.0)
+                .detach();
+            Some(probs)
+        } else {
+            None
+        };
+
         let (
             base_retrieval_loss,
             retrieval_loss_f32,
@@ -1187,14 +1302,22 @@ impl<B: Backend> OXIModel<B> {
             retrieval_positive_count_f32,
             retrieval_positive_sim_f32,
             retrieval_negative_sim_f32,
-        ) = self.compute_retrieval_loss(trunk_output.clone(), &batch.items);
+        ) = self.compute_retrieval_loss(
+            trunk_output.clone(),
+            &batch.items,
+            retrieval_policy_probs.clone(),
+        );
         let (
             trunk_retrieval_loss_f32,
             trunk_retrieval_pair_count_f32,
             trunk_retrieval_positive_count_f32,
             trunk_retrieval_positive_sim_f32,
             trunk_retrieval_negative_sim_f32,
-        ) = self.compute_trunk_retrieval_metrics(trunk_output.clone(), &batch.items);
+        ) = self.compute_trunk_retrieval_metrics(
+            trunk_output.clone(),
+            &batch.items,
+            retrieval_policy_probs,
+        );
 
         let (
             base_calibration_loss,

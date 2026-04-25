@@ -417,10 +417,16 @@ struct ModelParams {
     pub smolgen_gen_size: usize,
     #[serde(default)]
     pub retrieval_loss_weight: f32,
+    #[serde(default = "default_retrieval_objective")]
+    pub retrieval_objective: String,
     #[serde(default = "oxi::config::default_retrieval_logit_scale_for_serde")]
     pub retrieval_logit_scale: f32,
     #[serde(default = "oxi::config::default_retrieval_margin_for_serde")]
     pub retrieval_margin: f32,
+    #[serde(default = "default_retrieval_policy_temperature")]
+    pub retrieval_policy_temperature: f32,
+    #[serde(default = "default_retrieval_policy_positive_threshold")]
+    pub retrieval_policy_positive_threshold: f32,
 }
 
 fn default_smolgen_hidden() -> usize {
@@ -431,6 +437,15 @@ fn default_smolgen_global_dim() -> usize {
 }
 fn default_smolgen_gen_size() -> usize {
     128
+}
+fn default_retrieval_objective() -> String {
+    oxi::config::RETRIEVAL_OBJECTIVE_SAME_MOVE.to_string()
+}
+fn default_retrieval_policy_temperature() -> f32 {
+    0.5
+}
+fn default_retrieval_policy_positive_threshold() -> f32 {
+    0.25
 }
 
 /// Load a Config from a model directory's params.json file.
@@ -454,8 +469,11 @@ fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
         smolgen_global_dim: params.smolgen_global_dim,
         smolgen_gen_size: params.smolgen_gen_size,
         retrieval_loss_weight: params.retrieval_loss_weight,
+        retrieval_objective: params.retrieval_objective,
         retrieval_logit_scale: params.retrieval_logit_scale,
         retrieval_margin: params.retrieval_margin,
+        retrieval_policy_temperature: params.retrieval_policy_temperature,
+        retrieval_policy_positive_threshold: params.retrieval_policy_positive_threshold,
         ..Default::default()
     })
 }

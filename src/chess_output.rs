@@ -85,23 +85,23 @@ pub struct ChessOutput<B: Backend> {
     pub retrieval_loss: Tensor<B, 1>,
     /// Scalar snapshot of the unweighted retrieval loss.
     pub retrieval_loss_f32: f32,
-    /// Number of mutually-legal in-batch pairs used by the retrieval loss.
+    /// Number of in-batch pairs used by the retrieval loss.
     pub retrieval_pair_count: f32,
-    /// Number of positive pairs among the mutually-legal in-batch pairs.
+    /// Number of positive/high-target pairs among the in-batch pairs.
     pub retrieval_positive_count: f32,
-    /// Mean cosine similarity of positive retrieval pairs.
+    /// Mean cosine similarity of positive/high-target retrieval pairs.
     pub retrieval_positive_sim: f32,
-    /// Mean cosine similarity of negative retrieval pairs.
+    /// Mean cosine similarity of negative/low-target retrieval pairs.
     pub retrieval_negative_sim: f32,
-    /// Scalar snapshot of retrieval BCE measured directly on normalized mean-pooled trunk.
+    /// Scalar snapshot of retrieval loss measured directly on normalized mean-pooled trunk.
     pub trunk_retrieval_loss_f32: f32,
-    /// Number of mutually-legal in-batch pairs used by trunk retrieval metrics.
+    /// Number of in-batch pairs used by trunk retrieval metrics.
     pub trunk_retrieval_pair_count: f32,
-    /// Number of positive pairs among trunk retrieval metrics.
+    /// Number of positive/high-target pairs among trunk retrieval metrics.
     pub trunk_retrieval_positive_count: f32,
-    /// Mean cosine similarity of positive pairs on normalized mean-pooled trunk.
+    /// Mean cosine similarity of positive/high-target pairs on normalized mean-pooled trunk.
     pub trunk_retrieval_positive_sim: f32,
-    /// Mean cosine similarity of negative pairs on normalized mean-pooled trunk.
+    /// Mean cosine similarity of negative/low-target pairs on normalized mean-pooled trunk.
     pub trunk_retrieval_negative_sim: f32,
 }
 

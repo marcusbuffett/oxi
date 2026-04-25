@@ -3091,19 +3091,25 @@ where
         }
 
         if output.retrieval_pair_count > 0.0 {
+            let retrieval_loss_kind = if config.retrieval_uses_policy_overlap() {
+                "MSE"
+            } else {
+                "BCE"
+            };
             let retrieval_loss = output.retrieval_loss_f32 as f64;
             let retrieval_pairs = output.retrieval_pair_count as f64;
             let retrieval_positives = output.retrieval_positive_count as f64;
             let retrieval_positive_sim = output.retrieval_positive_sim as f64;
             let retrieval_negative_sim = output.retrieval_negative_sim as f64;
+            let retrieval_sim_gap = retrieval_positive_sim - retrieval_negative_sim;
             let retrieval_gradnorm = gradnorm_snapshot
                 .iter()
                 .find(|status| status.task == GradNormTask::Retrieval);
 
             renderer.update_train(MetricState::Numeric {
-                name: "Retrieval Loss|BCE".to_string(),
+                name: format!("Retrieval Loss|{retrieval_loss_kind}"),
                 entry: SerializedEntry::new(
-                    format!("Retrieval BCE: {retrieval_loss:.4}"),
+                    format!("Retrieval {retrieval_loss_kind}: {retrieval_loss:.4}"),
                     format!("{retrieval_loss:.4}"),
                 ),
                 value: NumericEntry::Value(retrieval_loss),
@@ -3132,6 +3138,14 @@ where
                 ),
                 value: NumericEntry::Value(retrieval_negative_sim),
             });
+            renderer.update_train(MetricState::Numeric {
+                name: "Retrieval Cosine|Gap".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Gap: {retrieval_sim_gap:.4}"),
+                    format!("{retrieval_sim_gap:.4}"),
+                ),
+                value: NumericEntry::Value(retrieval_sim_gap),
+            });
             if let Some(status) = retrieval_gradnorm {
                 let weight = status.weight as f64;
                 renderer.update_train(MetricState::Numeric {
@@ -3153,19 +3167,27 @@ where
             metric_logger.log("retrieval_positive_count", iteration, retrieval_positives);
             metric_logger.log("retrieval_positive_sim", iteration, retrieval_positive_sim);
             metric_logger.log("retrieval_negative_sim", iteration, retrieval_negative_sim);
+            metric_logger.log("retrieval_sim_gap", iteration, retrieval_sim_gap);
         }
 
         if output.trunk_retrieval_pair_count > 0.0 {
+            let retrieval_loss_kind = if config.retrieval_uses_policy_overlap() {
+                "MSE"
+            } else {
+                "BCE"
+            };
             let trunk_retrieval_loss = output.trunk_retrieval_loss_f32 as f64;
             let trunk_retrieval_pairs = output.trunk_retrieval_pair_count as f64;
             let trunk_retrieval_positives = output.trunk_retrieval_positive_count as f64;
             let trunk_retrieval_positive_sim = output.trunk_retrieval_positive_sim as f64;
             let trunk_retrieval_negative_sim = output.trunk_retrieval_negative_sim as f64;
+            let trunk_retrieval_sim_gap =
+                trunk_retrieval_positive_sim - trunk_retrieval_negative_sim;
 
             renderer.update_train(MetricState::Numeric {
-                name: "Trunk Retrieval|BCE".to_string(),
+                name: format!("Trunk Retrieval|{retrieval_loss_kind}"),
                 entry: SerializedEntry::new(
-                    format!("Trunk BCE: {trunk_retrieval_loss:.4}"),
+                    format!("Trunk {retrieval_loss_kind}: {trunk_retrieval_loss:.4}"),
                     format!("{trunk_retrieval_loss:.4}"),
                 ),
                 value: NumericEntry::Value(trunk_retrieval_loss),
@@ -3196,6 +3218,14 @@ where
                 ),
                 value: NumericEntry::Value(trunk_retrieval_negative_sim),
             });
+            renderer.update_train(MetricState::Numeric {
+                name: "Trunk Retrieval|Gap".to_string(),
+                entry: SerializedEntry::new(
+                    format!("Trunk gap: {trunk_retrieval_sim_gap:.4}"),
+                    format!("{trunk_retrieval_sim_gap:.4}"),
+                ),
+                value: NumericEntry::Value(trunk_retrieval_sim_gap),
+            });
 
             metric_logger.log("trunk_retrieval_loss", iteration, trunk_retrieval_loss);
             metric_logger.log(
@@ -3217,6 +3247,11 @@ where
                 "trunk_retrieval_negative_sim",
                 iteration,
                 trunk_retrieval_negative_sim,
+            );
+            metric_logger.log(
+                "trunk_retrieval_sim_gap",
+                iteration,
+                trunk_retrieval_sim_gap,
             );
         }
 

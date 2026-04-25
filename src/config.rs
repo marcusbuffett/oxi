@@ -35,6 +35,9 @@ pub const FEATURES_PER_TOKEN: usize = BOARD_FEATURES_PER_TOKEN + RECENCY_FEATURE
 pub const PREVIOUS_POSITIONS: usize = 5; // Used for decay horizon only
 pub const HISTORY_DECAY: f32 = 0.8; // Exponential decay factor for historical positions
 
+pub const RETRIEVAL_OBJECTIVE_SAME_MOVE: &str = "same_move";
+pub const RETRIEVAL_OBJECTIVE_POLICY_OVERLAP: &str = "policy_overlap";
+
 // Global config storage
 static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 
@@ -304,6 +307,12 @@ pub struct Config {
     #[serde(default)]
     pub retrieval_loss_weight: f32,
 
+    /// Retrieval target geometry. `same_move` uses the observed move label;
+    /// `policy_overlap` regresses cosine similarity to detached policy mass
+    /// overlap between positions.
+    #[serde(default = "default_retrieval_objective")]
+    pub retrieval_objective: String,
+
     /// Logit scale for the retrieval pairwise BCE objective.
     #[serde(default = "default_retrieval_logit_scale")]
     pub retrieval_logit_scale: f32,
@@ -312,6 +321,16 @@ pub struct Config {
     /// pushed above this margin, mutually-legal negative pairs below it.
     #[serde(default = "default_retrieval_margin")]
     pub retrieval_margin: f32,
+
+    /// Temperature for the detached policy distribution used by
+    /// `policy_overlap`; values below 1 sharpen the candidate-move set.
+    #[serde(default = "default_retrieval_policy_temperature")]
+    pub retrieval_policy_temperature: f32,
+
+    /// Monitoring threshold for policy-overlap retrieval metrics. Pairs with
+    /// policy overlap at or above this value are reported as "positive".
+    #[serde(default = "default_retrieval_policy_positive_threshold")]
+    pub retrieval_policy_positive_threshold: f32,
 
     /// Priority multiplier applied to calibration GradNorm target
     #[serde(default = "default_gradnorm_calibration_priority")]
@@ -405,11 +424,20 @@ pub fn default_retrieval_logit_scale_for_serde() -> f32 {
 pub fn default_retrieval_margin_for_serde() -> f32 {
     0.5
 }
+fn default_retrieval_objective() -> String {
+    RETRIEVAL_OBJECTIVE_SAME_MOVE.to_string()
+}
 fn default_retrieval_logit_scale() -> f32 {
     default_retrieval_logit_scale_for_serde()
 }
 fn default_retrieval_margin() -> f32 {
     default_retrieval_margin_for_serde()
+}
+fn default_retrieval_policy_temperature() -> f32 {
+    0.5
+}
+fn default_retrieval_policy_positive_threshold() -> f32 {
+    0.25
 }
 fn default_gradnorm_calibration_priority() -> f32 {
     2.0
@@ -712,10 +740,19 @@ pub struct ConfigOverrides {
     pub retrieval_loss_weight: Option<f32>,
 
     #[arg(long)]
+    pub retrieval_objective: Option<String>,
+
+    #[arg(long)]
     pub retrieval_logit_scale: Option<f32>,
 
     #[arg(long)]
     pub retrieval_margin: Option<f32>,
+
+    #[arg(long)]
+    pub retrieval_policy_temperature: Option<f32>,
+
+    #[arg(long)]
+    pub retrieval_policy_positive_threshold: Option<f32>,
 
     #[arg(long)]
     pub gradnorm_calibration_priority: Option<f32>,
@@ -978,11 +1015,20 @@ impl Config {
         if let Some(v) = overrides.retrieval_loss_weight {
             config.retrieval_loss_weight = v;
         }
+        if let Some(v) = overrides.retrieval_objective {
+            config.retrieval_objective = v;
+        }
         if let Some(v) = overrides.retrieval_logit_scale {
             config.retrieval_logit_scale = v;
         }
         if let Some(v) = overrides.retrieval_margin {
             config.retrieval_margin = v;
+        }
+        if let Some(v) = overrides.retrieval_policy_temperature {
+            config.retrieval_policy_temperature = v;
+        }
+        if let Some(v) = overrides.retrieval_policy_positive_threshold {
+            config.retrieval_policy_positive_threshold = v;
         }
         if let Some(v) = overrides.gradnorm_calibration_priority {
             config.gradnorm_calibration_priority = v;
@@ -1207,12 +1253,31 @@ impl Config {
         self.retrieval_loss_weight.max(0.0)
     }
 
+    pub fn retrieval_objective(&self) -> &str {
+        match self.retrieval_objective.as_str() {
+            RETRIEVAL_OBJECTIVE_POLICY_OVERLAP => RETRIEVAL_OBJECTIVE_POLICY_OVERLAP,
+            _ => RETRIEVAL_OBJECTIVE_SAME_MOVE,
+        }
+    }
+
+    pub fn retrieval_uses_policy_overlap(&self) -> bool {
+        self.retrieval_objective() == RETRIEVAL_OBJECTIVE_POLICY_OVERLAP
+    }
+
     pub fn retrieval_logit_scale(&self) -> f32 {
         self.retrieval_logit_scale.max(1e-3)
     }
 
     pub fn retrieval_margin(&self) -> f32 {
         self.retrieval_margin.clamp(-1.0, 1.0)
+    }
+
+    pub fn retrieval_policy_temperature(&self) -> f32 {
+        self.retrieval_policy_temperature.max(1e-3)
+    }
+
+    pub fn retrieval_policy_positive_threshold(&self) -> f32 {
+        self.retrieval_policy_positive_threshold.clamp(0.0, 1.0)
     }
 
     /// Calculate value example weight based on ply (0 before start, ramps to 1 at full)
@@ -1321,8 +1386,11 @@ impl Default for Config {
             calibration_loss_weight: default_calibration_loss_weight(),
             policy_regret_loss_weight: default_policy_regret_loss_weight(),
             retrieval_loss_weight: 0.0,
+            retrieval_objective: default_retrieval_objective(),
             retrieval_logit_scale: default_retrieval_logit_scale(),
             retrieval_margin: default_retrieval_margin(),
+            retrieval_policy_temperature: default_retrieval_policy_temperature(),
+            retrieval_policy_positive_threshold: default_retrieval_policy_positive_threshold(),
             gradnorm_calibration_priority: default_gradnorm_calibration_priority(),
             gradnorm_policy_regret_priority: default_gradnorm_policy_regret_priority(),
             gradnorm_retrieval_priority: default_gradnorm_retrieval_priority(),
