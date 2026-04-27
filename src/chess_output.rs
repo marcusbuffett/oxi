@@ -93,6 +93,12 @@ pub struct ChessOutput<B: Backend> {
     pub retrieval_positive_sim: f32,
     /// Mean cosine similarity of negative/low-target retrieval pairs.
     pub retrieval_negative_sim: f32,
+    /// Share of top retrieval neighbors with the same ECO-derived opening family.
+    pub retrieval_opening_family_match_rate: f32,
+    /// Number of labeled top-neighbor pairs used by the opening-family proxy.
+    pub retrieval_opening_family_pair_count: f32,
+    /// Fraction of batch positions that resolved to an ECO opening family.
+    pub retrieval_opening_family_coverage: f32,
     /// Scalar snapshot of retrieval loss measured directly on normalized mean-pooled trunk.
     pub trunk_retrieval_loss_f32: f32,
     /// Number of in-batch pairs used by trunk retrieval metrics.
@@ -178,6 +184,9 @@ impl<B: Backend> ChessOutput<B> {
             retrieval_positive_count: 0.0,
             retrieval_positive_sim: 0.0,
             retrieval_negative_sim: 0.0,
+            retrieval_opening_family_match_rate: 0.0,
+            retrieval_opening_family_pair_count: 0.0,
+            retrieval_opening_family_coverage: 0.0,
             trunk_retrieval_loss_f32: 0.0,
             trunk_retrieval_pair_count: 0.0,
             trunk_retrieval_positive_count: 0.0,
@@ -304,6 +313,9 @@ impl<B: Backend> ChessOutput<B> {
         retrieval_positive_count: f32,
         retrieval_positive_sim: f32,
         retrieval_negative_sim: f32,
+        retrieval_opening_family_match_rate: f32,
+        retrieval_opening_family_pair_count: f32,
+        retrieval_opening_family_coverage: f32,
     ) -> Self {
         self.base_retrieval_loss = base_retrieval_loss;
         self.retrieval_loss = retrieval_loss;
@@ -312,6 +324,9 @@ impl<B: Backend> ChessOutput<B> {
         self.retrieval_positive_count = retrieval_positive_count;
         self.retrieval_positive_sim = retrieval_positive_sim;
         self.retrieval_negative_sim = retrieval_negative_sim;
+        self.retrieval_opening_family_match_rate = retrieval_opening_family_match_rate;
+        self.retrieval_opening_family_pair_count = retrieval_opening_family_pair_count;
+        self.retrieval_opening_family_coverage = retrieval_opening_family_coverage;
         self
     }
 
@@ -402,6 +417,9 @@ impl<B: Backend> ChessOutput<B> {
             retrieval_positive_count: self.retrieval_positive_count,
             retrieval_positive_sim: self.retrieval_positive_sim,
             retrieval_negative_sim: self.retrieval_negative_sim,
+            retrieval_opening_family_match_rate: self.retrieval_opening_family_match_rate,
+            retrieval_opening_family_pair_count: self.retrieval_opening_family_pair_count,
+            retrieval_opening_family_coverage: self.retrieval_opening_family_coverage,
             trunk_retrieval_loss_f32: self.trunk_retrieval_loss_f32,
             trunk_retrieval_pair_count: self.trunk_retrieval_pair_count,
             trunk_retrieval_positive_count: self.trunk_retrieval_positive_count,
@@ -511,6 +529,9 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
         let retrieval_positive_count = self.retrieval_positive_count;
         let retrieval_positive_sim = self.retrieval_positive_sim;
         let retrieval_negative_sim = self.retrieval_negative_sim;
+        let retrieval_opening_family_match_rate = self.retrieval_opening_family_match_rate;
+        let retrieval_opening_family_pair_count = self.retrieval_opening_family_pair_count;
+        let retrieval_opening_family_coverage = self.retrieval_opening_family_coverage;
         let trunk_retrieval_loss_f32 = self.trunk_retrieval_loss_f32;
         let trunk_retrieval_pair_count = self.trunk_retrieval_pair_count;
         let trunk_retrieval_positive_count = self.trunk_retrieval_positive_count;
@@ -617,6 +638,9 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             retrieval_positive_count,
             retrieval_positive_sim,
             retrieval_negative_sim,
+            retrieval_opening_family_match_rate,
+            retrieval_opening_family_pair_count,
+            retrieval_opening_family_coverage,
             trunk_retrieval_loss_f32,
             trunk_retrieval_pair_count,
             trunk_retrieval_positive_count,

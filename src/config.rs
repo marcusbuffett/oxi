@@ -37,6 +37,8 @@ pub const HISTORY_DECAY: f32 = 0.8; // Exponential decay factor for historical p
 
 pub const RETRIEVAL_OBJECTIVE_SAME_MOVE: &str = "same_move";
 pub const RETRIEVAL_OBJECTIVE_POLICY_OVERLAP: &str = "policy_overlap";
+pub const RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC: &str = "structural_semantic";
+pub const RETRIEVAL_OBJECTIVE_MIXED_GAME: &str = "mixed_game";
 
 // Global config storage
 static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
@@ -307,9 +309,13 @@ pub struct Config {
     #[serde(default)]
     pub retrieval_loss_weight: f32,
 
-    /// Retrieval target geometry. `same_move` uses the observed move label;
-    /// `policy_overlap` regresses cosine similarity to detached policy mass
-    /// overlap between positions.
+    /// Retrieval target geometry. `mixed_game` regresses cosine similarity to a
+    /// weighted blend of detached trunk semantics, optional debiased
+    /// policy-distribution overlap, and future-continuation overlap,
+    /// optionally gated by handcrafted structure. `structural_semantic` uses
+    /// only trunk semantics plus structure; `same_move` uses the observed move
+    /// label; `policy_overlap` uses detached policy mass overlap plus
+    /// structure.
     #[serde(default = "default_retrieval_objective")]
     pub retrieval_objective: String,
 
@@ -327,10 +333,31 @@ pub struct Config {
     #[serde(default = "default_retrieval_policy_temperature")]
     pub retrieval_policy_temperature: f32,
 
-    /// Monitoring threshold for policy-overlap retrieval metrics. Pairs with
-    /// policy overlap at or above this value are reported as "positive".
+    /// Monitoring threshold for MSE-style retrieval metrics. Pairs with
+    /// policy-overlap or structural-semantic targets at or above this value
+    /// are reported as "positive".
     #[serde(default = "default_retrieval_policy_positive_threshold")]
     pub retrieval_policy_positive_threshold: f32,
+
+    /// Mixed-game retrieval target weights. They are normalized by their sum
+    /// at use time, so sweeps can set any component to zero without retuning
+    /// the other weights.
+    #[serde(default = "default_retrieval_semantic_weight")]
+    pub retrieval_semantic_weight: f32,
+    #[serde(default = "default_retrieval_policy_weight")]
+    pub retrieval_policy_weight: f32,
+    #[serde(default = "default_retrieval_continuation_weight")]
+    pub retrieval_continuation_weight: f32,
+    #[serde(default = "default_retrieval_continuation_plies")]
+    pub retrieval_continuation_plies: usize,
+
+    /// How strongly the mixed-game target is gated by handcrafted structure.
+    /// 0 disables the gate; 1 fully multiplies by the gate. Power >1 sharpens
+    /// the gate and power <1 makes it more permissive.
+    #[serde(default = "default_retrieval_structure_gate_strength")]
+    pub retrieval_structure_gate_strength: f32,
+    #[serde(default = "default_retrieval_structure_gate_power")]
+    pub retrieval_structure_gate_power: f32,
 
     /// Priority multiplier applied to calibration GradNorm target
     #[serde(default = "default_gradnorm_calibration_priority")]
@@ -425,7 +452,7 @@ pub fn default_retrieval_margin_for_serde() -> f32 {
     0.5
 }
 fn default_retrieval_objective() -> String {
-    RETRIEVAL_OBJECTIVE_SAME_MOVE.to_string()
+    RETRIEVAL_OBJECTIVE_MIXED_GAME.to_string()
 }
 fn default_retrieval_logit_scale() -> f32 {
     default_retrieval_logit_scale_for_serde()
@@ -438,6 +465,24 @@ fn default_retrieval_policy_temperature() -> f32 {
 }
 fn default_retrieval_policy_positive_threshold() -> f32 {
     0.25
+}
+fn default_retrieval_semantic_weight() -> f32 {
+    0.5
+}
+fn default_retrieval_policy_weight() -> f32 {
+    0.0
+}
+fn default_retrieval_continuation_weight() -> f32 {
+    0.3
+}
+fn default_retrieval_continuation_plies() -> usize {
+    4
+}
+fn default_retrieval_structure_gate_strength() -> f32 {
+    1.0
+}
+fn default_retrieval_structure_gate_power() -> f32 {
+    1.0
 }
 fn default_gradnorm_calibration_priority() -> f32 {
     2.0
@@ -755,6 +800,24 @@ pub struct ConfigOverrides {
     pub retrieval_policy_positive_threshold: Option<f32>,
 
     #[arg(long)]
+    pub retrieval_semantic_weight: Option<f32>,
+
+    #[arg(long)]
+    pub retrieval_policy_weight: Option<f32>,
+
+    #[arg(long)]
+    pub retrieval_continuation_weight: Option<f32>,
+
+    #[arg(long)]
+    pub retrieval_continuation_plies: Option<usize>,
+
+    #[arg(long)]
+    pub retrieval_structure_gate_strength: Option<f32>,
+
+    #[arg(long)]
+    pub retrieval_structure_gate_power: Option<f32>,
+
+    #[arg(long)]
     pub gradnorm_calibration_priority: Option<f32>,
 
     #[arg(long)]
@@ -1030,6 +1093,24 @@ impl Config {
         if let Some(v) = overrides.retrieval_policy_positive_threshold {
             config.retrieval_policy_positive_threshold = v;
         }
+        if let Some(v) = overrides.retrieval_semantic_weight {
+            config.retrieval_semantic_weight = v;
+        }
+        if let Some(v) = overrides.retrieval_policy_weight {
+            config.retrieval_policy_weight = v;
+        }
+        if let Some(v) = overrides.retrieval_continuation_weight {
+            config.retrieval_continuation_weight = v;
+        }
+        if let Some(v) = overrides.retrieval_continuation_plies {
+            config.retrieval_continuation_plies = v;
+        }
+        if let Some(v) = overrides.retrieval_structure_gate_strength {
+            config.retrieval_structure_gate_strength = v;
+        }
+        if let Some(v) = overrides.retrieval_structure_gate_power {
+            config.retrieval_structure_gate_power = v;
+        }
         if let Some(v) = overrides.gradnorm_calibration_priority {
             config.gradnorm_calibration_priority = v;
         }
@@ -1256,12 +1337,25 @@ impl Config {
     pub fn retrieval_objective(&self) -> &str {
         match self.retrieval_objective.as_str() {
             RETRIEVAL_OBJECTIVE_POLICY_OVERLAP => RETRIEVAL_OBJECTIVE_POLICY_OVERLAP,
+            RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC => RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC,
+            RETRIEVAL_OBJECTIVE_MIXED_GAME => RETRIEVAL_OBJECTIVE_MIXED_GAME,
             _ => RETRIEVAL_OBJECTIVE_SAME_MOVE,
         }
     }
 
-    pub fn retrieval_uses_policy_overlap(&self) -> bool {
+    pub fn retrieval_needs_policy_probs(&self) -> bool {
         self.retrieval_objective() == RETRIEVAL_OBJECTIVE_POLICY_OVERLAP
+            || (self.retrieval_objective() == RETRIEVAL_OBJECTIVE_MIXED_GAME
+                && self.retrieval_policy_weight() > 0.0)
+    }
+
+    pub fn retrieval_uses_mse(&self) -> bool {
+        matches!(
+            self.retrieval_objective(),
+            RETRIEVAL_OBJECTIVE_POLICY_OVERLAP
+                | RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC
+                | RETRIEVAL_OBJECTIVE_MIXED_GAME
+        )
     }
 
     pub fn retrieval_logit_scale(&self) -> f32 {
@@ -1278,6 +1372,30 @@ impl Config {
 
     pub fn retrieval_policy_positive_threshold(&self) -> f32 {
         self.retrieval_policy_positive_threshold.clamp(0.0, 1.0)
+    }
+
+    pub fn retrieval_semantic_weight(&self) -> f32 {
+        self.retrieval_semantic_weight.max(0.0)
+    }
+
+    pub fn retrieval_policy_weight(&self) -> f32 {
+        self.retrieval_policy_weight.max(0.0)
+    }
+
+    pub fn retrieval_continuation_weight(&self) -> f32 {
+        self.retrieval_continuation_weight.max(0.0)
+    }
+
+    pub fn retrieval_continuation_plies(&self) -> usize {
+        self.retrieval_continuation_plies.clamp(1, 16)
+    }
+
+    pub fn retrieval_structure_gate_strength(&self) -> f32 {
+        self.retrieval_structure_gate_strength.clamp(0.0, 1.0)
+    }
+
+    pub fn retrieval_structure_gate_power(&self) -> f32 {
+        self.retrieval_structure_gate_power.clamp(0.1, 4.0)
     }
 
     /// Calculate value example weight based on ply (0 before start, ramps to 1 at full)
@@ -1391,6 +1509,12 @@ impl Default for Config {
             retrieval_margin: default_retrieval_margin(),
             retrieval_policy_temperature: default_retrieval_policy_temperature(),
             retrieval_policy_positive_threshold: default_retrieval_policy_positive_threshold(),
+            retrieval_semantic_weight: default_retrieval_semantic_weight(),
+            retrieval_policy_weight: default_retrieval_policy_weight(),
+            retrieval_continuation_weight: default_retrieval_continuation_weight(),
+            retrieval_continuation_plies: default_retrieval_continuation_plies(),
+            retrieval_structure_gate_strength: default_retrieval_structure_gate_strength(),
+            retrieval_structure_gate_power: default_retrieval_structure_gate_power(),
             gradnorm_calibration_priority: default_gradnorm_calibration_priority(),
             gradnorm_policy_regret_priority: default_gradnorm_policy_regret_priority(),
             gradnorm_retrieval_priority: default_gradnorm_retrieval_priority(),

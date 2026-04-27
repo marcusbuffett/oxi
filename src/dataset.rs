@@ -68,6 +68,9 @@ pub struct ChessExample {
     pub outcome: f32,
     pub previous_fens: Vec<String>,
     pub previous_moves: Vec<String>, // UCI moves that led to previous_fens positions
+    /// Future UCI moves after `move_uci`, normalized to this example's side-to-move perspective.
+    #[serde(default)]
+    pub future_moves: Vec<String>,
     // Time control data
     pub time_remaining_self: u32,          // seconds
     pub time_remaining_oppo: u32,          // seconds
@@ -79,6 +82,9 @@ pub struct ChessExample {
     /// Whether this example comes from a puzzle (tactical training position)
     #[serde(default)]
     pub is_puzzle: bool,
+    /// ECO-derived opening-family labels seen earlier in the PGN line.
+    #[serde(default)]
+    pub opening_family_labels: Vec<String>,
 }
 
 /// Grouped dataset item - contains raw data with probability distributions
@@ -92,6 +98,7 @@ pub struct ChessItem {
     pub material_imbalance: i32, // signed material difference (white - black)
     pub fen: String,             // The FEN position
     pub move_uci: String,
+    pub future_moves: Vec<String>,
     pub elo_self: i32,
     pub elo_oppo: i32,
     pub time_used_for_move: u32,
@@ -99,6 +106,7 @@ pub struct ChessItem {
     // Global features (raw, unnormalized)
     pub global_features: GlobalFeatures,
     pub is_puzzle: bool,
+    pub opening_family_labels: Vec<String>,
     pub calibration_label: Option<CalibrationLabel>,
 }
 
@@ -295,12 +303,14 @@ impl OXIDataset {
             material_imbalance,
             fen: example.fen.clone(),
             move_uci: example.move_uci.clone(),
+            future_moves: example.future_moves.clone(),
             elo_self: example.elo_self,
             elo_oppo: example.elo_oppo,
             time_used_for_move: example.time_used_for_move,
             material_imbalance_history: example.material_imbalance_history.clone(),
             global_features,
             is_puzzle: example.is_puzzle,
+            opening_family_labels: example.opening_family_labels.clone(),
             calibration_label,
         })
     }

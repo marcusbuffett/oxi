@@ -32,6 +32,7 @@ use ratatui::{
 const MAX_DURATION_SAMPLES: usize = 200;
 const DRAW_INTERVAL: Duration = Duration::from_millis(100);
 const LOOP_SLEEP: Duration = Duration::from_millis(30);
+const RETRIEVAL_MSE_VISUAL_CAP: f64 = 0.08;
 
 #[derive(Clone, Debug)]
 enum MetricSplit {
@@ -664,8 +665,19 @@ impl TuiApp {
         let mut x_bounds = [0.0, 1.0];
         let mut y_bounds = [0.0, 1.0];
 
+        let mut visually_capped = false;
         for line in &group.series {
-            let data = aggregate_samples(&line.samples, usable_width);
+            let mut data = aggregate_samples(&line.samples, usable_width);
+            if let Some(cap) = visual_cap_for_series(&group.name, &line.label) {
+                let mut clipped = false;
+                for (_, value) in &mut data {
+                    if *value > cap {
+                        *value = cap;
+                        clipped = true;
+                    }
+                }
+                visually_capped |= clipped;
+            }
             if !data.is_empty() {
                 let (series_x, series_y) = compute_bounds(&data);
                 if !bounds_initialized {
@@ -683,9 +695,17 @@ impl TuiApp {
             aggregated_data.push(data);
         }
 
-        let mut block = Block::default()
-            .title(group.display_name())
-            .borders(Borders::ALL);
+        let title = if visually_capped {
+            format!(
+                "{} (MSE display cap {:.2})",
+                group.display_name(),
+                RETRIEVAL_MSE_VISUAL_CAP
+            )
+        } else {
+            group.display_name()
+        };
+
+        let mut block = Block::default().title(title).borders(Borders::ALL);
 
         if is_selected {
             block = block.border_style(
@@ -1316,6 +1336,14 @@ fn split_metric_name(name: &str) -> (String, Option<String>) {
         (base.trim().to_string(), Some(series.trim().to_string()))
     } else {
         (name.to_string(), None)
+    }
+}
+
+fn visual_cap_for_series(group_name: &str, series_label: &str) -> Option<f64> {
+    if matches!(group_name, "Retrieval Loss" | "Trunk Retrieval") && series_label == "MSE" {
+        Some(RETRIEVAL_MSE_VISUAL_CAP)
+    } else {
+        None
     }
 }
 

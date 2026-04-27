@@ -1,7 +1,11 @@
+#[cfg(feature = "train")]
 use crate::calibration::calibration_skill_band_label;
 use crate::calibration::RegretBin;
+use crate::config::{ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
+#[cfg(feature = "train")]
 use crate::config::{
-    ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS, RETRIEVAL_OBJECTIVE_POLICY_OVERLAP,
+    RETRIEVAL_OBJECTIVE_MIXED_GAME, RETRIEVAL_OBJECTIVE_POLICY_OVERLAP,
+    RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC,
 };
 use crate::distribution_utils::beta_log_pdf;
 use crate::factorized_policy::FactorizedPolicyHead;
@@ -12,7 +16,9 @@ use burn::module::Param;
 use burn::nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig};
 use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
-use burn::tensor::activation::{log_softmax, silu, softmax};
+#[cfg(feature = "train")]
+use burn::tensor::activation::log_softmax;
+use burn::tensor::activation::{silu, softmax};
 
 #[cfg(feature = "train")]
 use crate::config::get_global_config;
@@ -22,6 +28,8 @@ use crate::forward_timing::{finish_and_log_forward_pass, start_forward_pass, Tim
 use crate::model_prediction_logger::log_model_predictions;
 #[cfg(feature = "train")]
 use crate::norm_debug::{log_tensor_stats, LayerScope, NormDebugScope, StreamScope};
+#[cfg(feature = "train")]
+use crate::opening_family_metric::compute_opening_family_neighbor_metrics;
 #[cfg(feature = "train")]
 use burn::tensor::backend::AutodiffBackend;
 #[cfg(feature = "train")]
@@ -69,6 +77,10 @@ pub struct OXIModel<B: Backend> {
     aux_trunk_to_square_hidden: Linear<B>,
     cp_loss_head_hidden: Linear<B>,
     cp_loss_head: Linear<B>,
+    retrieval_smolgen_weight_gen: SmolgenWeightGen<B>,
+    retrieval_block: TransformerBlock<B>,
+    retrieval_pool_fc1: Linear<B>,
+    retrieval_pool_fc2: Linear<B>,
     retrieval_head: Linear<B>,
 }
 
@@ -201,6 +213,14 @@ impl<B: Backend> OXIModel<B> {
         let cp_loss_head = LinearConfig::new(config.embed_dim(), RegretBin::COUNT)
             .with_initializer(std_init.clone())
             .init(device);
+        let retrieval_smolgen_weight_gen = SmolgenWeightGen::new(config, device);
+        let retrieval_block = TransformerBlock::new_for_head(config, device);
+        let retrieval_pool_fc1 = LinearConfig::new(config.embed_dim(), config.embed_dim())
+            .with_initializer(std_init.clone())
+            .init(device);
+        let retrieval_pool_fc2 = LinearConfig::new(config.embed_dim(), 1)
+            .with_initializer(std_init.clone())
+            .init(device);
         let retrieval_head = LinearConfig::new(config.embed_dim(), config.embed_dim())
             .with_initializer(std_init.clone())
             .init(device);
@@ -243,8 +263,27 @@ impl<B: Backend> OXIModel<B> {
             aux_trunk_to_square_hidden,
             cp_loss_head_hidden,
             cp_loss_head,
+            retrieval_smolgen_weight_gen,
+            retrieval_block,
+            retrieval_pool_fc1,
+            retrieval_pool_fc2,
             retrieval_head,
         }
+    }
+
+    fn retrieval_attention_pool(&self, tokens: Tensor<B, 3>) -> Tensor<B, 2> {
+        let batch_size = tokens.dims()[0];
+        let embed_dim = tokens.dims()[2];
+        let pool_hidden = silu(self.retrieval_pool_fc1.forward(tokens.clone()));
+        let pool_logits = self
+            .retrieval_pool_fc2
+            .forward(pool_hidden)
+            .reshape([batch_size, 64]);
+        let scale = (embed_dim as f64).sqrt();
+        let pool_weights = softmax(pool_logits / scale, 1).reshape([batch_size, 64, 1]);
+        (tokens * pool_weights)
+            .sum_dim(1)
+            .reshape([batch_size, embed_dim])
     }
 
     fn retrieval_embedding_from_pooled(&self, pooled: Tensor<B, 2>) -> Tensor<B, 2> {
@@ -271,10 +310,17 @@ impl<B: Backend> OXIModel<B> {
         pooled / norm
     }
 
-    fn retrieval_embedding_from_trunk(&self, trunk: Tensor<B, 3>) -> Tensor<B, 2> {
-        let batch_size = trunk.dims()[0];
-        let embed_dim = trunk.dims()[2];
-        let pooled = trunk.mean_dim(1).reshape([batch_size, embed_dim]);
+    fn retrieval_embedding_from_trunk(
+        &self,
+        trunk: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> Tensor<B, 2> {
+        let retrieval_tokens = self.retrieval_block.forward_with_film(
+            trunk,
+            &self.retrieval_smolgen_weight_gen,
+            globals,
+        );
+        let pooled = self.retrieval_attention_pool(retrieval_tokens);
         self.retrieval_embedding_from_pooled(pooled)
     }
 
@@ -404,9 +450,101 @@ impl<B: Backend> OXIModel<B> {
     }
 
     #[cfg(feature = "train")]
+    fn piece_identity_index(item: &crate::dataset::ChessItem, square: usize) -> Option<usize> {
+        let offset = square * FEATURES_PER_TOKEN;
+        let features = item
+            .board_encoded
+            .get(offset..offset + crate::config::PIECE_IDENTITY_FEATURES)?;
+        features.iter().position(|v| *v > 0.5)
+    }
+
+    #[cfg(feature = "train")]
+    fn retrieval_structure_similarity(
+        a: &crate::dataset::ChessItem,
+        b: &crate::dataset::ChessItem,
+    ) -> f32 {
+        let mut pawn_union = 0.0f32;
+        let mut pawn_same = 0.0f32;
+        let mut piece_union = 0.0f32;
+        let mut piece_same = 0.0f32;
+
+        for square in 0..64 {
+            let piece_a = Self::piece_identity_index(a, square);
+            let piece_b = Self::piece_identity_index(b, square);
+            if piece_a.is_some() || piece_b.is_some() {
+                piece_union += 1.0;
+                if piece_a == piece_b {
+                    piece_same += 1.0;
+                }
+            }
+
+            let pawn_a = matches!(piece_a, Some(0 | 6));
+            let pawn_b = matches!(piece_b, Some(0 | 6));
+            if pawn_a || pawn_b {
+                pawn_union += 1.0;
+                if piece_a == piece_b {
+                    pawn_same += 1.0;
+                }
+            }
+        }
+
+        let pawn_similarity = if pawn_union > 0.0 {
+            pawn_same / pawn_union
+        } else {
+            1.0
+        };
+        let piece_similarity = if piece_union > 0.0 {
+            piece_same / piece_union
+        } else {
+            1.0
+        };
+        let ply_gap = a
+            .global_features
+            .move_count
+            .abs_diff(b.global_features.move_count) as f32;
+        let ply_gate = (-ply_gap / 16.0).exp();
+        let material_gap = (a.material_imbalance - b.material_imbalance).abs() as f32;
+        let material_gate = (-material_gap / 6.0).exp();
+        let source_gate = if a.is_puzzle == b.is_puzzle {
+            1.0
+        } else {
+            0.25
+        };
+
+        (pawn_similarity.powf(2.0)
+            * (0.25 + 0.75 * piece_similarity)
+            * ply_gate
+            * material_gate
+            * source_gate)
+            .clamp(0.0, 1.0)
+    }
+
+    #[cfg(feature = "train")]
+    fn retrieval_structure_gate(
+        &self,
+        items: &[crate::dataset::ChessItem],
+        batch_size: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 2> {
+        let mut gate_data = vec![0.0f32; batch_size * batch_size];
+        for i in 0..batch_size {
+            for j in 0..batch_size {
+                if i == j {
+                    continue;
+                }
+                gate_data[i * batch_size + j] =
+                    Self::retrieval_structure_similarity(&items[i], &items[j]);
+            }
+        }
+        Tensor::<B, 1>::from_data(TensorData::from(gate_data.as_slice()), device)
+            .reshape([batch_size, batch_size])
+    }
+
+    #[cfg(feature = "train")]
     fn compute_policy_overlap_retrieval_loss_from_embeddings(
         &self,
         embeddings: Tensor<B, 2>,
+        items: &[crate::dataset::ChessItem],
         policy_probs: Tensor<B, 2>,
     ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
     where
@@ -415,18 +553,19 @@ impl<B: Backend> OXIModel<B> {
         let batch_size = embeddings.dims()[0];
         let device = embeddings.device();
         let zero = || Tensor::<B, 1>::zeros([1], &device);
-        if batch_size < 2 || policy_probs.dims()[0] != batch_size {
+        if batch_size < 2 || policy_probs.dims()[0] != batch_size || items.len() != batch_size {
             return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
         }
 
         let (pair_mask, pair_count) = self.off_diagonal_mask(batch_size, &device);
+        let structure_gate = self.retrieval_structure_gate(items, batch_size, &device);
         let probs_i = policy_probs.clone().detach().unsqueeze_dim::<3>(1);
         let probs_j = policy_probs.detach().unsqueeze_dim::<3>(0);
         let target = probs_i
             .min_pair(probs_j)
             .sum_dim(2)
             .reshape([batch_size, batch_size])
-            .detach();
+            * structure_gate.detach();
 
         let sim = embeddings.clone().matmul(embeddings.transpose());
         let diff = sim.clone() - target.clone();
@@ -468,9 +607,296 @@ impl<B: Backend> OXIModel<B> {
     }
 
     #[cfg(feature = "train")]
+    fn compute_structural_semantic_retrieval_loss_from_embeddings(
+        &self,
+        embeddings: Tensor<B, 2>,
+        semantic_embeddings: Tensor<B, 2>,
+        items: &[crate::dataset::ChessItem],
+    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
+    where
+        B::FloatElem: From<f32>,
+    {
+        let batch_size = embeddings.dims()[0];
+        let device = embeddings.device();
+        let zero = || Tensor::<B, 1>::zeros([1], &device);
+        if batch_size < 2
+            || semantic_embeddings.dims()[0] != batch_size
+            || items.len() != batch_size
+        {
+            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+
+        let (pair_mask, pair_count) = self.off_diagonal_mask(batch_size, &device);
+        let structure_gate = self.retrieval_structure_gate(items, batch_size, &device);
+        let semantic_sim = semantic_embeddings
+            .clone()
+            .detach()
+            .matmul(semantic_embeddings.detach().transpose())
+            .clamp_min(0.0);
+        let target = semantic_sim * structure_gate.detach();
+
+        let sim = embeddings.clone().matmul(embeddings.transpose());
+        let diff = sim.clone() - target.clone();
+        let loss = (diff.powf_scalar(2.0) * pair_mask.clone()).sum() / pair_count;
+
+        let config = get_global_config();
+        let positive_mask = target
+            .greater_elem(config.retrieval_policy_positive_threshold())
+            .float()
+            * pair_mask.clone();
+        let positive_count = positive_mask.clone().sum().into_scalar().elem::<f32>();
+        let negative_mask = pair_mask - positive_mask.clone();
+        let negative_count = (pair_count - positive_count).max(0.0);
+
+        let positive_sim = if positive_count > 0.0 {
+            ((sim.clone() * positive_mask).sum() / positive_count)
+                .into_scalar()
+                .elem::<f32>()
+        } else {
+            0.0
+        };
+        let negative_sim = if negative_count > 0.0 {
+            ((sim * negative_mask).sum() / negative_count)
+                .into_scalar()
+                .elem::<f32>()
+        } else {
+            0.0
+        };
+        let loss_f32 = loss.clone().into_scalar().elem::<f32>();
+
+        (
+            loss,
+            loss_f32,
+            pair_count,
+            positive_count,
+            positive_sim,
+            negative_sim,
+        )
+    }
+
+    #[cfg(feature = "train")]
+    fn retrieval_target_move_indices(items: &[crate::dataset::ChessItem]) -> Vec<Option<usize>> {
+        items
+            .iter()
+            .map(|item| item.move_distribution.iter().position(|p| *p > 0.0))
+            .collect()
+    }
+
+    #[cfg(feature = "train")]
+    fn retrieval_debiased_policy_overlap(
+        &self,
+        policy_probs: Tensor<B, 2>,
+        target_indices: &[Option<usize>],
+        batch_size: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 2>
+    where
+        B::FloatElem: From<f32>,
+    {
+        let mut mask_data = vec![1.0f32; batch_size * LEGAL_MOVES];
+        for (row, target_idx) in target_indices.iter().enumerate() {
+            if let Some(target_idx) = target_idx {
+                if *target_idx < LEGAL_MOVES {
+                    mask_data[row * LEGAL_MOVES + target_idx] = 0.0;
+                }
+            }
+        }
+
+        let debias_mask = Tensor::<B, 1>::from_data(TensorData::from(mask_data.as_slice()), device)
+            .reshape([batch_size, LEGAL_MOVES]);
+        let debiased_probs = policy_probs.detach() * debias_mask;
+        let row_sum = debiased_probs.clone().sum_dim(1).clamp_min(1e-6);
+        let debiased_probs = debiased_probs / row_sum;
+        let probs_i = debiased_probs.clone().unsqueeze_dim::<3>(1);
+        let probs_j = debiased_probs.unsqueeze_dim::<3>(0);
+        probs_i
+            .min_pair(probs_j)
+            .sum_dim(2)
+            .reshape([batch_size, batch_size])
+    }
+
+    #[cfg(feature = "train")]
+    fn future_continuation_overlap(a: &[String], b: &[String], n: usize) -> f32 {
+        if a.len() < n || b.len() < n || n == 0 {
+            return 0.0;
+        }
+
+        let mut used = vec![false; n];
+        let mut matches = 0usize;
+        for move_a in a.iter().take(n) {
+            if let Some((idx, _)) = b
+                .iter()
+                .take(n)
+                .enumerate()
+                .find(|(idx, move_b)| !used[*idx] && *move_b == move_a)
+            {
+                used[idx] = true;
+                matches += 1;
+            }
+        }
+
+        matches as f32 / n as f32
+    }
+
+    #[cfg(feature = "train")]
+    fn retrieval_future_continuation_similarity_and_mask(
+        &self,
+        items: &[crate::dataset::ChessItem],
+        batch_size: usize,
+        continuation_plies: usize,
+        device: &B::Device,
+    ) -> (Tensor<B, 2>, Tensor<B, 2>, f32) {
+        let mut sim_data = vec![0.0f32; batch_size * batch_size];
+        let mut mask_data = vec![0.0f32; batch_size * batch_size];
+        let mut pair_count = 0.0f32;
+
+        for i in 0..batch_size {
+            if items[i].future_moves.len() < continuation_plies {
+                continue;
+            }
+
+            for j in 0..batch_size {
+                if i == j {
+                    continue;
+                }
+                if items[j].future_moves.len() < continuation_plies {
+                    continue;
+                }
+
+                let offset = i * batch_size + j;
+                mask_data[offset] = 1.0;
+                pair_count += 1.0;
+                sim_data[offset] = Self::future_continuation_overlap(
+                    &items[i].future_moves,
+                    &items[j].future_moves,
+                    continuation_plies,
+                );
+            }
+        }
+
+        let sim = Tensor::<B, 1>::from_data(TensorData::from(sim_data.as_slice()), device)
+            .reshape([batch_size, batch_size]);
+        let mask = Tensor::<B, 1>::from_data(TensorData::from(mask_data.as_slice()), device)
+            .reshape([batch_size, batch_size]);
+        (sim, mask, pair_count)
+    }
+
+    #[cfg(feature = "train")]
+    fn compute_mixed_game_retrieval_loss_from_embeddings(
+        &self,
+        embeddings: Tensor<B, 2>,
+        semantic_embeddings: Tensor<B, 2>,
+        items: &[crate::dataset::ChessItem],
+        policy_probs: Option<Tensor<B, 2>>,
+    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
+    where
+        B::FloatElem: From<f32>,
+    {
+        let batch_size = embeddings.dims()[0];
+        let device = embeddings.device();
+        let zero = || Tensor::<B, 1>::zeros([1], &device);
+        if batch_size < 2
+            || semantic_embeddings.dims()[0] != batch_size
+            || policy_probs
+                .as_ref()
+                .is_some_and(|policy_probs| policy_probs.dims()[0] != batch_size)
+            || items.len() != batch_size
+        {
+            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+
+        let config = get_global_config();
+        let continuation_plies = config.retrieval_continuation_plies();
+        let (continuation_sim, pair_mask, pair_count) = self
+            .retrieval_future_continuation_similarity_and_mask(
+                items,
+                batch_size,
+                continuation_plies,
+                &device,
+            );
+        if pair_count <= 0.0 {
+            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        let structure_gate = self.retrieval_structure_gate(items, batch_size, &device);
+        let target_indices = Self::retrieval_target_move_indices(items);
+
+        let semantic_sim = semantic_embeddings
+            .clone()
+            .detach()
+            .matmul(semantic_embeddings.detach().transpose())
+            .clamp_min(0.0);
+        let semantic_weight = config.retrieval_semantic_weight();
+        let policy_weight = if policy_probs.is_some() {
+            config.retrieval_policy_weight()
+        } else {
+            0.0
+        };
+        let continuation_weight = config.retrieval_continuation_weight();
+        let total_weight = (semantic_weight + policy_weight + continuation_weight).max(1e-6);
+
+        let mixed_target = if let Some(policy_probs) = policy_probs {
+            let policy_overlap = self.retrieval_debiased_policy_overlap(
+                policy_probs,
+                &target_indices,
+                batch_size,
+                &device,
+            );
+            (semantic_sim * semantic_weight
+                + policy_overlap * policy_weight
+                + continuation_sim * continuation_weight)
+                / total_weight
+        } else {
+            (semantic_sim * semantic_weight + continuation_sim * continuation_weight) / total_weight
+        };
+        let gate_strength = config.retrieval_structure_gate_strength();
+        let gate = structure_gate
+            .detach()
+            .powf_scalar(config.retrieval_structure_gate_power());
+        let target = mixed_target * (gate * gate_strength + (1.0 - gate_strength));
+
+        let sim = embeddings.clone().matmul(embeddings.transpose());
+        let diff = sim.clone() - target.clone();
+        let loss = (diff.powf_scalar(2.0) * pair_mask.clone()).sum() / pair_count;
+
+        let positive_mask = target
+            .greater_elem(config.retrieval_policy_positive_threshold())
+            .float()
+            * pair_mask.clone();
+        let positive_count = positive_mask.clone().sum().into_scalar().elem::<f32>();
+        let negative_mask = pair_mask - positive_mask.clone();
+        let negative_count = (pair_count - positive_count).max(0.0);
+
+        let positive_sim = if positive_count > 0.0 {
+            ((sim.clone() * positive_mask).sum() / positive_count)
+                .into_scalar()
+                .elem::<f32>()
+        } else {
+            0.0
+        };
+        let negative_sim = if negative_count > 0.0 {
+            ((sim * negative_mask).sum() / negative_count)
+                .into_scalar()
+                .elem::<f32>()
+        } else {
+            0.0
+        };
+        let loss_f32 = loss.clone().into_scalar().elem::<f32>();
+
+        (
+            loss,
+            loss_f32,
+            pair_count,
+            positive_count,
+            positive_sim,
+            negative_sim,
+        )
+    }
+
+    #[cfg(feature = "train")]
     fn compute_retrieval_loss_from_embeddings(
         &self,
         embeddings: Tensor<B, 2>,
+        semantic_embeddings: Option<Tensor<B, 2>>,
         items: &[crate::dataset::ChessItem],
         policy_probs: Option<Tensor<B, 2>>,
     ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
@@ -479,10 +905,30 @@ impl<B: Backend> OXIModel<B> {
     {
         let config = get_global_config();
         if config.retrieval_objective() == RETRIEVAL_OBJECTIVE_POLICY_OVERLAP {
-            if let Some(policy_probs) = policy_probs {
+            if let Some(policy_probs) = policy_probs.clone() {
                 return self.compute_policy_overlap_retrieval_loss_from_embeddings(
                     embeddings,
+                    items,
                     policy_probs,
+                );
+            }
+        }
+        if config.retrieval_objective() == RETRIEVAL_OBJECTIVE_MIXED_GAME {
+            if let Some(semantic_embeddings) = semantic_embeddings.clone() {
+                return self.compute_mixed_game_retrieval_loss_from_embeddings(
+                    embeddings,
+                    semantic_embeddings,
+                    items,
+                    policy_probs,
+                );
+            }
+        }
+        if config.retrieval_objective() == RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC {
+            if let Some(semantic_embeddings) = semantic_embeddings {
+                return self.compute_structural_semantic_retrieval_loss_from_embeddings(
+                    embeddings,
+                    semantic_embeddings,
+                    items,
                 );
             }
         }
@@ -494,14 +940,35 @@ impl<B: Backend> OXIModel<B> {
     fn compute_retrieval_loss(
         &self,
         trunk_output: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
         items: &[crate::dataset::ChessItem],
         policy_probs: Option<Tensor<B, 2>>,
-    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
+    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32, f32, f32, f32)
     where
         B::FloatElem: From<f32>,
     {
-        let retrieval_z = self.retrieval_embedding_from_trunk(trunk_output);
-        self.compute_retrieval_loss_from_embeddings(retrieval_z, items, policy_probs)
+        let semantic_z = self.normalized_mean_pooled_trunk(trunk_output.clone().detach());
+        let retrieval_z = self.retrieval_embedding_from_trunk(trunk_output.detach(), globals);
+        let opening_family_metrics =
+            compute_opening_family_neighbor_metrics(retrieval_z.clone().detach(), items, 5);
+        let (loss, loss_f32, pair_count, positive_count, positive_sim, negative_sim) = self
+            .compute_retrieval_loss_from_embeddings(
+                retrieval_z,
+                Some(semantic_z),
+                items,
+                policy_probs,
+            );
+        (
+            loss,
+            loss_f32,
+            pair_count,
+            positive_count,
+            positive_sim,
+            negative_sim,
+            opening_family_metrics.match_rate,
+            opening_family_metrics.neighbor_pair_count,
+            opening_family_metrics.position_coverage,
+        )
     }
 
     #[cfg(feature = "train")]
@@ -515,8 +982,13 @@ impl<B: Backend> OXIModel<B> {
         B::FloatElem: From<f32>,
     {
         let trunk_z = self.normalized_mean_pooled_trunk(trunk_output.detach());
-        let (_, loss_f32, pair_count, positive_count, positive_sim, negative_sim) =
-            self.compute_retrieval_loss_from_embeddings(trunk_z, items, policy_probs);
+        let (_, loss_f32, pair_count, positive_count, positive_sim, negative_sim) = self
+            .compute_retrieval_loss_from_embeddings(
+                trunk_z.clone(),
+                Some(trunk_z),
+                items,
+                policy_probs,
+            );
         (
             loss_f32,
             pair_count,
@@ -534,6 +1006,17 @@ impl<B: Backend> OXIModel<B> {
         let (policy, value, side_info, time_usage, _trunk, _policy_tokens) =
             self.forward_with_trunk(board, globals);
         (policy, value, side_info, time_usage)
+    }
+
+    pub fn forward_policy_and_retrieval_embedding(
+        &self,
+        board: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> (Tensor<B, 3>, Tensor<B, 2>) {
+        let (policy, _value, _side_info, _time_usage, trunk, _policy_tokens) =
+            self.forward_with_trunk(board, globals.clone());
+        let embedding = self.retrieval_embedding_from_trunk(trunk, globals);
+        (policy, embedding)
     }
 
     /// Inference-only forward pass that returns the same four outputs as `forward`,
@@ -682,10 +1165,7 @@ impl<B: Backend> OXIModel<B> {
         log_tensor_stats("encoder.post_norm", &x);
 
         let embedding_out = if capture_trunk {
-            let batch_size = x.dims()[0];
-            let embed_dim = x.dims()[2];
-            let pooled = x.clone().mean_dim(1).reshape([batch_size, embed_dim]);
-            Some(self.retrieval_embedding_from_pooled(pooled))
+            Some(self.retrieval_embedding_from_trunk(x.clone(), globals.clone()))
         } else {
             None
         };
@@ -1289,13 +1769,16 @@ impl<B: Backend> OXIModel<B> {
             retrieval_positive_count_f32,
             retrieval_positive_sim_f32,
             retrieval_negative_sim_f32,
+            retrieval_opening_family_match_rate_f32,
+            retrieval_opening_family_pair_count_f32,
+            retrieval_opening_family_coverage_f32,
             trunk_retrieval_loss_f32,
             trunk_retrieval_pair_count_f32,
             trunk_retrieval_positive_count_f32,
             trunk_retrieval_positive_sim_f32,
             trunk_retrieval_negative_sim_f32,
         ) = if config.retrieval_loss_weight() > 0.0 {
-            let retrieval_policy_probs = if config.retrieval_uses_policy_overlap() {
+            let retrieval_policy_probs = if config.retrieval_needs_policy_probs() {
                 let temperature = config.retrieval_policy_temperature();
                 let logits = policy_logits_flat.clone() / temperature;
                 let probs = log_softmax(logits, 1)
@@ -1315,8 +1798,12 @@ impl<B: Backend> OXIModel<B> {
                 retrieval_positive_count_f32,
                 retrieval_positive_sim_f32,
                 retrieval_negative_sim_f32,
+                retrieval_opening_family_match_rate_f32,
+                retrieval_opening_family_pair_count_f32,
+                retrieval_opening_family_coverage_f32,
             ) = self.compute_retrieval_loss(
                 trunk_output.clone(),
+                batch.global_features.clone(),
                 &batch.items,
                 retrieval_policy_probs.clone(),
             );
@@ -1339,6 +1826,9 @@ impl<B: Backend> OXIModel<B> {
                 retrieval_positive_count_f32,
                 retrieval_positive_sim_f32,
                 retrieval_negative_sim_f32,
+                retrieval_opening_family_match_rate_f32,
+                retrieval_opening_family_pair_count_f32,
+                retrieval_opening_family_coverage_f32,
                 trunk_retrieval_loss_f32,
                 trunk_retrieval_pair_count_f32,
                 trunk_retrieval_positive_count_f32,
@@ -1348,6 +1838,9 @@ impl<B: Backend> OXIModel<B> {
         } else {
             (
                 zero_like(),
+                0.0,
+                0.0,
+                0.0,
                 0.0,
                 0.0,
                 0.0,
@@ -1720,6 +2213,9 @@ impl<B: Backend> OXIModel<B> {
             retrieval_positive_count_f32,
             retrieval_positive_sim_f32,
             retrieval_negative_sim_f32,
+            retrieval_opening_family_match_rate_f32,
+            retrieval_opening_family_pair_count_f32,
+            retrieval_opening_family_coverage_f32,
         )
         .with_trunk_retrieval_metrics(
             trunk_retrieval_loss_f32,
@@ -1870,6 +2366,28 @@ mod tests {
     use crate::config::{FEATURES_PER_TOKEN, NUM_GLOBALS};
     use crate::test_backend::{test_device, TestBackend};
     use burn::tensor::TensorData;
+
+    #[cfg(feature = "train")]
+    #[test]
+    fn test_future_continuation_overlap_is_orderless() {
+        let a = vec![
+            "e2e4".to_string(),
+            "g1f3".to_string(),
+            "f1b5".to_string(),
+            "e1g1".to_string(),
+        ];
+        let b = vec![
+            "a7a6".to_string(),
+            "e1g1".to_string(),
+            "g1f3".to_string(),
+            "c7c5".to_string(),
+        ];
+
+        assert_eq!(
+            OXIModel::<TestBackend>::future_continuation_overlap(&a, &b, 4),
+            0.5
+        );
+    }
 
     #[test]
     fn test_beta_loss_matches_manual_nll() {

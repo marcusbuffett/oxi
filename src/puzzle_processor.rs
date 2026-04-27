@@ -82,6 +82,7 @@ pub fn puzzle_to_example(puzzle: &PuzzleRecord) -> Option<ChessExample> {
         outcome,
         previous_fens: vec![prev_fen],
         previous_moves: vec![prev_move],
+        future_moves: vec![],
         time_remaining_self: PUZZLE_TIME_REMAINING,
         time_remaining_oppo: PUZZLE_TIME_REMAINING,
         time_used_for_move: PUZZLE_TIME_USED,
@@ -89,6 +90,7 @@ pub fn puzzle_to_example(puzzle: &PuzzleRecord) -> Option<ChessExample> {
         move_count: 20,
         material_imbalance_history: vec![],
         is_puzzle: true,
+        opening_family_labels: vec![],
     })
 }
 
@@ -272,6 +274,7 @@ mod tests {
                 outcome: 0.5,
                 previous_fens: vec![],
                 previous_moves: vec![],
+                future_moves: vec![],
                 time_remaining_self: 600,
                 time_remaining_oppo: 600,
                 time_used_for_move: 30,
@@ -279,6 +282,7 @@ mod tests {
                 move_count: 10,
                 material_imbalance_history: vec![],
                 is_puzzle: false,
+                opening_family_labels: vec![],
             })
             .collect();
 
@@ -291,6 +295,7 @@ mod tests {
                 outcome: 1.0,
                 previous_fens: vec![],
                 previous_moves: vec![],
+                future_moves: vec![],
                 time_remaining_self: 600,
                 time_remaining_oppo: 600,
                 time_used_for_move: 30,
@@ -298,6 +303,7 @@ mod tests {
                 move_count: 20,
                 material_imbalance_history: vec![],
                 is_puzzle: true,
+                opening_family_labels: vec![],
             })
             .collect();
 

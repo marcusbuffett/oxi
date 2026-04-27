@@ -427,6 +427,18 @@ struct ModelParams {
     pub retrieval_policy_temperature: f32,
     #[serde(default = "default_retrieval_policy_positive_threshold")]
     pub retrieval_policy_positive_threshold: f32,
+    #[serde(default = "default_retrieval_semantic_weight")]
+    pub retrieval_semantic_weight: f32,
+    #[serde(default = "default_retrieval_policy_weight")]
+    pub retrieval_policy_weight: f32,
+    #[serde(default = "default_retrieval_continuation_weight")]
+    pub retrieval_continuation_weight: f32,
+    #[serde(default = "default_retrieval_continuation_plies")]
+    pub retrieval_continuation_plies: usize,
+    #[serde(default = "default_retrieval_structure_gate_strength")]
+    pub retrieval_structure_gate_strength: f32,
+    #[serde(default = "default_retrieval_structure_gate_power")]
+    pub retrieval_structure_gate_power: f32,
 }
 
 fn default_smolgen_hidden() -> usize {
@@ -439,7 +451,7 @@ fn default_smolgen_gen_size() -> usize {
     128
 }
 fn default_retrieval_objective() -> String {
-    oxi::config::RETRIEVAL_OBJECTIVE_SAME_MOVE.to_string()
+    oxi::config::RETRIEVAL_OBJECTIVE_MIXED_GAME.to_string()
 }
 fn default_retrieval_policy_temperature() -> f32 {
     0.5
@@ -447,7 +459,24 @@ fn default_retrieval_policy_temperature() -> f32 {
 fn default_retrieval_policy_positive_threshold() -> f32 {
     0.25
 }
-
+fn default_retrieval_semantic_weight() -> f32 {
+    0.5
+}
+fn default_retrieval_policy_weight() -> f32 {
+    0.0
+}
+fn default_retrieval_continuation_weight() -> f32 {
+    0.3
+}
+fn default_retrieval_continuation_plies() -> usize {
+    4
+}
+fn default_retrieval_structure_gate_strength() -> f32 {
+    1.0
+}
+fn default_retrieval_structure_gate_power() -> f32 {
+    1.0
+}
 /// Load a Config from a model directory's params.json file.
 /// Only reads architecture params, fills the rest with defaults — same approach as the production bot.
 fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
@@ -474,6 +503,12 @@ fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
         retrieval_margin: params.retrieval_margin,
         retrieval_policy_temperature: params.retrieval_policy_temperature,
         retrieval_policy_positive_threshold: params.retrieval_policy_positive_threshold,
+        retrieval_semantic_weight: params.retrieval_semantic_weight,
+        retrieval_policy_weight: params.retrieval_policy_weight,
+        retrieval_continuation_weight: params.retrieval_continuation_weight,
+        retrieval_continuation_plies: params.retrieval_continuation_plies,
+        retrieval_structure_gate_strength: params.retrieval_structure_gate_strength,
+        retrieval_structure_gate_power: params.retrieval_structure_gate_power,
         ..Default::default()
     })
 }

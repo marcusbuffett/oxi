@@ -95,6 +95,8 @@ pub mod move_accuracy_metric;
 #[cfg(feature = "train")]
 pub mod norm_debug;
 #[cfg(feature = "train")]
+pub mod opening_family_metric;
+#[cfg(feature = "train")]
 pub mod pgn_processor;
 #[cfg(feature = "train")]
 pub mod policy_loss_metric;

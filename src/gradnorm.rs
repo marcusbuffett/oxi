@@ -36,6 +36,10 @@ impl GradNormTask {
         .into_iter()
     }
 
+    fn managed_by_gradnorm(&self) -> bool {
+        !matches!(self, GradNormTask::Retrieval)
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             GradNormTask::Policy => "policy",
@@ -79,7 +83,7 @@ struct TaskState {
 
 impl TaskState {
     fn new(task: GradNormTask, initial_weight: f32, priority: f32) -> Self {
-        let enabled = initial_weight > 0.0;
+        let enabled = task.managed_by_gradnorm() && initial_weight > 0.0;
         Self {
             task,
             weight: initial_weight.max(0.0),
@@ -240,7 +244,11 @@ impl GradNormState {
             };
 
             task_state.priority = priority.max(EPS);
-            if configured_weight <= 0.0 {
+            if !task_state.task.managed_by_gradnorm() {
+                task_state.weight = configured_weight.max(0.0);
+                task_state.initial_weight = configured_weight.max(0.0);
+                task_state.enabled = false;
+            } else if configured_weight <= 0.0 {
                 task_state.weight = 0.0;
                 task_state.initial_weight = 0.0;
                 task_state.enabled = false;
@@ -282,7 +290,7 @@ impl GradNormState {
                 GradNormTask::Retrieval => config.retrieval_loss_weight(),
             };
             task_state.weight = weight;
-            task_state.enabled = weight > 0.0;
+            task_state.enabled = task_state.task.managed_by_gradnorm() && weight > 0.0;
         }
     }
 

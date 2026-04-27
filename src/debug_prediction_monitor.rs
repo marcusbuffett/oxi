@@ -287,6 +287,7 @@ fn build_debug_position(dataset: &OXIDataset, spec: &DebugPositionSpec) -> Resul
         outcome: 0.5,
         previous_fens,
         previous_moves,
+        future_moves: vec![],
         time_remaining_self,
         time_remaining_oppo,
         time_used_for_move: 0,
@@ -294,6 +295,7 @@ fn build_debug_position(dataset: &OXIDataset, spec: &DebugPositionSpec) -> Resul
         move_count,
         material_imbalance_history: material_history,
         is_puzzle: false,
+        opening_family_labels: vec![],
     };
 
     let item = dataset

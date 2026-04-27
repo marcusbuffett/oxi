@@ -493,6 +493,9 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         retrieval_positive_count: output.retrieval_positive_count,
         retrieval_positive_sim: output.retrieval_positive_sim,
         retrieval_negative_sim: output.retrieval_negative_sim,
+        retrieval_opening_family_match_rate: output.retrieval_opening_family_match_rate,
+        retrieval_opening_family_pair_count: output.retrieval_opening_family_pair_count,
+        retrieval_opening_family_coverage: output.retrieval_opening_family_coverage,
         trunk_retrieval_loss_f32: output.trunk_retrieval_loss_f32,
         trunk_retrieval_pair_count: output.trunk_retrieval_pair_count,
         trunk_retrieval_positive_count: output.trunk_retrieval_positive_count,
@@ -565,6 +568,9 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_retrieval_positive_count = 0.0f32;
     let mut sum_retrieval_positive_sim_weighted = 0.0f32;
     let mut sum_retrieval_negative_sim_weighted = 0.0f32;
+    let mut sum_retrieval_opening_family_match_weighted = 0.0f32;
+    let mut sum_retrieval_opening_family_pair_count = 0.0f32;
+    let mut sum_retrieval_opening_family_coverage = 0.0f32;
     let mut sum_trunk_retrieval_loss_f32 = 0.0f32;
     let mut sum_trunk_retrieval_pair_count = 0.0f32;
     let mut sum_trunk_retrieval_positive_count = 0.0f32;
@@ -634,6 +640,11 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
             output.retrieval_positive_sim * output.retrieval_positive_count;
         sum_retrieval_negative_sim_weighted +=
             output.retrieval_negative_sim * retrieval_negative_count;
+        sum_retrieval_opening_family_match_weighted +=
+            output.retrieval_opening_family_match_rate * output.retrieval_opening_family_pair_count;
+        sum_retrieval_opening_family_pair_count += output.retrieval_opening_family_pair_count;
+        sum_retrieval_opening_family_coverage +=
+            output.retrieval_opening_family_coverage * batch_scalar;
         sum_trunk_retrieval_loss_f32 += output.trunk_retrieval_loss_f32 * batch_scalar;
         sum_trunk_retrieval_pair_count += output.trunk_retrieval_pair_count;
         sum_trunk_retrieval_positive_count += output.trunk_retrieval_positive_count;
@@ -790,6 +801,13 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         } else {
             0.0
         },
+        retrieval_opening_family_match_rate: if sum_retrieval_opening_family_pair_count > 0.0 {
+            sum_retrieval_opening_family_match_weighted / sum_retrieval_opening_family_pair_count
+        } else {
+            0.0
+        },
+        retrieval_opening_family_pair_count: sum_retrieval_opening_family_pair_count,
+        retrieval_opening_family_coverage: sum_retrieval_opening_family_coverage / total_scalar,
         trunk_retrieval_loss_f32: sum_trunk_retrieval_loss_f32 / total_scalar,
         trunk_retrieval_pair_count: sum_trunk_retrieval_pair_count,
         trunk_retrieval_positive_count: sum_trunk_retrieval_positive_count,
@@ -828,7 +846,6 @@ where
         (GradNormTask::Auxiliary, weights.aux),
         (GradNormTask::Calibration, weights.calibration),
         (GradNormTask::PolicyRegret, weights.policy_regret),
-        (GradNormTask::Retrieval, weights.retrieval),
     ];
 
     for (task, weight) in tasks {
@@ -3091,7 +3108,7 @@ where
         }
 
         if output.retrieval_pair_count > 0.0 {
-            let retrieval_loss_kind = if config.retrieval_uses_policy_overlap() {
+            let retrieval_loss_kind = if config.retrieval_uses_mse() {
                 "MSE"
             } else {
                 "BCE"
@@ -3102,6 +3119,9 @@ where
             let retrieval_positive_sim = output.retrieval_positive_sim as f64;
             let retrieval_negative_sim = output.retrieval_negative_sim as f64;
             let retrieval_sim_gap = retrieval_positive_sim - retrieval_negative_sim;
+            let opening_family_match_rate = output.retrieval_opening_family_match_rate as f64;
+            let opening_family_pairs = output.retrieval_opening_family_pair_count as f64;
+            let opening_family_coverage = output.retrieval_opening_family_coverage as f64;
             let retrieval_gradnorm = gradnorm_snapshot
                 .iter()
                 .find(|status| status.task == GradNormTask::Retrieval);
@@ -3140,18 +3160,46 @@ where
             });
             if let Some(status) = retrieval_gradnorm {
                 let weight = status.weight as f64;
+                let weight_label = if status.enabled {
+                    "GradNorm Weight"
+                } else {
+                    "Fixed Weight"
+                };
                 renderer.update_train(MetricState::Numeric {
-                    name: "Retrieval Loss|GradNorm Weight".to_string(),
+                    name: format!("Retrieval Loss|{weight_label}"),
                     entry: SerializedEntry::new(
                         format!("Weight: {weight:.6}"),
                         format!("{weight:.6}"),
                     ),
                     value: NumericEntry::Value(weight),
                 });
-                metric_logger.log("retrieval_gradnorm_weight", iteration, weight);
-                if let Some(grad_norm) = status.last_grad_norm {
-                    metric_logger.log("retrieval_gradnorm_grad", iteration, grad_norm as f64);
+                if status.enabled {
+                    metric_logger.log("retrieval_gradnorm_weight", iteration, weight);
+                    if let Some(grad_norm) = status.last_grad_norm {
+                        metric_logger.log("retrieval_gradnorm_grad", iteration, grad_norm as f64);
+                    }
+                } else {
+                    metric_logger.log("retrieval_fixed_weight", iteration, weight);
                 }
+            }
+
+            if opening_family_pairs > 0.0 {
+                renderer.update_train(MetricState::Numeric {
+                    name: "Retrieval Opening|Family Match".to_string(),
+                    entry: SerializedEntry::new(
+                        format!("Family match: {opening_family_match_rate:.3}"),
+                        format!("{opening_family_match_rate:.3}"),
+                    ),
+                    value: NumericEntry::Value(opening_family_match_rate),
+                });
+                renderer.update_train(MetricState::Numeric {
+                    name: "Retrieval Opening|Coverage".to_string(),
+                    entry: SerializedEntry::new(
+                        format!("Coverage: {opening_family_coverage:.3}"),
+                        format!("{opening_family_coverage:.3}"),
+                    ),
+                    value: NumericEntry::Value(opening_family_coverage),
+                });
             }
 
             metric_logger.log("retrieval_loss", iteration, retrieval_loss);
@@ -3160,10 +3208,25 @@ where
             metric_logger.log("retrieval_positive_sim", iteration, retrieval_positive_sim);
             metric_logger.log("retrieval_negative_sim", iteration, retrieval_negative_sim);
             metric_logger.log("retrieval_sim_gap", iteration, retrieval_sim_gap);
+            metric_logger.log(
+                "retrieval_opening_family_match_rate",
+                iteration,
+                opening_family_match_rate,
+            );
+            metric_logger.log(
+                "retrieval_opening_family_pair_count",
+                iteration,
+                opening_family_pairs,
+            );
+            metric_logger.log(
+                "retrieval_opening_family_coverage",
+                iteration,
+                opening_family_coverage,
+            );
         }
 
         if output.trunk_retrieval_pair_count > 0.0 {
-            let retrieval_loss_kind = if config.retrieval_uses_policy_overlap() {
+            let retrieval_loss_kind = if config.retrieval_uses_mse() {
                 "MSE"
             } else {
                 "BCE"
