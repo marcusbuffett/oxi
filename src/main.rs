@@ -475,7 +475,7 @@ fn default_retrieval_structure_gate_strength() -> f32 {
     1.0
 }
 fn default_retrieval_structure_gate_power() -> f32 {
-    0.5
+    0.25
 }
 /// Load a Config from a model directory's params.json file.
 /// Only reads architecture params, fills the rest with defaults — same approach as the production bot.
