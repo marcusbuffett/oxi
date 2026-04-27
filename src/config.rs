@@ -483,7 +483,7 @@ fn default_retrieval_structure_gate_strength() -> f32 {
     1.0
 }
 fn default_retrieval_structure_gate_power() -> f32 {
-    0.25
+    0.2
 }
 fn default_gradnorm_calibration_priority() -> f32 {
     2.0
