@@ -628,11 +628,12 @@ impl<B: Backend> OXIModel<B> {
 
         let (pair_mask, pair_count) = self.off_diagonal_mask(batch_size, &device);
         let structure_gate = self.retrieval_structure_gate(items, batch_size, &device);
-        let semantic_sim = semantic_embeddings
+        let semantic_sim = (semantic_embeddings
             .clone()
             .detach()
             .matmul(semantic_embeddings.detach().transpose())
-            .clamp_min(0.0);
+            + 1.0)
+            / 2.0;
         let target = semantic_sim * structure_gate.detach();
 
         let sim = embeddings.clone().matmul(embeddings.transpose());
@@ -820,11 +821,12 @@ impl<B: Backend> OXIModel<B> {
         let structure_gate = self.retrieval_structure_gate(items, batch_size, &device);
         let target_indices = Self::retrieval_target_move_indices(items);
 
-        let semantic_sim = semantic_embeddings
+        let semantic_sim = (semantic_embeddings
             .clone()
             .detach()
             .matmul(semantic_embeddings.detach().transpose())
-            .clamp_min(0.0);
+            + 1.0)
+            / 2.0;
         let semantic_weight = config.retrieval_semantic_weight();
         let policy_weight = if policy_probs.is_some() {
             config.retrieval_policy_weight()

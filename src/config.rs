@@ -341,7 +341,8 @@ pub struct Config {
 
     /// Mixed-game retrieval target weights. They are normalized by their sum
     /// at use time, so sweeps can set any component to zero without retuning
-    /// the other weights.
+    /// the other weights. The default keeps the target semantic-only after
+    /// continuation-overlap ablations underperformed.
     #[serde(default = "default_retrieval_semantic_weight")]
     pub retrieval_semantic_weight: f32,
     #[serde(default = "default_retrieval_policy_weight")]
@@ -473,7 +474,7 @@ fn default_retrieval_policy_weight() -> f32 {
     0.0
 }
 fn default_retrieval_continuation_weight() -> f32 {
-    0.3
+    0.0
 }
 fn default_retrieval_continuation_plies() -> usize {
     4
@@ -482,7 +483,7 @@ fn default_retrieval_structure_gate_strength() -> f32 {
     1.0
 }
 fn default_retrieval_structure_gate_power() -> f32 {
-    1.0
+    0.5
 }
 fn default_gradnorm_calibration_priority() -> f32 {
     2.0
