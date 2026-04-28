@@ -94,6 +94,11 @@ struct RetrievalStructureComponents {
     role_count_similarity: f32,
     non_pawn_role_count_similarity: f32,
     pawn_file_similarity: f32,
+    white_pawn_file_similarity: f32,
+    black_pawn_file_similarity: f32,
+    balanced_pawn_file_similarity: f32,
+    pawn_file_missing_similarity: f32,
+    open_file_similarity: f32,
     center_pawn_similarity: f32,
     pawn_wing_similarity: f32,
     nearby_non_pawn_similarity: f32,
@@ -511,6 +516,8 @@ impl<B: Backend> OXIModel<B> {
         let mut role_counts_b = [0.0f32; crate::config::PIECE_IDENTITY_FEATURES];
         let mut pawn_files_a = [0.0f32; 16];
         let mut pawn_files_b = [0.0f32; 16];
+        let mut open_files_a = [0.0f32; 8];
+        let mut open_files_b = [0.0f32; 8];
         let mut pawn_wings_a = [0.0f32; 6];
         let mut pawn_wings_b = [0.0f32; 6];
         let mut non_pawns_a = Vec::new();
@@ -599,6 +606,28 @@ impl<B: Backend> OXIModel<B> {
                 Self::count_jaccard(&role_counts_a[7..12], &role_counts_b[7..12]),
             );
         let pawn_file_similarity = Self::count_jaccard(&pawn_files_a, &pawn_files_b);
+        let white_pawn_file_similarity =
+            Self::count_jaccard(&pawn_files_a[0..8], &pawn_files_b[0..8]);
+        let black_pawn_file_similarity =
+            Self::count_jaccard(&pawn_files_a[8..16], &pawn_files_b[8..16]);
+        let balanced_pawn_file_similarity =
+            white_pawn_file_similarity.min(black_pawn_file_similarity);
+        for file in 0..8 {
+            open_files_a[file] = if pawn_files_a[file] == 0.0 && pawn_files_a[file + 8] == 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+            open_files_b[file] = if pawn_files_b[file] == 0.0 && pawn_files_b[file + 8] == 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        let pawn_file_missing_similarity = 1.0
+            - Self::binary_hamming_distance(&pawn_files_a, &pawn_files_b)
+                / pawn_files_a.len().max(1) as f32;
+        let open_file_similarity = Self::count_jaccard(&open_files_a, &open_files_b);
         let pawn_wing_similarity = Self::count_jaccard(&pawn_wings_a, &pawn_wings_b);
         let nearby_non_pawn_similarity = Self::nearby_piece_similarity(&non_pawns_a, &non_pawns_b);
         let ply_gap = a
@@ -621,6 +650,11 @@ impl<B: Backend> OXIModel<B> {
             role_count_similarity,
             non_pawn_role_count_similarity,
             pawn_file_similarity,
+            white_pawn_file_similarity,
+            black_pawn_file_similarity,
+            balanced_pawn_file_similarity,
+            pawn_file_missing_similarity,
+            open_file_similarity,
             center_pawn_similarity,
             pawn_wing_similarity,
             nearby_non_pawn_similarity,
@@ -657,6 +691,14 @@ impl<B: Backend> OXIModel<B> {
         } else {
             1.0
         }
+    }
+
+    #[cfg(feature = "train")]
+    fn binary_hamming_distance(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .filter(|(x, y)| (**x > 0.5) != (**y > 0.5))
+            .count() as f32
     }
 
     #[cfg(feature = "train")]
@@ -2715,10 +2757,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         results.sort_by(|a, b| {
-            b.auc
-                .total_cmp(&a.auc)
+            b.top_match
+                .total_cmp(&a.top_match)
                 .then_with(|| b.macro_top_match.total_cmp(&a.macro_top_match))
-                .then_with(|| b.top_match.total_cmp(&a.top_match))
+                .then_with(|| b.auc.total_cmp(&a.auc))
         });
 
         println!(
@@ -2754,10 +2796,15 @@ mod tests {
         }
     }
 
-    const STRUCTURAL_PROXY_CANDIDATES: [&str; 40] = [
+    const STRUCTURAL_PROXY_CANDIDATES: [&str; 58] = [
         "current",
         "pawn_exact",
         "pawn_file",
+        "white_pawn_file",
+        "black_pawn_file",
+        "balanced_pawn_file",
+        "pawn_file_missing",
+        "open_file",
         "center_pawn",
         "pawn_wing",
         "piece_exact",
@@ -2771,10 +2818,17 @@ mod tests {
         "pawn_file_nearby_mean",
         "pawn_file_center_mean",
         "pawn_file_wing_mean",
+        "balanced_file_center_mean",
+        "missing_file_center_mean",
+        "open_file_center_mean",
         "pawn_non_pawn_mean",
         "pawn_file_non_pawn_mean",
+        "balanced_file_non_pawn_mean",
         "pawn_exact_file_product",
         "pawn_file_center_product",
+        "balanced_file_center_product",
+        "missing_file_center_product",
+        "open_file_center_product",
         "pawn_file_role_product",
         "pawn_file_nearby_product",
         "pawn_file_non_pawn_product",
@@ -2787,6 +2841,12 @@ mod tests {
         "pawn_skeleton_center_wing_soft",
         "pawn_skeleton_center_wing_role",
         "pawn_skeleton_center_wing_nearby",
+        "pawn_skeleton_balanced_file",
+        "pawn_skeleton_missing_file",
+        "pawn_skeleton_open_file",
+        "pawn_skeleton_center_balanced_file",
+        "pawn_skeleton_center_missing_file",
+        "pawn_skeleton_center_open_file",
         "pawn_blend_soft_pieces",
         "pawn_blend_soft_shape",
         "piece_soft_gates",
@@ -2833,7 +2893,7 @@ mod tests {
     }
 
     #[cfg(feature = "train")]
-    fn structural_proxy_candidate_scores(c: RetrievalStructureComponents) -> [f32; 40] {
+    fn structural_proxy_candidate_scores(c: RetrievalStructureComponents) -> [f32; 58] {
         let soft_progress_gate = c.ply_gate.powf(0.25) * c.material_gate.powf(0.25) * c.source_gate;
         let pawn_skeleton = c.pawn_similarity.powf(2.0) * c.source_gate;
         let current_no_ply_material =
@@ -2856,6 +2916,11 @@ mod tests {
             c.current_score(),
             c.pawn_similarity,
             c.pawn_file_similarity,
+            c.white_pawn_file_similarity,
+            c.black_pawn_file_similarity,
+            c.balanced_pawn_file_similarity,
+            c.pawn_file_missing_similarity,
+            c.open_file_similarity,
             c.center_pawn_similarity,
             c.pawn_wing_similarity,
             c.piece_similarity,
@@ -2869,10 +2934,17 @@ mod tests {
             0.55 * c.pawn_file_similarity + 0.45 * c.nearby_non_pawn_similarity,
             0.5 * c.pawn_file_similarity + 0.5 * c.center_pawn_similarity,
             0.5 * c.pawn_file_similarity + 0.5 * c.pawn_wing_similarity,
+            0.5 * c.balanced_pawn_file_similarity + 0.5 * c.center_pawn_similarity,
+            0.5 * c.pawn_file_missing_similarity + 0.5 * c.center_pawn_similarity,
+            0.5 * c.open_file_similarity + 0.5 * c.center_pawn_similarity,
             0.55 * c.pawn_similarity + 0.45 * c.non_pawn_similarity,
             0.55 * c.pawn_file_similarity + 0.45 * c.non_pawn_similarity,
+            0.55 * c.balanced_pawn_file_similarity + 0.45 * c.non_pawn_similarity,
             c.pawn_similarity * c.pawn_file_similarity,
             c.pawn_file_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
+            c.balanced_pawn_file_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
+            c.pawn_file_missing_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
+            c.open_file_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
             c.pawn_file_similarity * (0.5 + 0.5 * c.role_count_similarity),
             c.pawn_file_similarity * (0.5 + 0.5 * c.nearby_non_pawn_similarity),
             c.pawn_file_similarity * (0.5 + 0.5 * c.non_pawn_similarity),
@@ -2893,6 +2965,14 @@ mod tests {
                     + 0.25 * c.center_pawn_similarity
                     + 0.2 * c.pawn_wing_similarity
                     + 0.15 * c.nearby_non_pawn_similarity),
+            pawn_skeleton * (0.5 + 0.5 * c.balanced_pawn_file_similarity),
+            pawn_skeleton * (0.5 + 0.5 * c.pawn_file_missing_similarity),
+            pawn_skeleton * (0.5 + 0.5 * c.open_file_similarity),
+            pawn_skeleton
+                * (0.45 + 0.35 * c.center_pawn_similarity + 0.2 * c.balanced_pawn_file_similarity),
+            pawn_skeleton
+                * (0.45 + 0.35 * c.center_pawn_similarity + 0.2 * c.pawn_file_missing_similarity),
+            pawn_skeleton * (0.45 + 0.35 * c.center_pawn_similarity + 0.2 * c.open_file_similarity),
             average(&[
                 (0.55, c.pawn_similarity),
                 (0.25, c.pawn_file_similarity),
