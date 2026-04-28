@@ -2368,6 +2368,9 @@ mod tests {
     use crate::config::{FEATURES_PER_TOKEN, NUM_GLOBALS};
     use crate::test_backend::{test_device, TestBackend};
     use burn::tensor::TensorData;
+    use rand::{Rng, SeedableRng};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[cfg(feature = "train")]
     #[test]
@@ -2389,6 +2392,281 @@ mod tests {
             OXIModel::<TestBackend>::future_continuation_overlap(&a, &b, 4),
             0.5
         );
+    }
+
+    #[cfg(feature = "train")]
+    #[test]
+    #[ignore]
+    fn structural_similarity_opening_family_proxy() {
+        let config = crate::config::global_config().cloned().unwrap_or_else(|| {
+            let config = ModelConfig::default();
+            let _ = crate::config::set_global_config(config.clone());
+            config
+        });
+        let data_path = std::env::var("STRUCTURAL_GATE_DATA_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("../data"));
+        let max_items = env_usize("STRUCTURAL_GATE_MAX_ITEMS", 2_000);
+        let max_scan = env_usize("STRUCTURAL_GATE_MAX_SCAN", 100_000);
+        let top_k = env_usize("STRUCTURAL_GATE_TOP_K", 5);
+        let seed = env_usize("STRUCTURAL_GATE_SEED", 42) as u64;
+        let gate_power = env_f32(
+            "STRUCTURAL_GATE_POWER",
+            config.retrieval_structure_gate_power(),
+        );
+
+        let examples_iter = crate::pgn_processor::process_pgn_directory_iter(&data_path)
+            .unwrap_or_else(|err| panic!("failed to load PGN examples from {data_path:?}: {err}"));
+        let dataset = crate::dataset::OXIDataset::new(Vec::new(), config);
+        let mut items = Vec::with_capacity(max_items);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut scanned = 0usize;
+        let mut labeled_seen = 0usize;
+        for example in examples_iter.take(max_scan) {
+            scanned += 1;
+            if example.opening_family_labels.is_empty() {
+                continue;
+            }
+            let Ok(item) = dataset.process_example(&example) else {
+                continue;
+            };
+            if item.opening_family_labels.is_empty() {
+                continue;
+            }
+            labeled_seen += 1;
+            if items.len() < max_items {
+                items.push(item);
+            } else {
+                let replacement_idx = rng.random_range(0..labeled_seen);
+                if replacement_idx < max_items {
+                    items[replacement_idx] = item;
+                }
+            }
+        }
+
+        assert!(
+            items.len() >= 100,
+            "need at least 100 opening-family-labeled items, got {} after scanning {} examples",
+            items.len(),
+            scanned
+        );
+
+        let label_sets = items
+            .iter()
+            .map(|item| {
+                item.opening_family_labels
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut positive_scores = Vec::new();
+        let mut negative_scores = Vec::new();
+        let mut raw_top = vec![Vec::<(f32, bool)>::with_capacity(top_k + 1); items.len()];
+        let mut same_pair_count = 0usize;
+        let mut diff_pair_count = 0usize;
+
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                let same_family = label_sets[i]
+                    .iter()
+                    .any(|label| label_sets[j].contains(label));
+                let raw_score =
+                    OXIModel::<TestBackend>::retrieval_structure_similarity(&items[i], &items[j]);
+
+                if same_family {
+                    same_pair_count += 1;
+                    positive_scores.push(raw_score);
+                } else {
+                    diff_pair_count += 1;
+                    negative_scores.push(raw_score);
+                }
+                push_top_candidate(&mut raw_top[i], top_k, raw_score, same_family);
+                push_top_candidate(&mut raw_top[j], top_k, raw_score, same_family);
+            }
+        }
+
+        assert!(
+            !positive_scores.is_empty() && !negative_scores.is_empty(),
+            "need both positive and negative opening-family pairs, got pos={} neg={}",
+            positive_scores.len(),
+            negative_scores.len()
+        );
+
+        let raw_auc = roc_auc(&positive_scores, &negative_scores);
+        let raw_brier = balanced_brier(&positive_scores, &negative_scores, |x| x);
+        let raw_log_loss = balanced_log_loss(&positive_scores, &negative_scores, |x| x);
+        let effective_brier =
+            balanced_brier(&positive_scores, &negative_scores, |x| x.powf(gate_power));
+        let effective_log_loss =
+            balanced_log_loss(&positive_scores, &negative_scores, |x| x.powf(gate_power));
+        let top_match = top_k_match_rate(&raw_top);
+
+        let positive_mean = mean(&positive_scores);
+        let negative_mean = mean(&negative_scores);
+        let positive_rate =
+            same_pair_count as f64 / (same_pair_count + diff_pair_count).max(1) as f64;
+
+        println!(
+            "STRUCTURAL_FAMILY_PROXY data_path={} scanned={} labeled_seen={} sampled_items={} seed={} pairs={} positives={} negatives={} positive_rate={:.6}",
+            data_path.display(),
+            scanned,
+            labeled_seen,
+            items.len(),
+            seed,
+            same_pair_count + diff_pair_count,
+            same_pair_count,
+            diff_pair_count,
+            positive_rate
+        );
+        println!(
+            "STRUCTURAL_FAMILY_PROXY headline_auc={:.6} top{}_match={:.6} mean_pos={:.6} mean_neg={:.6} mean_gap={:.6}",
+            raw_auc,
+            top_k,
+            top_match,
+            positive_mean,
+            negative_mean,
+            positive_mean - negative_mean
+        );
+        println!(
+            "STRUCTURAL_FAMILY_PROXY calibration raw_brier={:.6} raw_log_loss={:.6} effective_power={:.3} effective_brier={:.6} effective_log_loss={:.6}",
+            raw_brier,
+            raw_log_loss,
+            gate_power,
+            effective_brier,
+            effective_log_loss
+        );
+    }
+
+    #[cfg(feature = "train")]
+    fn env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    #[cfg(feature = "train")]
+    fn env_f32(key: &str, default: f32) -> f32 {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    #[cfg(feature = "train")]
+    fn push_top_candidate(top: &mut Vec<(f32, bool)>, top_k: usize, score: f32, same_family: bool) {
+        if top_k == 0 {
+            return;
+        }
+        top.push((score, same_family));
+        top.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        top.truncate(top_k);
+    }
+
+    #[cfg(feature = "train")]
+    fn top_k_match_rate(tops: &[Vec<(f32, bool)>]) -> f64 {
+        let mut matches = 0usize;
+        let mut total = 0usize;
+        for top in tops {
+            for (_, same_family) in top {
+                total += 1;
+                if *same_family {
+                    matches += 1;
+                }
+            }
+        }
+        matches as f64 / total.max(1) as f64
+    }
+
+    #[cfg(feature = "train")]
+    fn mean(values: &[f32]) -> f64 {
+        values.iter().map(|value| *value as f64).sum::<f64>() / values.len().max(1) as f64
+    }
+
+    #[cfg(feature = "train")]
+    fn roc_auc(positive_scores: &[f32], negative_scores: &[f32]) -> f64 {
+        let mut ranked = Vec::with_capacity(positive_scores.len() + negative_scores.len());
+        ranked.extend(positive_scores.iter().map(|score| (*score, true)));
+        ranked.extend(negative_scores.iter().map(|score| (*score, false)));
+        ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut rank_sum_positive = 0.0f64;
+        let mut rank = 1usize;
+        let mut idx = 0usize;
+        while idx < ranked.len() {
+            let score = ranked[idx].0;
+            let start_rank = rank;
+            let mut end = idx + 1;
+            while end < ranked.len() && ranked[end].0 == score {
+                end += 1;
+            }
+            let end_rank = rank + (end - idx) - 1;
+            let average_rank = (start_rank + end_rank) as f64 / 2.0;
+            for (_, is_positive) in &ranked[idx..end] {
+                if *is_positive {
+                    rank_sum_positive += average_rank;
+                }
+            }
+            rank += end - idx;
+            idx = end;
+        }
+
+        let n_pos = positive_scores.len() as f64;
+        let n_neg = negative_scores.len() as f64;
+        (rank_sum_positive - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg).max(1.0)
+    }
+
+    #[cfg(feature = "train")]
+    fn balanced_brier(
+        positive_scores: &[f32],
+        negative_scores: &[f32],
+        transform: impl Fn(f32) -> f32,
+    ) -> f64 {
+        let pos = positive_scores
+            .iter()
+            .map(|score| {
+                let p = transform(*score) as f64;
+                (1.0 - p).powi(2)
+            })
+            .sum::<f64>()
+            / positive_scores.len().max(1) as f64;
+        let neg = negative_scores
+            .iter()
+            .map(|score| {
+                let p = transform(*score) as f64;
+                p.powi(2)
+            })
+            .sum::<f64>()
+            / negative_scores.len().max(1) as f64;
+        (pos + neg) / 2.0
+    }
+
+    #[cfg(feature = "train")]
+    fn balanced_log_loss(
+        positive_scores: &[f32],
+        negative_scores: &[f32],
+        transform: impl Fn(f32) -> f32,
+    ) -> f64 {
+        let eps = 1e-6f64;
+        let pos = positive_scores
+            .iter()
+            .map(|score| {
+                let p = (transform(*score) as f64).clamp(eps, 1.0 - eps);
+                -p.ln()
+            })
+            .sum::<f64>()
+            / positive_scores.len().max(1) as f64;
+        let neg = negative_scores
+            .iter()
+            .map(|score| {
+                let p = (transform(*score) as f64).clamp(eps, 1.0 - eps);
+                -(1.0 - p).ln()
+            })
+            .sum::<f64>()
+            / negative_scores.len().max(1) as f64;
+        (pos + neg) / 2.0
     }
 
     #[test]
