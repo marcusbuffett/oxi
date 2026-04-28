@@ -84,6 +84,25 @@ pub struct OXIModel<B: Backend> {
     retrieval_head: Linear<B>,
 }
 
+#[cfg(feature = "train")]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct RetrievalStructureComponents {
+    pawn_similarity: f32,
+    piece_similarity: f32,
+    non_pawn_similarity: f32,
+    ply_gate: f32,
+    material_gate: f32,
+    source_gate: f32,
+}
+
+#[cfg(feature = "train")]
+impl RetrievalStructureComponents {
+    fn current_score(self) -> f32 {
+        (self.pawn_similarity.powf(2.0) * self.source_gate).clamp(0.0, 1.0)
+    }
+}
+
 impl<B: Backend> OXIModel<B> {
     pub fn new(device: &Device<B>, config: &ModelConfig) -> Self {
         let embed_dim = config.embed_dim();
@@ -463,10 +482,20 @@ impl<B: Backend> OXIModel<B> {
         a: &crate::dataset::ChessItem,
         b: &crate::dataset::ChessItem,
     ) -> f32 {
+        Self::retrieval_structure_components(a, b).current_score()
+    }
+
+    #[cfg(feature = "train")]
+    fn retrieval_structure_components(
+        a: &crate::dataset::ChessItem,
+        b: &crate::dataset::ChessItem,
+    ) -> RetrievalStructureComponents {
         let mut pawn_union = 0.0f32;
         let mut pawn_same = 0.0f32;
         let mut piece_union = 0.0f32;
         let mut piece_same = 0.0f32;
+        let mut non_pawn_union = 0.0f32;
+        let mut non_pawn_same = 0.0f32;
 
         for square in 0..64 {
             let piece_a = Self::piece_identity_index(a, square);
@@ -486,6 +515,15 @@ impl<B: Backend> OXIModel<B> {
                     pawn_same += 1.0;
                 }
             }
+
+            let non_pawn_a = piece_a.is_some() && !pawn_a;
+            let non_pawn_b = piece_b.is_some() && !pawn_b;
+            if non_pawn_a || non_pawn_b {
+                non_pawn_union += 1.0;
+                if piece_a == piece_b {
+                    non_pawn_same += 1.0;
+                }
+            }
         }
 
         let pawn_similarity = if pawn_union > 0.0 {
@@ -495,6 +533,11 @@ impl<B: Backend> OXIModel<B> {
         };
         let piece_similarity = if piece_union > 0.0 {
             piece_same / piece_union
+        } else {
+            1.0
+        };
+        let non_pawn_similarity = if non_pawn_union > 0.0 {
+            non_pawn_same / non_pawn_union
         } else {
             1.0
         };
@@ -511,12 +554,14 @@ impl<B: Backend> OXIModel<B> {
             0.25
         };
 
-        (pawn_similarity.powf(2.0)
-            * (0.25 + 0.75 * piece_similarity)
-            * ply_gate
-            * material_gate
-            * source_gate)
-            .clamp(0.0, 1.0)
+        RetrievalStructureComponents {
+            pawn_similarity,
+            piece_similarity,
+            non_pawn_similarity,
+            ply_gate,
+            material_gate,
+            source_gate,
+        }
     }
 
     #[cfg(feature = "train")]
@@ -2461,9 +2506,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut positive_scores = Vec::new();
-        let mut negative_scores = Vec::new();
-        let mut raw_top = vec![Vec::<(f32, bool)>::with_capacity(top_k + 1); items.len()];
+        let mut candidate_metrics = STRUCTURAL_PROXY_CANDIDATES
+            .iter()
+            .map(|name| StructuralProxyCandidateMetrics::new(name, items.len(), top_k))
+            .collect::<Vec<_>>();
         let mut same_pair_count = 0usize;
         let mut diff_pair_count = 0usize;
 
@@ -2472,41 +2518,77 @@ mod tests {
                 let same_family = label_sets[i]
                     .iter()
                     .any(|label| label_sets[j].contains(label));
-                let raw_score =
-                    OXIModel::<TestBackend>::retrieval_structure_similarity(&items[i], &items[j]);
+                let components =
+                    OXIModel::<TestBackend>::retrieval_structure_components(&items[i], &items[j]);
+                let scores = structural_proxy_candidate_scores(components);
 
                 if same_family {
                     same_pair_count += 1;
-                    positive_scores.push(raw_score);
                 } else {
                     diff_pair_count += 1;
-                    negative_scores.push(raw_score);
                 }
-                push_top_candidate(&mut raw_top[i], top_k, raw_score, same_family);
-                push_top_candidate(&mut raw_top[j], top_k, raw_score, same_family);
+                for (metric, score) in candidate_metrics.iter_mut().zip(scores) {
+                    if same_family {
+                        metric.positive_scores.push(score);
+                    } else {
+                        metric.negative_scores.push(score);
+                    }
+                    push_top_candidate(&mut metric.top[i], top_k, score, same_family);
+                    push_top_candidate(&mut metric.top[j], top_k, score, same_family);
+                }
             }
         }
 
         assert!(
-            !positive_scores.is_empty() && !negative_scores.is_empty(),
+            !candidate_metrics[0].positive_scores.is_empty()
+                && !candidate_metrics[0].negative_scores.is_empty(),
             "need both positive and negative opening-family pairs, got pos={} neg={}",
-            positive_scores.len(),
-            negative_scores.len()
+            candidate_metrics[0].positive_scores.len(),
+            candidate_metrics[0].negative_scores.len()
         );
 
-        let raw_auc = roc_auc(&positive_scores, &negative_scores);
-        let raw_brier = balanced_brier(&positive_scores, &negative_scores, |x| x);
-        let raw_log_loss = balanced_log_loss(&positive_scores, &negative_scores, |x| x);
-        let effective_brier =
-            balanced_brier(&positive_scores, &negative_scores, |x| x.powf(gate_power));
-        let effective_log_loss =
-            balanced_log_loss(&positive_scores, &negative_scores, |x| x.powf(gate_power));
-        let top_match = top_k_match_rate(&raw_top);
-
-        let positive_mean = mean(&positive_scores);
-        let negative_mean = mean(&negative_scores);
         let positive_rate =
             same_pair_count as f64 / (same_pair_count + diff_pair_count).max(1) as f64;
+        let mut results = candidate_metrics
+            .iter()
+            .map(|metric| {
+                let positive_mean = mean(&metric.positive_scores);
+                let negative_mean = mean(&metric.negative_scores);
+                StructuralProxyCandidateResult {
+                    name: metric.name,
+                    auc: roc_auc(&metric.positive_scores, &metric.negative_scores),
+                    top_match: top_k_match_rate(&metric.top),
+                    positive_mean,
+                    negative_mean,
+                    mean_gap: positive_mean - negative_mean,
+                    raw_brier: balanced_brier(
+                        &metric.positive_scores,
+                        &metric.negative_scores,
+                        |x| x,
+                    ),
+                    raw_log_loss: balanced_log_loss(
+                        &metric.positive_scores,
+                        &metric.negative_scores,
+                        |x| x,
+                    ),
+                    effective_brier: balanced_brier(
+                        &metric.positive_scores,
+                        &metric.negative_scores,
+                        |x| x.powf(gate_power),
+                    ),
+                    effective_log_loss: balanced_log_loss(
+                        &metric.positive_scores,
+                        &metric.negative_scores,
+                        |x| x.powf(gate_power),
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(|a, b| {
+            b.auc
+                .total_cmp(&a.auc)
+                .then_with(|| b.top_match.total_cmp(&a.top_match))
+        });
 
         println!(
             "STRUCTURAL_FAMILY_PROXY data_path={} scanned={} labeled_seen={} sampled_items={} seed={} pairs={} positives={} negatives={} positive_rate={:.6}",
@@ -2520,23 +2602,95 @@ mod tests {
             diff_pair_count,
             positive_rate
         );
-        println!(
-            "STRUCTURAL_FAMILY_PROXY headline_auc={:.6} top{}_match={:.6} mean_pos={:.6} mean_neg={:.6} mean_gap={:.6}",
-            raw_auc,
-            top_k,
-            top_match,
-            positive_mean,
-            negative_mean,
-            positive_mean - negative_mean
-        );
-        println!(
-            "STRUCTURAL_FAMILY_PROXY calibration raw_brier={:.6} raw_log_loss={:.6} effective_power={:.3} effective_brier={:.6} effective_log_loss={:.6}",
-            raw_brier,
-            raw_log_loss,
-            gate_power,
-            effective_brier,
-            effective_log_loss
-        );
+        for result in &results {
+            println!(
+                "STRUCTURAL_FAMILY_PROXY candidate={} auc={:.6} top{}_match={:.6} mean_pos={:.6} mean_neg={:.6} mean_gap={:.6} raw_brier={:.6} raw_log_loss={:.6} effective_power={:.3} effective_brier={:.6} effective_log_loss={:.6}",
+                result.name,
+                result.auc,
+                top_k,
+                result.top_match,
+                result.positive_mean,
+                result.negative_mean,
+                result.mean_gap,
+                result.raw_brier,
+                result.raw_log_loss,
+                gate_power,
+                result.effective_brier,
+                result.effective_log_loss
+            );
+        }
+    }
+
+    const STRUCTURAL_PROXY_CANDIDATES: [&str; 12] = [
+        "current",
+        "piece_only",
+        "pawn_only",
+        "non_pawn_only",
+        "pawn_piece_mean",
+        "pawn_non_pawn_mean",
+        "piece_soft_gates",
+        "additive_soft_gates",
+        "pawn_first_soft",
+        "geometric_soft",
+        "current_no_ply_material",
+        "piece_no_ply_material",
+    ];
+
+    #[cfg(feature = "train")]
+    struct StructuralProxyCandidateMetrics {
+        name: &'static str,
+        positive_scores: Vec<f32>,
+        negative_scores: Vec<f32>,
+        top: Vec<Vec<(f32, bool)>>,
+    }
+
+    #[cfg(feature = "train")]
+    impl StructuralProxyCandidateMetrics {
+        fn new(name: &'static str, item_count: usize, top_k: usize) -> Self {
+            Self {
+                name,
+                positive_scores: Vec::new(),
+                negative_scores: Vec::new(),
+                top: vec![Vec::<(f32, bool)>::with_capacity(top_k + 1); item_count],
+            }
+        }
+    }
+
+    #[cfg(feature = "train")]
+    struct StructuralProxyCandidateResult {
+        name: &'static str,
+        auc: f64,
+        top_match: f64,
+        positive_mean: f64,
+        negative_mean: f64,
+        mean_gap: f64,
+        raw_brier: f64,
+        raw_log_loss: f64,
+        effective_brier: f64,
+        effective_log_loss: f64,
+    }
+
+    #[cfg(feature = "train")]
+    fn structural_proxy_candidate_scores(c: RetrievalStructureComponents) -> [f32; 12] {
+        let soft_progress_gate = c.ply_gate.powf(0.25) * c.material_gate.powf(0.25) * c.source_gate;
+        let current_no_ply_material =
+            c.pawn_similarity.powf(2.0) * (0.25 + 0.75 * c.piece_similarity) * c.source_gate;
+
+        [
+            c.current_score(),
+            c.piece_similarity,
+            c.pawn_similarity,
+            c.non_pawn_similarity,
+            0.5 * c.pawn_similarity + 0.5 * c.piece_similarity,
+            0.55 * c.pawn_similarity + 0.45 * c.non_pawn_similarity,
+            c.piece_similarity * soft_progress_gate,
+            (0.5 * c.pawn_similarity + 0.4 * c.non_pawn_similarity + 0.1 * c.piece_similarity)
+                * soft_progress_gate,
+            c.pawn_similarity * (0.5 + 0.5 * c.non_pawn_similarity) * soft_progress_gate,
+            c.pawn_similarity.sqrt() * (0.35 + 0.65 * c.piece_similarity) * soft_progress_gate,
+            current_no_ply_material,
+            c.piece_similarity * c.source_gate,
+        ]
     }
 
     #[cfg(feature = "train")]
