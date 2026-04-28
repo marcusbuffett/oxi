@@ -91,6 +91,12 @@ struct RetrievalStructureComponents {
     pawn_similarity: f32,
     piece_similarity: f32,
     non_pawn_similarity: f32,
+    role_count_similarity: f32,
+    non_pawn_role_count_similarity: f32,
+    pawn_file_similarity: f32,
+    center_pawn_similarity: f32,
+    pawn_wing_similarity: f32,
+    nearby_non_pawn_similarity: f32,
     ply_gate: f32,
     material_gate: f32,
     source_gate: f32,
@@ -99,7 +105,10 @@ struct RetrievalStructureComponents {
 #[cfg(feature = "train")]
 impl RetrievalStructureComponents {
     fn current_score(self) -> f32 {
-        (self.pawn_similarity.powf(2.0) * self.source_gate).clamp(0.0, 1.0)
+        (self.pawn_similarity.powf(2.0)
+            * (0.5 + 0.5 * self.center_pawn_similarity)
+            * self.source_gate)
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -492,14 +501,30 @@ impl<B: Backend> OXIModel<B> {
     ) -> RetrievalStructureComponents {
         let mut pawn_union = 0.0f32;
         let mut pawn_same = 0.0f32;
+        let mut center_pawn_union = 0.0f32;
+        let mut center_pawn_same = 0.0f32;
         let mut piece_union = 0.0f32;
         let mut piece_same = 0.0f32;
         let mut non_pawn_union = 0.0f32;
         let mut non_pawn_same = 0.0f32;
+        let mut role_counts_a = [0.0f32; crate::config::PIECE_IDENTITY_FEATURES];
+        let mut role_counts_b = [0.0f32; crate::config::PIECE_IDENTITY_FEATURES];
+        let mut pawn_files_a = [0.0f32; 16];
+        let mut pawn_files_b = [0.0f32; 16];
+        let mut pawn_wings_a = [0.0f32; 6];
+        let mut pawn_wings_b = [0.0f32; 6];
+        let mut non_pawns_a = Vec::new();
+        let mut non_pawns_b = Vec::new();
 
         for square in 0..64 {
             let piece_a = Self::piece_identity_index(a, square);
             let piece_b = Self::piece_identity_index(b, square);
+            if let Some(piece) = piece_a {
+                role_counts_a[piece] += 1.0;
+            }
+            if let Some(piece) = piece_b {
+                role_counts_b[piece] += 1.0;
+            }
             if piece_a.is_some() || piece_b.is_some() {
                 piece_union += 1.0;
                 if piece_a == piece_b {
@@ -515,6 +540,22 @@ impl<B: Backend> OXIModel<B> {
                     pawn_same += 1.0;
                 }
             }
+            if pawn_a {
+                let color_offset = if matches!(piece_a, Some(6)) { 8 } else { 0 };
+                pawn_files_a[color_offset + square % 8] = 1.0;
+                pawn_wings_a[Self::pawn_wing_index(square, piece_a)] += 1.0;
+            }
+            if pawn_b {
+                let color_offset = if matches!(piece_b, Some(6)) { 8 } else { 0 };
+                pawn_files_b[color_offset + square % 8] = 1.0;
+                pawn_wings_b[Self::pawn_wing_index(square, piece_b)] += 1.0;
+            }
+            if (3..=4).contains(&(square % 8)) && (pawn_a || pawn_b) {
+                center_pawn_union += 1.0;
+                if piece_a == piece_b {
+                    center_pawn_same += 1.0;
+                }
+            }
 
             let non_pawn_a = piece_a.is_some() && !pawn_a;
             let non_pawn_b = piece_b.is_some() && !pawn_b;
@@ -523,6 +564,12 @@ impl<B: Backend> OXIModel<B> {
                 if piece_a == piece_b {
                     non_pawn_same += 1.0;
                 }
+            }
+            if non_pawn_a {
+                non_pawns_a.push((piece_a.unwrap_or(0), square));
+            }
+            if non_pawn_b {
+                non_pawns_b.push((piece_b.unwrap_or(0), square));
             }
         }
 
@@ -541,6 +588,19 @@ impl<B: Backend> OXIModel<B> {
         } else {
             1.0
         };
+        let center_pawn_similarity = if center_pawn_union > 0.0 {
+            center_pawn_same / center_pawn_union
+        } else {
+            pawn_similarity
+        };
+        let role_count_similarity = Self::count_jaccard(&role_counts_a, &role_counts_b);
+        let non_pawn_role_count_similarity =
+            Self::count_jaccard(&role_counts_a[1..6], &role_counts_b[1..6]).min(
+                Self::count_jaccard(&role_counts_a[7..12], &role_counts_b[7..12]),
+            );
+        let pawn_file_similarity = Self::count_jaccard(&pawn_files_a, &pawn_files_b);
+        let pawn_wing_similarity = Self::count_jaccard(&pawn_wings_a, &pawn_wings_b);
+        let nearby_non_pawn_similarity = Self::nearby_piece_similarity(&non_pawns_a, &non_pawns_b);
         let ply_gap = a
             .global_features
             .move_count
@@ -558,10 +618,79 @@ impl<B: Backend> OXIModel<B> {
             pawn_similarity,
             piece_similarity,
             non_pawn_similarity,
+            role_count_similarity,
+            non_pawn_role_count_similarity,
+            pawn_file_similarity,
+            center_pawn_similarity,
+            pawn_wing_similarity,
+            nearby_non_pawn_similarity,
             ply_gate,
             material_gate,
             source_gate,
         }
+    }
+
+    #[cfg(feature = "train")]
+    fn pawn_wing_index(square: usize, piece: Option<usize>) -> usize {
+        let color_offset = if matches!(piece, Some(6)) { 3 } else { 0 };
+        let file = square % 8;
+        let wing = if file <= 2 {
+            0
+        } else if file <= 4 {
+            1
+        } else {
+            2
+        };
+        color_offset + wing
+    }
+
+    #[cfg(feature = "train")]
+    fn count_jaccard(a: &[f32], b: &[f32]) -> f32 {
+        let mut intersection = 0.0f32;
+        let mut union = 0.0f32;
+        for (x, y) in a.iter().zip(b) {
+            intersection += x.min(*y);
+            union += x.max(*y);
+        }
+        if union > 0.0 {
+            intersection / union
+        } else {
+            1.0
+        }
+    }
+
+    #[cfg(feature = "train")]
+    fn nearby_piece_similarity(a: &[(usize, usize)], b: &[(usize, usize)]) -> f32 {
+        if a.is_empty() && b.is_empty() {
+            return 1.0;
+        }
+        if a.is_empty() || b.is_empty() {
+            return 0.0;
+        }
+        let forward = Self::directed_nearby_piece_similarity(a, b);
+        let backward = Self::directed_nearby_piece_similarity(b, a);
+        0.5 * (forward + backward)
+    }
+
+    #[cfg(feature = "train")]
+    fn directed_nearby_piece_similarity(a: &[(usize, usize)], b: &[(usize, usize)]) -> f32 {
+        let mut score = 0.0f32;
+        for (piece_a, square_a) in a {
+            let file_a = square_a % 8;
+            let rank_a = square_a / 8;
+            let best = b
+                .iter()
+                .filter(|(piece_b, _)| piece_a == piece_b)
+                .map(|(_, square_b)| {
+                    let file_b = square_b % 8;
+                    let rank_b = square_b / 8;
+                    let distance = file_a.abs_diff(file_b).max(rank_a.abs_diff(rank_b)) as f32;
+                    (1.0 - distance / 4.0).clamp(0.0, 1.0)
+                })
+                .fold(0.0f32, f32::max);
+            score += best;
+        }
+        score / a.len().max(1) as f32
     }
 
     #[cfg(feature = "train")]
@@ -2414,7 +2543,7 @@ mod tests {
     use crate::test_backend::{test_device, TestBackend};
     use burn::tensor::TensorData;
     use rand::{Rng, SeedableRng};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     #[cfg(feature = "train")]
@@ -2533,8 +2662,8 @@ mod tests {
                     } else {
                         metric.negative_scores.push(score);
                     }
-                    push_top_candidate(&mut metric.top[i], top_k, score, same_family);
-                    push_top_candidate(&mut metric.top[j], top_k, score, same_family);
+                    push_top_candidate(&mut metric.top[i], top_k, score, j);
+                    push_top_candidate(&mut metric.top[j], top_k, score, i);
                 }
             }
         }
@@ -2557,7 +2686,8 @@ mod tests {
                 StructuralProxyCandidateResult {
                     name: metric.name,
                     auc: roc_auc(&metric.positive_scores, &metric.negative_scores),
-                    top_match: top_k_match_rate(&metric.top),
+                    top_match: top_k_match_rate(&metric.top, &label_sets),
+                    macro_top_match: macro_top_k_match_rate(&metric.top, &label_sets),
                     positive_mean,
                     negative_mean,
                     mean_gap: positive_mean - negative_mean,
@@ -2587,6 +2717,7 @@ mod tests {
         results.sort_by(|a, b| {
             b.auc
                 .total_cmp(&a.auc)
+                .then_with(|| b.macro_top_match.total_cmp(&a.macro_top_match))
                 .then_with(|| b.top_match.total_cmp(&a.top_match))
         });
 
@@ -2604,11 +2735,13 @@ mod tests {
         );
         for result in &results {
             println!(
-                "STRUCTURAL_FAMILY_PROXY candidate={} auc={:.6} top{}_match={:.6} mean_pos={:.6} mean_neg={:.6} mean_gap={:.6} raw_brier={:.6} raw_log_loss={:.6} effective_power={:.3} effective_brier={:.6} effective_log_loss={:.6}",
+                "STRUCTURAL_FAMILY_PROXY candidate={} auc={:.6} top{}_match={:.6} macro_top{}_match={:.6} mean_pos={:.6} mean_neg={:.6} mean_gap={:.6} raw_brier={:.6} raw_log_loss={:.6} effective_power={:.3} effective_brier={:.6} effective_log_loss={:.6}",
                 result.name,
                 result.auc,
                 top_k,
                 result.top_match,
+                top_k,
+                result.macro_top_match,
                 result.positive_mean,
                 result.negative_mean,
                 result.mean_gap,
@@ -2621,13 +2754,41 @@ mod tests {
         }
     }
 
-    const STRUCTURAL_PROXY_CANDIDATES: [&str; 12] = [
+    const STRUCTURAL_PROXY_CANDIDATES: [&str; 40] = [
         "current",
-        "piece_only",
-        "pawn_only",
-        "non_pawn_only",
+        "pawn_exact",
+        "pawn_file",
+        "center_pawn",
+        "pawn_wing",
+        "piece_exact",
+        "non_pawn_exact",
+        "role_counts",
+        "non_pawn_role_counts",
+        "nearby_non_pawn",
         "pawn_piece_mean",
+        "pawn_file_piece_mean",
+        "pawn_file_role_mean",
+        "pawn_file_nearby_mean",
+        "pawn_file_center_mean",
+        "pawn_file_wing_mean",
         "pawn_non_pawn_mean",
+        "pawn_file_non_pawn_mean",
+        "pawn_exact_file_product",
+        "pawn_file_center_product",
+        "pawn_file_role_product",
+        "pawn_file_nearby_product",
+        "pawn_file_non_pawn_product",
+        "pawn_file_piece_product",
+        "pawn_skeleton_role_product",
+        "pawn_skeleton_nearby_product",
+        "pawn_skeleton_center_product",
+        "pawn_skeleton_wing_product",
+        "pawn_skeleton_center_wing_product",
+        "pawn_skeleton_center_wing_soft",
+        "pawn_skeleton_center_wing_role",
+        "pawn_skeleton_center_wing_nearby",
+        "pawn_blend_soft_pieces",
+        "pawn_blend_soft_shape",
         "piece_soft_gates",
         "additive_soft_gates",
         "pawn_first_soft",
@@ -2641,7 +2802,7 @@ mod tests {
         name: &'static str,
         positive_scores: Vec<f32>,
         negative_scores: Vec<f32>,
-        top: Vec<Vec<(f32, bool)>>,
+        top: Vec<Vec<(f32, usize)>>,
     }
 
     #[cfg(feature = "train")]
@@ -2651,7 +2812,7 @@ mod tests {
                 name,
                 positive_scores: Vec::new(),
                 negative_scores: Vec::new(),
-                top: vec![Vec::<(f32, bool)>::with_capacity(top_k + 1); item_count],
+                top: vec![Vec::<(f32, usize)>::with_capacity(top_k + 1); item_count],
             }
         }
     }
@@ -2661,6 +2822,7 @@ mod tests {
         name: &'static str,
         auc: f64,
         top_match: f64,
+        macro_top_match: f64,
         positive_mean: f64,
         negative_mean: f64,
         mean_gap: f64,
@@ -2671,18 +2833,77 @@ mod tests {
     }
 
     #[cfg(feature = "train")]
-    fn structural_proxy_candidate_scores(c: RetrievalStructureComponents) -> [f32; 12] {
+    fn structural_proxy_candidate_scores(c: RetrievalStructureComponents) -> [f32; 40] {
         let soft_progress_gate = c.ply_gate.powf(0.25) * c.material_gate.powf(0.25) * c.source_gate;
+        let pawn_skeleton = c.pawn_similarity.powf(2.0) * c.source_gate;
         let current_no_ply_material =
             c.pawn_similarity.powf(2.0) * (0.25 + 0.75 * c.piece_similarity) * c.source_gate;
+        let average = |terms: &[(f32, f32)]| -> f32 {
+            let mut numerator = 0.0f32;
+            let mut denominator = 0.0f32;
+            for (weight, value) in terms {
+                numerator += weight * value;
+                denominator += weight;
+            }
+            if denominator > 0.0 {
+                numerator / denominator
+            } else {
+                0.0
+            }
+        };
 
         [
             c.current_score(),
-            c.piece_similarity,
             c.pawn_similarity,
+            c.pawn_file_similarity,
+            c.center_pawn_similarity,
+            c.pawn_wing_similarity,
+            c.piece_similarity,
             c.non_pawn_similarity,
+            c.role_count_similarity,
+            c.non_pawn_role_count_similarity,
+            c.nearby_non_pawn_similarity,
             0.5 * c.pawn_similarity + 0.5 * c.piece_similarity,
+            0.55 * c.pawn_file_similarity + 0.45 * c.piece_similarity,
+            0.55 * c.pawn_file_similarity + 0.45 * c.role_count_similarity,
+            0.55 * c.pawn_file_similarity + 0.45 * c.nearby_non_pawn_similarity,
+            0.5 * c.pawn_file_similarity + 0.5 * c.center_pawn_similarity,
+            0.5 * c.pawn_file_similarity + 0.5 * c.pawn_wing_similarity,
             0.55 * c.pawn_similarity + 0.45 * c.non_pawn_similarity,
+            0.55 * c.pawn_file_similarity + 0.45 * c.non_pawn_similarity,
+            c.pawn_similarity * c.pawn_file_similarity,
+            c.pawn_file_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
+            c.pawn_file_similarity * (0.5 + 0.5 * c.role_count_similarity),
+            c.pawn_file_similarity * (0.5 + 0.5 * c.nearby_non_pawn_similarity),
+            c.pawn_file_similarity * (0.5 + 0.5 * c.non_pawn_similarity),
+            c.pawn_file_similarity * (0.5 + 0.5 * c.piece_similarity),
+            pawn_skeleton * (0.5 + 0.5 * c.role_count_similarity),
+            pawn_skeleton * (0.5 + 0.5 * c.nearby_non_pawn_similarity),
+            pawn_skeleton * (0.5 + 0.5 * c.center_pawn_similarity),
+            pawn_skeleton * (0.5 + 0.5 * c.pawn_wing_similarity),
+            pawn_skeleton * (0.5 + 0.25 * c.center_pawn_similarity + 0.25 * c.pawn_wing_similarity),
+            pawn_skeleton * (0.35 + 0.4 * c.center_pawn_similarity + 0.25 * c.pawn_wing_similarity),
+            pawn_skeleton
+                * (0.4
+                    + 0.25 * c.center_pawn_similarity
+                    + 0.2 * c.pawn_wing_similarity
+                    + 0.15 * c.role_count_similarity),
+            pawn_skeleton
+                * (0.4
+                    + 0.25 * c.center_pawn_similarity
+                    + 0.2 * c.pawn_wing_similarity
+                    + 0.15 * c.nearby_non_pawn_similarity),
+            average(&[
+                (0.55, c.pawn_similarity),
+                (0.25, c.pawn_file_similarity),
+                (0.20, c.piece_similarity),
+            ]),
+            average(&[
+                (0.45, c.pawn_similarity),
+                (0.25, c.pawn_file_similarity),
+                (0.15, c.center_pawn_similarity),
+                (0.15, c.role_count_similarity),
+            ]),
             c.piece_similarity * soft_progress_gate,
             (0.5 * c.pawn_similarity + 0.4 * c.non_pawn_similarity + 0.1 * c.piece_similarity)
                 * soft_progress_gate,
@@ -2710,28 +2931,56 @@ mod tests {
     }
 
     #[cfg(feature = "train")]
-    fn push_top_candidate(top: &mut Vec<(f32, bool)>, top_k: usize, score: f32, same_family: bool) {
+    fn push_top_candidate(top: &mut Vec<(f32, usize)>, top_k: usize, score: f32, neighbor: usize) {
         if top_k == 0 {
             return;
         }
-        top.push((score, same_family));
+        top.push((score, neighbor));
         top.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         top.truncate(top_k);
     }
 
     #[cfg(feature = "train")]
-    fn top_k_match_rate(tops: &[Vec<(f32, bool)>]) -> f64 {
+    fn top_k_match_rate(tops: &[Vec<(f32, usize)>], label_sets: &[HashSet<String>]) -> f64 {
         let mut matches = 0usize;
         let mut total = 0usize;
-        for top in tops {
-            for (_, same_family) in top {
+        for (i, top) in tops.iter().enumerate() {
+            for (_, neighbor) in top {
                 total += 1;
-                if *same_family {
+                if label_sets[i]
+                    .iter()
+                    .any(|label| label_sets[*neighbor].contains(label))
+                {
                     matches += 1;
                 }
             }
         }
         matches as f64 / total.max(1) as f64
+    }
+
+    #[cfg(feature = "train")]
+    fn macro_top_k_match_rate(tops: &[Vec<(f32, usize)>], label_sets: &[HashSet<String>]) -> f64 {
+        let mut per_label = HashMap::<String, (usize, usize)>::new();
+        for (i, top) in tops.iter().enumerate() {
+            for label in &label_sets[i] {
+                let entry = per_label.entry(label.clone()).or_default();
+                for (_, neighbor) in top {
+                    entry.1 += 1;
+                    if label_sets[*neighbor].contains(label) {
+                        entry.0 += 1;
+                    }
+                }
+            }
+        }
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for (matches, total) in per_label.values() {
+            if *total > 0 {
+                sum += *matches as f64 / *total as f64;
+                count += 1;
+            }
+        }
+        sum / count.max(1) as f64
     }
 
     #[cfg(feature = "train")]
