@@ -857,16 +857,8 @@ impl<B: Backend> OXIModel<B> {
         let target = mixed_target * (gate * gate_strength + (1.0 - gate_strength));
 
         let sim = embeddings.clone().matmul(embeddings.transpose());
-        let target_mass = target.clone() * pair_mask.clone();
-        let row_target_sum = target_mass.clone().sum_dim(1).clamp_min(1e-6);
-        let target_dist = target_mass.detach() / row_target_sum.clone();
-        let logits = (sim.clone() * config.retrieval_logit_scale())
-            .mask_fill(pair_mask.clone().equal_elem(0.0), f32::NEG_INFINITY);
-        let log_probs = log_softmax(logits, 1).mask_fill(pair_mask.clone().equal_elem(0.0), 0.0);
-        let row_loss = -(target_dist * log_probs).sum_dim(1);
-        let row_mask = row_target_sum.greater_elem(1e-6).float();
-        let row_count = row_mask.clone().sum().clamp_min(1.0);
-        let loss = (row_loss * row_mask).sum() / row_count;
+        let diff = sim.clone() - target.clone();
+        let loss = (diff.powf_scalar(2.0) * pair_mask.clone()).sum() / pair_count;
 
         let positive_mask = target
             .greater_elem(config.retrieval_policy_positive_threshold())
