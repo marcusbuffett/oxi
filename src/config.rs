@@ -1456,7 +1456,7 @@ impl Default for Config {
             gradnorm_probe_size: 256,
             lr_min: 0.000001,
             lr_window_size: 500,
-            lr_plateau_t_threshold: 0.6,
+            lr_plateau_t_threshold: 0.0,
             lr_reduction_factor: 0.7,
             lr_multiplier: 1.5,
             muon_base_lr: default_muon_base_lr(),
