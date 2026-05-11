@@ -1,12 +1,12 @@
 #[cfg(feature = "train")]
 use crate::calibration::calibration_skill_band_label;
 use crate::calibration::RegretBin;
-use crate::config::{ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
 #[cfg(feature = "train")]
 use crate::config::{
-    RETRIEVAL_OBJECTIVE_MIXED_GAME, RETRIEVAL_OBJECTIVE_POLICY_OVERLAP,
-    RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC,
+    get_global_config, RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN, RETRIEVAL_OBJECTIVE_MIXED_GAME,
+    RETRIEVAL_OBJECTIVE_POLICY_OVERLAP, RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC,
 };
+use crate::config::{ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
 use crate::distribution_utils::beta_log_pdf;
 use crate::factorized_policy::FactorizedPolicyHead;
 use crate::relative_position_transformer::TransformerBlock;
@@ -20,8 +20,6 @@ use burn::prelude::*;
 use burn::tensor::activation::log_softmax;
 use burn::tensor::activation::{silu, softmax};
 
-#[cfg(feature = "train")]
-use crate::config::get_global_config;
 #[cfg(feature = "train")]
 use crate::forward_timing::{finish_and_log_forward_pass, start_forward_pass, TimingScope};
 #[cfg(feature = "train")]
@@ -355,6 +353,18 @@ impl<B: Backend> OXIModel<B> {
         );
         let pooled = self.retrieval_attention_pool(retrieval_tokens);
         self.retrieval_embedding_from_pooled(pooled)
+    }
+
+    #[cfg(feature = "train")]
+    fn position_embedding_from_trunk(
+        &self,
+        trunk: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> Tensor<B, 2> {
+        match get_global_config().retrieval_embedding_source() {
+            RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN => self.normalized_mean_pooled_trunk(trunk),
+            _ => self.retrieval_embedding_from_trunk(trunk, globals),
+        }
     }
 
     #[cfg(feature = "train")]
@@ -1166,7 +1176,7 @@ impl<B: Backend> OXIModel<B> {
         B::FloatElem: From<f32>,
     {
         let semantic_z = self.normalized_mean_pooled_trunk(trunk_output.clone().detach());
-        let retrieval_z = self.retrieval_embedding_from_trunk(trunk_output.detach(), globals);
+        let retrieval_z = self.position_embedding_from_trunk(trunk_output.detach(), globals);
         let opening_family_metrics =
             compute_opening_family_neighbor_metrics(retrieval_z.clone().detach(), items, 5);
         let (loss, loss_f32, pair_count, positive_count, positive_sim, negative_sim) = self

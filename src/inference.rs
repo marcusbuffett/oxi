@@ -9,7 +9,9 @@ use burn_cuda;
 #[cfg(feature = "backend-candle")]
 use burn_candle;
 
-use crate::config::{Config, LEGAL_MOVES, NUM_GLOBALS, PREVIOUS_POSITIONS};
+use crate::config::{
+    Config, LEGAL_MOVES, NUM_GLOBALS, PREVIOUS_POSITIONS, RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN,
+};
 use crate::encoding::encode_position;
 use crate::model::OXIModel;
 use crate::move_encoding::{decode_move, encode_move};
@@ -771,14 +773,20 @@ where
             .map_err(|e| anyhow::anyhow!("Failed to convert trunk tensor to f32: {:?}", e))?;
         debug_assert_eq!(trunk_flat.len(), n * 64 * embed_dim);
 
-        let embedding_dims = retrieval_embedding.dims();
-        debug_assert_eq!(embedding_dims[0], n);
-        let output_embed_dim = embedding_dims[1];
-        let embedding_flat = retrieval_embedding
-            .to_data()
-            .to_vec::<f32>()
-            .map_err(|e| anyhow::anyhow!("Failed to convert embedding tensor to f32: {:?}", e))?;
-        debug_assert_eq!(embedding_flat.len(), n * output_embed_dim);
+        let use_trunk_mean_embedding =
+            self.config.retrieval_embedding_source() == RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN;
+        let (output_embed_dim, embedding_flat) = if use_trunk_mean_embedding {
+            (embed_dim, Vec::new())
+        } else {
+            let embedding_dims = retrieval_embedding.dims();
+            debug_assert_eq!(embedding_dims[0], n);
+            let output_embed_dim = embedding_dims[1];
+            let embedding_flat = retrieval_embedding.to_data().to_vec::<f32>().map_err(|e| {
+                anyhow::anyhow!("Failed to convert embedding tensor to f32: {:?}", e)
+            })?;
+            debug_assert_eq!(embedding_flat.len(), n * output_embed_dim);
+            (output_embed_dim, embedding_flat)
+        };
 
         let predictions = self.finalize_batched_predictions(
             items,
@@ -823,8 +831,31 @@ where
                 per_square.copy_from_slice(model_frame);
             }
 
-            let emb_start = i * output_embed_dim;
-            let embedding = embedding_flat[emb_start..emb_start + output_embed_dim].to_vec();
+            let embedding = if use_trunk_mean_embedding {
+                let mut pooled = vec![0.0f32; embed_dim];
+                for sq in 0..64usize {
+                    let src = sq * embed_dim;
+                    for dim in 0..embed_dim {
+                        pooled[dim] += model_frame[src + dim];
+                    }
+                }
+                for value in &mut pooled {
+                    *value /= 64.0;
+                }
+                let norm = pooled
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-6);
+                for value in &mut pooled {
+                    *value /= norm;
+                }
+                pooled
+            } else {
+                let emb_start = i * output_embed_dim;
+                embedding_flat[emb_start..emb_start + output_embed_dim].to_vec()
+            };
 
             out.push((
                 prediction,

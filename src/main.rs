@@ -419,6 +419,8 @@ struct ModelParams {
     pub retrieval_loss_weight: f32,
     #[serde(default = "default_retrieval_objective")]
     pub retrieval_objective: String,
+    #[serde(default = "default_retrieval_embedding_source")]
+    pub retrieval_embedding_source: String,
     #[serde(default = "oxi::config::default_retrieval_logit_scale_for_serde")]
     pub retrieval_logit_scale: f32,
     #[serde(default = "oxi::config::default_retrieval_margin_for_serde")]
@@ -452,6 +454,9 @@ fn default_smolgen_gen_size() -> usize {
 }
 fn default_retrieval_objective() -> String {
     oxi::config::RETRIEVAL_OBJECTIVE_MIXED_GAME.to_string()
+}
+fn default_retrieval_embedding_source() -> String {
+    oxi::config::RETRIEVAL_EMBEDDING_SOURCE_RETRIEVAL_HEAD.to_string()
 }
 fn default_retrieval_policy_temperature() -> f32 {
     0.5
@@ -499,6 +504,7 @@ fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
         smolgen_gen_size: params.smolgen_gen_size,
         retrieval_loss_weight: params.retrieval_loss_weight,
         retrieval_objective: params.retrieval_objective,
+        retrieval_embedding_source: params.retrieval_embedding_source,
         retrieval_logit_scale: params.retrieval_logit_scale,
         retrieval_margin: params.retrieval_margin,
         retrieval_policy_temperature: params.retrieval_policy_temperature,

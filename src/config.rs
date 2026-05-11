@@ -39,6 +39,8 @@ pub const RETRIEVAL_OBJECTIVE_SAME_MOVE: &str = "same_move";
 pub const RETRIEVAL_OBJECTIVE_POLICY_OVERLAP: &str = "policy_overlap";
 pub const RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC: &str = "structural_semantic";
 pub const RETRIEVAL_OBJECTIVE_MIXED_GAME: &str = "mixed_game";
+pub const RETRIEVAL_EMBEDDING_SOURCE_RETRIEVAL_HEAD: &str = "retrieval_head";
+pub const RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN: &str = "trunk_mean";
 
 // Global config storage
 static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
@@ -319,6 +321,12 @@ pub struct Config {
     #[serde(default = "default_retrieval_objective")]
     pub retrieval_objective: String,
 
+    /// Which position embedding is returned by inference/attention paths.
+    /// `retrieval_head` uses the dedicated retrieval transformer + projection.
+    /// `trunk_mean` returns L2-normalized mean pooling of the shared trunk.
+    #[serde(default = "default_retrieval_embedding_source")]
+    pub retrieval_embedding_source: String,
+
     /// Logit scale for the retrieval pairwise BCE objective.
     #[serde(default = "default_retrieval_logit_scale")]
     pub retrieval_logit_scale: f32,
@@ -454,6 +462,9 @@ pub fn default_retrieval_margin_for_serde() -> f32 {
 }
 fn default_retrieval_objective() -> String {
     RETRIEVAL_OBJECTIVE_MIXED_GAME.to_string()
+}
+fn default_retrieval_embedding_source() -> String {
+    RETRIEVAL_EMBEDDING_SOURCE_RETRIEVAL_HEAD.to_string()
 }
 fn default_retrieval_logit_scale() -> f32 {
     default_retrieval_logit_scale_for_serde()
@@ -789,6 +800,9 @@ pub struct ConfigOverrides {
     pub retrieval_objective: Option<String>,
 
     #[arg(long)]
+    pub retrieval_embedding_source: Option<String>,
+
+    #[arg(long)]
     pub retrieval_logit_scale: Option<f32>,
 
     #[arg(long)]
@@ -1082,6 +1096,9 @@ impl Config {
         if let Some(v) = overrides.retrieval_objective {
             config.retrieval_objective = v;
         }
+        if let Some(v) = overrides.retrieval_embedding_source {
+            config.retrieval_embedding_source = v;
+        }
         if let Some(v) = overrides.retrieval_logit_scale {
             config.retrieval_logit_scale = v;
         }
@@ -1344,6 +1361,13 @@ impl Config {
         }
     }
 
+    pub fn retrieval_embedding_source(&self) -> &str {
+        match self.retrieval_embedding_source.as_str() {
+            RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN => RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN,
+            _ => RETRIEVAL_EMBEDDING_SOURCE_RETRIEVAL_HEAD,
+        }
+    }
+
     pub fn retrieval_needs_policy_probs(&self) -> bool {
         self.retrieval_objective() == RETRIEVAL_OBJECTIVE_POLICY_OVERLAP
             || (self.retrieval_objective() == RETRIEVAL_OBJECTIVE_MIXED_GAME
@@ -1506,6 +1530,7 @@ impl Default for Config {
             policy_regret_loss_weight: default_policy_regret_loss_weight(),
             retrieval_loss_weight: 0.0,
             retrieval_objective: default_retrieval_objective(),
+            retrieval_embedding_source: default_retrieval_embedding_source(),
             retrieval_logit_scale: default_retrieval_logit_scale(),
             retrieval_margin: default_retrieval_margin(),
             retrieval_policy_temperature: default_retrieval_policy_temperature(),
