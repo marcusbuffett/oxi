@@ -95,8 +95,15 @@ pub struct Config {
     /// Minimum learning rate (end of training)
     pub lr_min: f64,
 
-    /// Window size for plateau detection (number of iterations to compare)
+    /// Fallback window size for plateau detection (number of scheduler steps).
+    /// Prefer lr_window_samples when set so statistical power is stable across
+    /// batch sizes.
     pub lr_window_size: usize,
+
+    /// Sample-count window for plateau detection. Converted to scheduler steps
+    /// using the effective batch size.
+    #[serde(default = "default_lr_window_samples")]
+    pub lr_window_samples: Option<usize>,
 
     /// Welch's t-test threshold for plateau detection. Plateau is declared when t-statistic
     /// falls below this value (i.e., we can't confidently say loss is still decreasing).
@@ -105,6 +112,15 @@ pub struct Config {
 
     /// Factor to reduce learning rate by when plateau is detected (e.g., 0.5 means halve the LR)
     pub lr_reduction_factor: f64,
+
+    /// Number of consecutive plateau windows required before reducing LR.
+    #[serde(default = "default_lr_plateau_patience")]
+    pub lr_plateau_patience: usize,
+
+    /// Cooldown after an LR reduction, in samples. Converted to scheduler steps
+    /// using the effective batch size.
+    #[serde(default = "default_lr_plateau_cooldown_samples")]
+    pub lr_plateau_cooldown_samples: usize,
 
     /// Multiplier applied to the learning rate calculated from batch size
     pub lr_multiplier: f64,
@@ -124,7 +140,7 @@ pub struct Config {
     #[serde(default = "default_embedding_base_lr")]
     pub embedding_base_lr: f64,
 
-    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size optimizer steps
+    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size scheduler steps
     pub warmup_multiplier: f64,
 
     /// Weight for policy loss
@@ -405,6 +421,18 @@ pub struct Config {
     #[serde(default = "default_use_muon")]
     pub use_muon: Option<bool>,
 
+    /// Optimizer update for the Muon parameter group: "aurora" or "muon"
+    #[serde(default = "default_muon_optimizer")]
+    pub muon_optimizer: Option<String>,
+
+    /// Aurora projection iterations for the Muon parameter group
+    #[serde(default = "default_aurora_pp_iterations")]
+    pub aurora_pp_iterations: usize,
+
+    /// Aurora row-normalization damping exponent
+    #[serde(default = "default_aurora_pp_beta")]
+    pub aurora_pp_beta: f32,
+
     /// Muon LR adjustment function: "original" or "match_rms_adamw"
     #[serde(default)]
     pub muon_lr_adjust: Option<String>,
@@ -431,6 +459,15 @@ fn default_value_ply_ramp_full() -> usize {
 fn default_use_muon() -> Option<bool> {
     Some(true)
 }
+fn default_muon_optimizer() -> Option<String> {
+    Some("aurora".to_string())
+}
+fn default_aurora_pp_iterations() -> usize {
+    2
+}
+fn default_aurora_pp_beta() -> f32 {
+    0.5
+}
 fn default_muon_base_lr() -> f64 {
     0.0225 // Was 0.015; increased 50% for faster convergence in limited-iteration regime
 }
@@ -439,6 +476,15 @@ fn default_adamw_base_lr() -> f64 {
 }
 fn default_embedding_base_lr() -> f64 {
     0.1125 // Was 0.075; increased 50% for faster convergence. Width-independent per μP.
+}
+fn default_lr_window_samples() -> Option<usize> {
+    Some(500_000)
+}
+fn default_lr_plateau_patience() -> usize {
+    1
+}
+fn default_lr_plateau_cooldown_samples() -> usize {
+    250_000
 }
 fn default_aux_loss_weight() -> f32 {
     0.06 // Was 0.04; increased to strengthen trunk-level auxiliary supervision signal
@@ -555,9 +601,13 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub lr_min: Option<f64>,
 
-    /// Window size for plateau detection (number of iterations to compare)
+    /// Fallback window size for plateau detection (number of scheduler steps)
     #[arg(long)]
     pub lr_window_size: Option<usize>,
+
+    /// Sample-count window for plateau detection. Overrides lr_window_size when set.
+    #[arg(long)]
+    pub lr_window_samples: Option<usize>,
 
     /// Welch's t-test threshold for plateau detection (e.g., 1.65 = p<0.05)
     #[arg(long)]
@@ -566,6 +616,14 @@ pub struct ConfigOverrides {
     /// Factor to reduce learning rate by when plateau is detected
     #[arg(long)]
     pub lr_reduction_factor: Option<f64>,
+
+    /// Consecutive plateau windows required before reducing LR
+    #[arg(long)]
+    pub lr_plateau_patience: Option<usize>,
+
+    /// Cooldown after an LR reduction, in samples
+    #[arg(long)]
+    pub lr_plateau_cooldown_samples: Option<usize>,
 
     /// Multiplier applied to the learning rate calculated from batch size
     #[arg(long)]
@@ -587,7 +645,7 @@ pub struct ConfigOverrides {
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub lr_range_finder: Option<bool>,
 
-    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size optimizer steps
+    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size scheduler steps
     #[arg(long)]
     pub warmup_multiplier: Option<f64>,
 
@@ -861,6 +919,18 @@ pub struct ConfigOverrides {
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub use_muon: Option<bool>,
 
+    /// Optimizer update for the Muon parameter group: "aurora" or "muon"
+    #[arg(long)]
+    pub muon_optimizer: Option<String>,
+
+    /// Aurora projection iterations for the Muon parameter group
+    #[arg(long)]
+    pub aurora_pp_iterations: Option<usize>,
+
+    /// Aurora row-normalization damping exponent
+    #[arg(long)]
+    pub aurora_pp_beta: Option<f32>,
+
     /// Muon LR adjustment function: "original" or "match_rms_adamw"
     #[arg(long)]
     pub muon_lr_adjust: Option<String>,
@@ -918,11 +988,20 @@ impl Config {
         if let Some(v) = overrides.lr_window_size {
             config.lr_window_size = v;
         }
+        if let Some(v) = overrides.lr_window_samples {
+            config.lr_window_samples = Some(v);
+        }
         if let Some(v) = overrides.lr_plateau_t_threshold {
             config.lr_plateau_t_threshold = v;
         }
         if let Some(v) = overrides.lr_reduction_factor {
             config.lr_reduction_factor = v;
+        }
+        if let Some(v) = overrides.lr_plateau_patience {
+            config.lr_plateau_patience = v.max(1);
+        }
+        if let Some(v) = overrides.lr_plateau_cooldown_samples {
+            config.lr_plateau_cooldown_samples = v;
         }
         if let Some(v) = overrides.lr_multiplier {
             config.lr_multiplier = v;
@@ -1156,6 +1235,15 @@ impl Config {
         if let Some(v) = overrides.use_muon {
             config.use_muon = Some(v);
         }
+        if let Some(v) = overrides.muon_optimizer {
+            config.muon_optimizer = Some(v);
+        }
+        if let Some(v) = overrides.aurora_pp_iterations {
+            config.aurora_pp_iterations = v;
+        }
+        if let Some(v) = overrides.aurora_pp_beta {
+            config.aurora_pp_beta = v;
+        }
         if let Some(v) = overrides.muon_lr_adjust {
             config.muon_lr_adjust = Some(v);
         }
@@ -1286,6 +1374,10 @@ impl Config {
 
     pub fn use_muon(&self) -> bool {
         self.use_muon.unwrap_or(true)
+    }
+
+    pub fn muon_optimizer(&self) -> &str {
+        self.muon_optimizer.as_deref().unwrap_or("aurora")
     }
 
     pub fn muon_lr_adjust(&self) -> &str {
@@ -1480,8 +1572,11 @@ impl Default for Config {
             gradnorm_probe_size: 256,
             lr_min: 0.000001,
             lr_window_size: 500,
+            lr_window_samples: default_lr_window_samples(),
             lr_plateau_t_threshold: 0.0,
-            lr_reduction_factor: 0.7,
+            lr_reduction_factor: 0.6,
+            lr_plateau_patience: default_lr_plateau_patience(),
+            lr_plateau_cooldown_samples: default_lr_plateau_cooldown_samples(),
             lr_multiplier: 1.5,
             muon_base_lr: default_muon_base_lr(),
             adamw_base_lr: default_adamw_base_lr(),
@@ -1551,6 +1646,9 @@ impl Default for Config {
             lr_range_finder: Some(false),
 
             use_muon: Some(true),
+            muon_optimizer: default_muon_optimizer(),
+            aurora_pp_iterations: default_aurora_pp_iterations(),
+            aurora_pp_beta: default_aurora_pp_beta(),
             muon_lr_adjust: None,
             aux_loss_weight: default_aux_loss_weight(),
             mixed_precision: Some(false),

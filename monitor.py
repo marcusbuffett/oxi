@@ -35,13 +35,12 @@ WEIGHT_TOP1 = 1.0
 WEIGHT_WDL  = 0.5
 WEIGHT_AUX  = 0.2
 WEIGHT_CALIBRATION = 0.4
-CALIBRATION_MIN_LABELED_FRACTION = 0.05
-CALIBRATION_TARGET_FRACTION = 0.10
 
 TRAINING_TIMEOUT = 3600  # seconds — assumed duration of a completed comparison run
 
-# Must match research_loop.py acceptance criterion
-MIN_COHEN_D = 0.5
+# Must match research_loop.ts scoring / acceptance criterion
+CALIBRATION_MIN_LABELED_FRACTION = 0.01
+MIN_COHEN_D = 0.3
 
 
 def steps_to_times(steps, total_steps, duration_secs):
@@ -89,16 +88,13 @@ def ao100_composite(metrics_dir: Path) -> float:
     aux  = (ao100("aux_from_square_accuracy") + ao100("aux_to_square_accuracy")) / 2.0
     calibration = ao100("cp_loss_calibration_overall")
     labeled_fraction = ao100("cp_loss_labeled_fraction")
-    calibration_cov = (
-        min(1.0, labeled_fraction / CALIBRATION_TARGET_FRACTION)
-        if labeled_fraction >= CALIBRATION_MIN_LABELED_FRACTION
-        else 0.0
-    )
+    if labeled_fraction < CALIBRATION_MIN_LABELED_FRACTION:
+        calibration = 0.0
     return (
         WEIGHT_TOP1 * top1
         + WEIGHT_WDL * wdl
         + WEIGHT_AUX * aux
-        + WEIGHT_CALIBRATION * calibration * calibration_cov
+        + WEIGHT_CALIBRATION * calibration
     )
 
 
@@ -200,20 +196,33 @@ def compute_composite(metrics_dir: Path):
         aux = (from_map[s] + to_map[s]) / 2.0
         calibration = calibration_map.get(s, 0.0)
         labeled_fraction = labeled_fraction_map.get(s, 0.0)
-        calibration_cov = (
-            min(1.0, labeled_fraction / CALIBRATION_TARGET_FRACTION)
-            if labeled_fraction >= CALIBRATION_MIN_LABELED_FRACTION
-            else 0.0
-        )
+        if labeled_fraction < CALIBRATION_MIN_LABELED_FRACTION:
+            calibration = 0.0
         score = (
             WEIGHT_TOP1 * top1_map[s]
             + WEIGHT_WDL * normalize_wdl(wdl_map[s])
             + WEIGHT_AUX * aux
-            + WEIGHT_CALIBRATION * calibration * calibration_cov
+            + WEIGHT_CALIBRATION * calibration
         )
         steps.append(s)
         values.append(score)
     return steps, values
+
+
+def composite_summary(metrics_dir: Path, limit_points: int | None = None) -> dict:
+    """Return research-loop-compatible ao100 composite summary."""
+    steps, values = compute_composite(metrics_dir)
+    if limit_points is not None:
+        steps = steps[:limit_points]
+        values = values[:limit_points]
+    if not values:
+        return {"score": 0.0, "n": 0, "last_step": None}
+    window = values[-100:]
+    return {
+        "score": sum(window) / len(window),
+        "n": len(values),
+        "last_step": steps[-1] if steps else None,
+    }
 
 
 def render(run_dir: Path, window: int, smooth_k: int, best_ever: dict) -> None:
@@ -485,10 +494,12 @@ def report(run_dir: Path, cmp_dir: Path | None) -> None:
             print(f"  {label:20s}  {ao100:8.4f}")
 
     # Composite
-    _, comp_values = compute_composite(metrics_dir)
-    comp_ao100 = sum(comp_values[-100:]) / min(len(comp_values), 100) if comp_values else 0
+    comp_summary = composite_summary(metrics_dir)
+    comp_ao100 = comp_summary["score"]
     cmp_comp_ao100 = None
+    cmp_same_n = None
     if cmp_metrics:
+        cmp_same_n = composite_summary(cmp_metrics, comp_summary["n"])
         cmp_cs, cmp_cv = compute_composite(cmp_metrics)
         if cmp_cv:
             cmp_times = steps_to_times(cmp_cs, len(cmp_cs), TRAINING_TIMEOUT)
@@ -502,6 +513,14 @@ def report(run_dir: Path, cmp_dir: Path | None) -> None:
         print(f"\n  {'COMPOSITE':20s}  {comp_ao100:8.4f}  vs  {cmp_comp_ao100:8.4f}  ({delta:+.4f} {arrow})")
     else:
         print(f"\n  {'COMPOSITE':20s}  {comp_ao100:8.4f}")
+
+    if cmp_same_n and cmp_same_n["n"] > 0:
+        delta = comp_ao100 - cmp_same_n["score"]
+        arrow = "▲" if delta > 0 else "▼" if delta < 0 else "="
+        print(
+            f"  {'same-N composite':20s}  {comp_ao100:8.4f}  vs  {cmp_same_n['score']:8.4f}  "
+            f"({delta:+.4f} {arrow}, n={comp_summary['n']})"
+        )
 
     # Throughput
     pts = read_log(metrics_dir / "top1_accuracy.log")
@@ -536,6 +555,8 @@ def main() -> None:
                         help="Smoothing window size (default 100)")
     parser.add_argument("--report", action="store_true",
                         help="Print a one-shot text comparison vs best run and exit")
+    parser.add_argument("--compare-run", metavar="DIR",
+                        help="Comparison run dir for --report (default: best research run)")
     args = parser.parse_args()
 
     base = Path(__file__).parent / "research_runs"
@@ -551,7 +572,13 @@ def main() -> None:
             sys.exit(1)
 
     if args.report:
-        cmp_dir = find_best_comparison_run(base, run_dir)
+        if args.compare_run:
+            cmp_dir = Path(args.compare_run)
+            if not cmp_dir.is_absolute():
+                candidate = Path(__file__).parent / cmp_dir
+                cmp_dir = candidate if candidate.exists() else base / cmp_dir
+        else:
+            cmp_dir = find_best_comparison_run(base, run_dir)
         report(run_dir, cmp_dir)
         sys.exit(0)
 

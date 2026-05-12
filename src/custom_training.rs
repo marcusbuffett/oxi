@@ -7,7 +7,7 @@ use burn::data::dataloader::Progress;
 use burn::grad_clipping::GradientClippingConfig;
 use burn::lr_scheduler::LrScheduler;
 use burn::module::{AutodiffModule, Module};
-use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, MuonConfig, Optimizer};
+use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -29,6 +29,7 @@ use tracing::subscriber::DefaultGuard;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt as tracing_fmt;
 
+use crate::aurora_optimizer::{AuroraConfig, MuonUpdateKind};
 use crate::chess_output::ChessOutput;
 use crate::config::Config;
 
@@ -1432,8 +1433,14 @@ fn write_scoresheet(
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations =
-        (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
+    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
+    let lr_window_size = config
+        .lr_window_samples
+        .map(|samples| samples.div_ceil(effective_batch_size).max(4))
+        .unwrap_or(config.lr_window_size);
+    let lr_plateau_cooldown_iterations = config
+        .lr_plateau_cooldown_samples
+        .div_ceil(effective_batch_size);
 
     let initial_adamw_lr =
         config.adamw_base_lr * adamw_dim_scale * batch_scale * config.lr_multiplier;
@@ -1443,8 +1450,7 @@ fn write_scoresheet(
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations =
-        (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
+    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
 
     let train_size_display = if train_size == usize::MAX {
         "streaming".to_string()
@@ -1501,6 +1507,7 @@ Model & Data Configuration\n\
 - Gradient clip: {gradient_clip}\n\
 - AdamW base LR: {adamw_base_lr:.6} (at d_ref=256)\n\
 - Muon base LR: {muon_base_lr:.6} (at d_ref=256)\n\
+- Muon update: {muon_optimizer} (aurora_pp_iterations={aurora_pp_iterations}, aurora_pp_beta={aurora_pp_beta})\n\
 - Embedding base LR: {embedding_base_lr:.6} (width-independent)\n\
 - Initial AdamW LR: {initial_adamw_lr:.6}\n\
 - Initial Muon LR: {initial_muon_lr:.6}\n\
@@ -1512,8 +1519,11 @@ Model & Data Configuration\n\
 - Warmup iterations: {warmup_iterations}\n\
 - Warmup multiplier: {warmup_multiplier}\n\
 - LR window size: {lr_window_size}\n\
+- LR window samples: {lr_window_samples}\n\
 - LR plateau t-threshold: {lr_plateau_t_threshold:.2}\n\
 - LR reduction factor: {lr_reduction_factor}\n\
+- LR plateau patience: {lr_plateau_patience}\n\
+- LR plateau cooldown samples: {lr_plateau_cooldown_samples} ({lr_plateau_cooldown_iterations} iterations)\n\
 \n\
 Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         duration = training_duration.as_secs_f64(),
@@ -1538,6 +1548,9 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         gradient_clip = config.gradient_clip,
         adamw_base_lr = config.adamw_base_lr,
         muon_base_lr = config.muon_base_lr,
+        muon_optimizer = config.muon_optimizer(),
+        aurora_pp_iterations = config.aurora_pp_iterations,
+        aurora_pp_beta = config.aurora_pp_beta,
         embedding_base_lr = config.embedding_base_lr,
         initial_adamw_lr = initial_adamw_lr,
         initial_muon_lr = initial_muon_lr,
@@ -1548,9 +1561,16 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         lr_multiplier = config.lr_multiplier,
         warmup_iterations = warmup_iterations,
         warmup_multiplier = config.warmup_multiplier,
-        lr_window_size = config.lr_window_size,
+        lr_window_size = lr_window_size,
+        lr_window_samples = config
+            .lr_window_samples
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "N/A".to_string()),
         lr_plateau_t_threshold = config.lr_plateau_t_threshold,
         lr_reduction_factor = config.lr_reduction_factor,
+        lr_plateau_patience = config.lr_plateau_patience,
+        lr_plateau_cooldown_samples = config.lr_plateau_cooldown_samples,
+        lr_plateau_cooldown_iterations = lr_plateau_cooldown_iterations,
         window = SCORE_WINDOW,
     );
 
@@ -1935,8 +1955,14 @@ where
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations =
-        (config.warmup_multiplier * (effective_batch_size as f64).sqrt()) as usize;
+    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
+    let lr_window_size = config
+        .lr_window_samples
+        .map(|samples| samples.div_ceil(effective_batch_size).max(4))
+        .unwrap_or(config.lr_window_size);
+    let lr_plateau_cooldown_iterations = config
+        .lr_plateau_cooldown_samples
+        .div_ceil(effective_batch_size);
     println!(
         "Effective batch size: {}, d_ref: {}, d: {}, adamw_dim_scale: {:.4}, muon_dim_scale: {:.4}",
         effective_batch_size,
@@ -1949,6 +1975,16 @@ where
         "AdamW LR: {:.6}, Muon LR: {:.6} (ratio: {:.2}x), Embedding LR: {:.6} (ratio: {:.2}x), Warmup: {}",
         initial_adamw_lr, initial_muon_lr, muon_to_adamw_lr_ratio,
         initial_embedding_lr, embedding_to_adamw_lr_ratio, warmup_iterations
+    );
+    println!(
+        "LR plateau: window={} steps (samples={:?}), threshold={:.3}, factor={:.3}, patience={}, cooldown={} steps (samples={})",
+        lr_window_size,
+        config.lr_window_samples,
+        config.lr_plateau_t_threshold,
+        config.lr_reduction_factor,
+        config.lr_plateau_patience,
+        lr_plateau_cooldown_iterations,
+        config.lr_plateau_cooldown_samples
     );
     println!(
         "AdamW LR: {:.6}, Muon LR: {:.6} (ratio: {:.2}x), Embedding LR: {:.6} (ratio: {:.2}x), Warmup: {}",
@@ -1975,15 +2011,22 @@ where
         "match_rms_adamw" => burn::optim::AdjustLrFn::MatchRmsAdamW,
         _ => burn::optim::AdjustLrFn::Original,
     };
-    let mut optim_muon = MuonConfig::new()
+    let muon_update_kind = MuonUpdateKind::parse(config.muon_optimizer());
+    let mut optim_muon = AuroraConfig::new()
         .with_weight_decay(muon_weight_decay)
         .with_adjust_lr_fn(muon_lr_adjust)
+        .with_update_kind(muon_update_kind)
+        .with_pp_iterations(config.aurora_pp_iterations)
+        .with_pp_beta(config.aurora_pp_beta)
         .init();
     println!(
-        "  Muon optimizer: enabled={}, lr_adjust={}, weight_decay={}",
+        "  Muon optimizer: enabled={}, update={}, lr_adjust={}, weight_decay={}, aurora_pp_iterations={}, aurora_pp_beta={}",
         config.use_muon(),
+        config.muon_optimizer(),
         config.muon_lr_adjust(),
-        config.weight_decay
+        config.weight_decay,
+        config.aurora_pp_iterations,
+        config.aurora_pp_beta
     );
 
     // AdamW optimizers for everything else
@@ -2377,9 +2420,11 @@ where
         initial_lr,
         config.lr_min,
         config.lr_reduction_factor,
-        config.lr_window_size,
+        lr_window_size,
         config.lr_plateau_t_threshold,
         warmup_iterations,
+        config.lr_plateau_patience,
+        lr_plateau_cooldown_iterations,
     );
 
     let mut loss_metric = LossMetric::new();
@@ -2473,6 +2518,22 @@ where
                 loop_iteration, items_processed, shuffle_buffer.len(), shuffle_buffer.is_exhausted()
             );
             break;
+        }
+
+        if let Some(timeout_seconds) = config.timeout {
+            if start_time.elapsed() >= Duration::from_secs(timeout_seconds) {
+                println!(
+                    "Training stopped: reached timeout ({} seconds)",
+                    timeout_seconds
+                );
+                tracing::info!(
+                    "EXIT_CONDITION: timeout_reached at iteration {} (items_processed={}, timeout_seconds={})",
+                    loop_iteration,
+                    items_processed,
+                    timeout_seconds
+                );
+                break;
+            }
         }
 
         if lr_scheduler.should_stop() {

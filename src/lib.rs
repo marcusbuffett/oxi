@@ -67,6 +67,8 @@ pub mod train_stubs {
 }
 
 #[cfg(feature = "train")]
+pub mod aurora_optimizer;
+#[cfg(feature = "train")]
 pub mod chess_output;
 #[cfg(feature = "train")]
 pub mod custom_training;
