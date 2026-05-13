@@ -151,6 +151,10 @@ pub struct ReduceOnPlateauScheduler {
     iteration: usize,
     num_reductions: usize,
     warmup_iterations: usize,
+    plateau_patience: usize,
+    consecutive_plateau_windows: usize,
+    cooldown_iterations: usize,
+    cooldown_until_iteration: usize,
 }
 
 impl ReduceOnPlateauScheduler {
@@ -161,6 +165,8 @@ impl ReduceOnPlateauScheduler {
         window_size: usize,
         t_threshold: f64,
         warmup_iterations: usize,
+        plateau_patience: usize,
+        cooldown_iterations: usize,
     ) -> Self {
         Self {
             initial_lr,
@@ -171,6 +177,10 @@ impl ReduceOnPlateauScheduler {
             iteration: 0,
             num_reductions: 0,
             warmup_iterations,
+            plateau_patience: plateau_patience.max(1),
+            consecutive_plateau_windows: 0,
+            cooldown_iterations,
+            cooldown_until_iteration: 0,
         }
     }
 
@@ -188,9 +198,19 @@ impl ReduceOnPlateauScheduler {
             return false;
         }
 
+        if self.is_in_cooldown() {
+            return false;
+        }
+
         self.detector.record(loss);
 
         if self.detector.is_plateau() {
+            self.consecutive_plateau_windows += 1;
+            if self.consecutive_plateau_windows < self.plateau_patience {
+                self.detector.reset();
+                return false;
+            }
+
             let new_lr = (self.current_lr * self.reduction_factor).max(self.min_lr);
             if new_lr < self.current_lr {
                 let window_values = self.detector.window_values();
@@ -202,7 +222,7 @@ impl ReduceOnPlateauScheduler {
 
                 tracing::warn!(
                     target: "plateau_detection",
-                    "PLATEAU DETECTED at iteration {}: LR {} -> {} | loss: {:.6} -> {:.6} | t-stat: {:.3} < threshold: {:.3} | rel_improvement: {:.4}% | window_size: {} | reduction #{}",
+                    "PLATEAU DETECTED at iteration {}: LR {} -> {} | loss: {:.6} -> {:.6} | t-stat: {:.3} < threshold: {:.3} | rel_improvement: {:.4}% | window_size: {} | patience: {}/{} | cooldown_iterations: {} | reduction #{}",
                     self.iteration,
                     self.current_lr,
                     new_lr,
@@ -212,6 +232,9 @@ impl ReduceOnPlateauScheduler {
                     threshold,
                     rel_improvement * 100.0,
                     window_values.len(),
+                    self.consecutive_plateau_windows,
+                    self.plateau_patience,
+                    self.cooldown_iterations,
                     self.num_reductions + 1
                 );
 
@@ -246,9 +269,13 @@ impl ReduceOnPlateauScheduler {
 
                 self.current_lr = new_lr;
                 self.num_reductions += 1;
+                self.consecutive_plateau_windows = 0;
+                self.cooldown_until_iteration = self.iteration + self.cooldown_iterations;
                 self.detector.reset();
                 return true;
             }
+        } else if self.detector.fill_ratio() >= 1.0 {
+            self.consecutive_plateau_windows = 0;
         }
         false
     }
@@ -268,6 +295,20 @@ impl ReduceOnPlateauScheduler {
 
     pub fn is_warming_up(&self) -> bool {
         self.warmup_iterations > 0 && self.iteration < self.warmup_iterations
+    }
+
+    pub fn is_in_cooldown(&self) -> bool {
+        self.iteration < self.cooldown_until_iteration
+    }
+
+    pub fn cooldown_progress(&self) -> f64 {
+        if !self.is_in_cooldown() || self.cooldown_iterations == 0 {
+            1.0
+        } else {
+            let elapsed =
+                self.cooldown_iterations - (self.cooldown_until_iteration - self.iteration);
+            (elapsed as f64 / self.cooldown_iterations as f64).clamp(0.0, 1.0)
+        }
     }
 
     pub fn warmup_progress(&self) -> f64 {
@@ -310,6 +351,8 @@ impl ReduceOnPlateauScheduler {
         self.current_lr = self.initial_lr;
         self.iteration = 0;
         self.num_reductions = 0;
+        self.consecutive_plateau_windows = 0;
+        self.cooldown_until_iteration = 0;
         self.detector.reset();
         tracing::info!(
             "LR scheduler reset to initial: lr={:.6}, warmup_iterations={}",
@@ -321,16 +364,22 @@ impl ReduceOnPlateauScheduler {
 
 impl LrScheduler for ReduceOnPlateauScheduler {
     type Record<B: Backend> = (
-        f64,      // initial_lr
-        f64,      // current_lr
-        f64,      // min_lr
-        f64,      // reduction_factor
-        usize,    // window_size
-        f64,      // t_threshold
-        usize,    // iteration
-        usize,    // num_reductions
-        usize,    // warmup_iterations
-        Vec<f64>, // detector window
+        f64,   // initial_lr
+        f64,   // current_lr
+        f64,   // min_lr
+        f64,   // reduction_factor
+        usize, // window_size
+        f64,   // t_threshold
+        usize, // iteration
+        usize, // num_reductions
+        usize, // warmup_iterations
+        (
+            Vec<f64>, // detector window
+            usize,    // plateau_patience
+            usize,    // consecutive_plateau_windows
+            usize,    // cooldown_iterations
+            usize,    // cooldown_until_iteration
+        ),
     );
 
     fn step(&mut self) -> f64 {
@@ -348,7 +397,13 @@ impl LrScheduler for ReduceOnPlateauScheduler {
             self.iteration,
             self.num_reductions,
             self.warmup_iterations,
-            self.detector.window.iter().copied().collect(),
+            (
+                self.detector.window.iter().copied().collect(),
+                self.plateau_patience,
+                self.consecutive_plateau_windows,
+                self.cooldown_iterations,
+                self.cooldown_until_iteration,
+            ),
         )
     }
 
@@ -358,12 +413,64 @@ impl LrScheduler for ReduceOnPlateauScheduler {
         self.min_lr = record.2;
         self.reduction_factor = record.3;
         self.detector = PlateauDetector::new(record.4, record.5);
-        for loss in record.9 {
+        for loss in (record.9).0 {
             self.detector.record(loss);
         }
         self.iteration = record.6;
         self.num_reductions = record.7;
         self.warmup_iterations = record.8;
+        self.plateau_patience = (record.9).1.max(1);
+        self.consecutive_plateau_windows = (record.9).2;
+        self.cooldown_iterations = (record.9).3;
+        self.cooldown_until_iteration = (record.9).4;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plateau_losses() -> [f64; 4] {
+        [1.0, 1.1, 2.0, 2.1]
+    }
+
+    #[test]
+    fn patience_requires_independent_plateau_windows() {
+        let mut scheduler = ReduceOnPlateauScheduler::new(1.0, 0.001, 0.5, 4, 0.0, 0, 2, 0);
+
+        for loss in plateau_losses() {
+            scheduler.record_batch(loss);
+        }
+
+        assert_eq!(scheduler.num_reductions(), 0);
+        assert_eq!(scheduler.consecutive_plateau_windows, 1);
+        assert_eq!(scheduler.detector.current_window_len(), 0);
+
+        for loss in plateau_losses() {
+            scheduler.record_batch(loss);
+        }
+
+        assert_eq!(scheduler.num_reductions(), 1);
+        assert_eq!(scheduler.get_lr(), 0.5);
+    }
+
+    #[test]
+    fn cooldown_skips_collecting_new_plateau_window() {
+        let mut scheduler = ReduceOnPlateauScheduler::new(1.0, 0.001, 0.5, 4, 0.0, 0, 1, 3);
+
+        for loss in plateau_losses() {
+            scheduler.record_batch(loss);
+        }
+
+        assert_eq!(scheduler.num_reductions(), 1);
+        assert!(scheduler.is_in_cooldown());
+
+        scheduler.record_batch(2.2);
+        scheduler.record_batch(2.3);
+        assert_eq!(scheduler.detector.current_window_len(), 0);
+
+        scheduler.record_batch(2.4);
+        assert_eq!(scheduler.detector.current_window_len(), 1);
     }
 }
