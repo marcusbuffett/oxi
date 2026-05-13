@@ -2,7 +2,7 @@
 pub type TestBackend = burn::backend::Wgpu;
 
 #[cfg(all(test, feature = "backend-wgpu"))]
-pub fn test_device() -> <TestBackend as burn::tensor::backend::Backend>::Device {
+pub fn test_device() -> burn::tensor::Device<TestBackend> {
     burn::backend::wgpu::WgpuDevice::default()
 }
 
@@ -10,7 +10,7 @@ pub fn test_device() -> <TestBackend as burn::tensor::backend::Backend>::Device 
 pub type TestBackend = burn::backend::LibTorch<f32>;
 
 #[cfg(all(test, feature = "backend-tch"))]
-pub fn test_device() -> <TestBackend as burn::tensor::backend::Backend>::Device {
+pub fn test_device() -> burn::tensor::Device<TestBackend> {
     burn::backend::libtorch::LibTorchDevice::Cpu
 }
 
@@ -18,7 +18,7 @@ pub fn test_device() -> <TestBackend as burn::tensor::backend::Backend>::Device 
 pub type TestBackend = burn_cuda::Cuda;
 
 #[cfg(all(test, feature = "backend-cuda"))]
-pub fn test_device() -> <TestBackend as burn::tensor::backend::Backend>::Device {
+pub fn test_device() -> burn::tensor::Device<TestBackend> {
     burn_cuda::CudaDevice::default()
 }
 

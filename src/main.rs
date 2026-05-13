@@ -554,8 +554,7 @@ async fn main() -> Result<()> {
                 #[cfg(target_os = "macos")]
                 {
                     type Backend = Autodiff<LibTorch<f32>>;
-                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0
-                        ..config.num_devices)
+                    let devices: Vec<burn::tensor::Device<Backend>> = (0..config.num_devices)
                         .map(|_| LibTorchDevice::Mps)
                         .collect();
                     train_custom::<Backend>(config.clone(), devices)?;
@@ -564,8 +563,7 @@ async fn main() -> Result<()> {
                 #[cfg(all(target_os = "linux", feature = "backend-cuda"))]
                 {
                     type Backend = Autodiff<Cuda>;
-                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> = (0
-                        ..config.num_devices)
+                    let devices: Vec<burn::tensor::Device<Backend>> = (0..config.num_devices)
                         .map(|i| CudaDevice::new(i))
                         .collect();
                     println!("Using burn-cuda backend with fusion + autotune");
@@ -575,7 +573,7 @@ async fn main() -> Result<()> {
                 #[cfg(all(target_os = "linux", feature = "backend-candle"))]
                 {
                     type Backend = Autodiff<Candle<f32, i64>>;
-                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                    let devices: Vec<burn::tensor::Device<Backend>> =
                         vec![CandleDevice::Cpu; config.num_devices];
                     println!(
                         "Using burn-candle backend (CPU for now - CUDA device construction TBD)"
@@ -586,7 +584,7 @@ async fn main() -> Result<()> {
                 #[cfg(all(target_os = "linux", feature = "backend-tch"))]
                 {
                     type Backend = Autodiff<LibTorch<f32>>;
-                    let devices: Vec<<Backend as burn::tensor::backend::Backend>::Device> =
+                    let devices: Vec<burn::tensor::Device<Backend>> =
                         (0..config.num_devices).map(LibTorchDevice::Cuda).collect();
                     println!("Using burn-tch backend (LibTorch) - WARNING: No fusion support");
                     train_custom::<Backend>(config.clone(), devices)?;

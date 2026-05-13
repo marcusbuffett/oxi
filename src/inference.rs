@@ -481,7 +481,7 @@ where
         model: OXIModel<InferenceBackend>,
         config: Config,
     ) -> InferenceEngine<InferenceBackend> {
-        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = Device::<InferenceBackend>::default();
         InferenceEngine::new(model, config, device)
     }
 
@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn test_inference_engine_creation() {
-        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = Device::<InferenceBackend>::default();
         let config = Config::default();
         crate::config::set_global_config(config.clone()).unwrap();
         let model = OXIModel::<InferenceBackend>::new(&device, &config);
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn test_analyze_position() {
-        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = Device::<InferenceBackend>::default();
         let config = Config::default();
         crate::config::set_global_config(config.clone()).unwrap();
         let model = OXIModel::<InferenceBackend>::new(&device, &config);
@@ -1252,7 +1252,7 @@ mod tests {
 
     #[test]
     fn test_predict_with_attention_batch_matches_sequential() {
-        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = Device::<InferenceBackend>::default();
         let config = Config::default();
         let _ = crate::config::set_global_config(config.clone());
         let model = OXIModel::<InferenceBackend>::new(&device, &config);
@@ -1343,7 +1343,7 @@ mod tests {
 
     #[test]
     fn test_momentum_features_snapshot() {
-        let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
+        let device = Device::<InferenceBackend>::default();
         let config = Config::default();
         crate::config::set_global_config(config.clone()).unwrap();
 
