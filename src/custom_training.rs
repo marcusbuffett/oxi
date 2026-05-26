@@ -2725,9 +2725,11 @@ where
                 items_processed,
                 items_total: train_size,
             },
-            epoch: 1,
-            epoch_total: 1,
-            iteration,
+            global_progress: Progress {
+                items_processed: 1,
+                items_total: 1,
+            },
+            iteration: Some(iteration),
             lr: Some(current_lr),
         };
 
