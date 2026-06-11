@@ -1,3 +1,4 @@
+pub mod allie_eval;
 pub mod calibration;
 pub mod config;
 pub mod constants;

@@ -62,9 +62,6 @@ fn bench_old_vs_new_model_cpu() {
     let old = bench_config("old 192d/8L/6H ", 192, 8, 6);
     let new = bench_config("new 320d/16L/10H", 320, 16, 10);
     for (i, &batch) in [1, 16, 64].iter().enumerate() {
-        println!(
-            "batch={batch}: ratio new/old = {:.2}x",
-            new[i] / old[i]
-        );
+        println!("batch={batch}: ratio new/old = {:.2}x", new[i] / old[i]);
     }
 }

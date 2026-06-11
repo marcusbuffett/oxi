@@ -135,9 +135,7 @@ impl<B: Backend> FactorizedPolicyHead<B> {
             device,
         );
         let flat = base_logits.reshape([batch_size, 64 * 64]);
-        let output = flat
-            .select(1, gather_idx)
-            .reshape([batch_size, 64, 76]);
+        let output = flat.select(1, gather_idx).reshape([batch_size, 64, 76]);
 
         // Add promotion-specific logits onto the promotion slots. Slot layout
         // must match move_encoding::build_tables: straight = 64..68, capture
@@ -170,7 +168,11 @@ impl<B: Backend> FactorizedPolicyHead<B> {
                     .reshape([batch_size, 1, 4]);
 
                 promo_add = promo_add.slice_assign(
-                    [0..batch_size, from_sq..from_sq + 1, start_idx..start_idx + 4],
+                    [
+                        0..batch_size,
+                        from_sq..from_sq + 1,
+                        start_idx..start_idx + 4,
+                    ],
                     promo_4,
                 );
             }

@@ -119,6 +119,10 @@ enum Commands {
     /// whitening.json next to the model (loaded automatically at inference time)
     ComputeWhitening(ComputeWhiteningCli),
 
+    /// Move-matching accuracy on the Allie test set (Zhang et al., ICLR 2025),
+    /// directly comparable to the paper's Allie/Maia numbers
+    EvaluateAllie(AllieEvalCli),
+
     /// Download TCEC (Top Chess Engine Championship) games for pretraining
     DownloadTcec {
         #[arg(long)]
@@ -332,6 +336,42 @@ struct ComputeWhiteningCli {
     examples: usize,
 }
 
+#[derive(Parser, Debug)]
+struct AllieEvalCli {
+    /// Model directory (containing model.mpk and params.json)
+    #[arg(long)]
+    model_dir: PathBuf,
+
+    /// Path to the Allie test set JSONL
+    /// (yimingzhang/allie-data, lichess-2022-blitz-test/2022-test-annotated.jsonl)
+    #[arg(long)]
+    dataset: PathBuf,
+
+    /// Inference batch size
+    #[arg(long, default_value = "512")]
+    batch_size: usize,
+
+    /// Plies excluded at the start of each game (paper: first 5 moves)
+    #[arg(long, default_value = "10")]
+    skip_plies: usize,
+
+    /// Moves with less than this many seconds on the mover's clock are excluded
+    #[arg(long, default_value = "30")]
+    min_clock: i64,
+
+    /// Evaluate only the first N games (smoke tests)
+    #[arg(long)]
+    limit: Option<usize>,
+
+    /// Device: cpu, mps, or cuda
+    #[arg(long)]
+    device: Option<String>,
+
+    /// Write per-position results to this JSONL file
+    #[arg(long)]
+    dump: Option<PathBuf>,
+}
+
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 struct CreateCalibrationDbCli {
     /// Directory containing PGN files to sample from
@@ -491,6 +531,55 @@ fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
 #[cfg(not(all(feature = "train", feature = "backend-tch")))]
 fn compute_whitening_command(_cli: &ComputeWhiteningCli) -> Result<()> {
     anyhow::bail!("compute-whitening requires the train and backend-tch features")
+}
+
+#[cfg(not(feature = "backend-tch"))]
+fn evaluate_allie_command(_cli: &AllieEvalCli) -> Result<()> {
+    anyhow::bail!("evaluate-allie requires the backend-tch feature")
+}
+
+#[cfg(feature = "backend-tch")]
+fn evaluate_allie_command(cli: &AllieEvalCli) -> Result<()> {
+    use oxi::allie_eval::{run_allie_eval, AllieEvalParams};
+
+    type EvalBackend = burn::backend::LibTorch<f32>;
+    let device = match cli.device.as_deref() {
+        Some("cpu") => burn_tch::LibTorchDevice::Cpu,
+        Some("mps") => burn_tch::LibTorchDevice::Mps,
+        Some("cuda") => burn_tch::LibTorchDevice::Cuda(0),
+        Some(other) => anyhow::bail!("unknown device {other:?} (expected cpu, mps, or cuda)"),
+        None => {
+            if cfg!(target_os = "macos") {
+                burn_tch::LibTorchDevice::Mps
+            } else {
+                burn_tch::LibTorchDevice::Cuda(0)
+            }
+        }
+    };
+
+    let config = load_config_from_model_dir(&cli.model_dir)?;
+    let _ = set_global_config(config.clone());
+    println!(
+        "Model: embed_dim={}, num_layers={}, num_heads={}",
+        config.embed_dim, config.num_layers, config.num_heads
+    );
+    let engine = InferenceEngine::<EvalBackend>::from_checkpoint(
+        &cli.model_dir.join("model"),
+        config,
+        device,
+    )?;
+
+    run_allie_eval(
+        &engine,
+        &AllieEvalParams {
+            dataset: cli.dataset.clone(),
+            batch_size: cli.batch_size,
+            skip_plies: cli.skip_plies,
+            min_clock: cli.min_clock,
+            limit: cli.limit,
+            dump: cli.dump.clone(),
+        },
+    )
 }
 
 #[cfg(all(feature = "train", feature = "backend-tch"))]
@@ -1171,6 +1260,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::ComputeWhitening(config) => compute_whitening_command(&config),
+        Commands::EvaluateAllie(config) => evaluate_allie_command(&config),
         Commands::CreateCalibrationDb(config) => {
             println!("Creating calibration DB...");
             println!("  PGN path: {}", config.pgn_dir.display());
