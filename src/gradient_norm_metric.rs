@@ -120,6 +120,9 @@ struct LayerAccumulator {
 struct GradientNormVisitor<'a, B: AutodiffBackend> {
     grads: &'a GradientsParams,
     total_norm_squared: f64,
+    /// On-device accumulator for the fast (no-breakdown) path, so the whole
+    /// walk costs a single device->host sync instead of one per parameter.
+    total_norm_sq_tensor: Option<Tensor<B::InnerBackend, 1>>,
     per_layer_accum: HashMap<String, LayerAccumulator>,
     per_head_norms: HashMap<HeadKey, f64>,
     config: &'static Config,
@@ -133,6 +136,7 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
         Self {
             grads,
             total_norm_squared: 0.0,
+            total_norm_sq_tensor: None,
             per_layer_accum: HashMap::new(),
             per_head_norms: HashMap::new(),
             config: get_global_config(),
@@ -197,8 +201,13 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
             .collect();
         per_head.sort_by(|a, b| b.norm.partial_cmp(&a.norm).unwrap_or(Ordering::Equal));
 
+        let mut total_norm_squared = self.total_norm_squared;
+        if let Some(acc) = self.total_norm_sq_tensor {
+            total_norm_squared += acc.into_scalar().elem::<f32>() as f64;
+        }
+
         GradientNormBreakdown {
-            total: self.total_norm_squared.sqrt(),
+            total: total_norm_squared.sqrt(),
             per_layer,
             per_head,
         }
@@ -211,12 +220,18 @@ impl<'a, B: AutodiffBackend> GradientNormVisitor<'a, B> {
         weight_tensor: Option<&Tensor<B::InnerBackend, D>>,
     ) {
         if let Some(grad_tensor) = self.grads.get::<B::InnerBackend, D>(id) {
-            let norm_sq = grad_tensor
-                .clone()
-                .powi_scalar(2)
-                .sum()
-                .into_scalar()
-                .elem::<f32>() as f64;
+            let norm_sq_dev = grad_tensor.clone().powi_scalar(2).sum();
+
+            if !self.need_breakdown {
+                // Fast path: keep the running sum on device; one sync at the end.
+                self.total_norm_sq_tensor = Some(match self.total_norm_sq_tensor.take() {
+                    Some(acc) => acc.add(norm_sq_dev),
+                    None => norm_sq_dev,
+                });
+                return;
+            }
+
+            let norm_sq = norm_sq_dev.into_scalar().elem::<f32>() as f64;
             self.total_norm_squared += norm_sq;
 
             if self.need_breakdown {

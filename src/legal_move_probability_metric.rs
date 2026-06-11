@@ -43,7 +43,7 @@ impl<B: Backend> Metric for LegalMoveProbabilityMetric<B> {
         let legal_prob_sums = legal_probs.sum_dim(1);
 
         // Get the average across the batch
-        let batch_size = legal_prob_sums.shape().dims[0];
+        let batch_size = input.policy_logits.shape().dims::<2>()[0];
         let total_legal_prob = legal_prob_sums.sum().to_data().as_slice::<f32>().unwrap()[0] as f64;
         let avg_legal_prob = total_legal_prob / batch_size as f64;
 
@@ -119,9 +119,11 @@ mod tests {
                 items_processed: 1,
                 items_total: 1,
             },
-            epoch: 0,
-            epoch_total: 1,
-            iteration: 0,
+            global_progress: Progress {
+                items_processed: 1,
+                items_total: 1,
+            },
+            iteration: Some(0),
             lr: None,
         };
 
@@ -171,9 +173,11 @@ mod tests {
                 items_processed: 1,
                 items_total: 1,
             },
-            epoch: 0,
-            epoch_total: 1,
-            iteration: 0,
+            global_progress: Progress {
+                items_processed: 1,
+                items_total: 1,
+            },
+            iteration: Some(0),
             lr: None,
         };
 

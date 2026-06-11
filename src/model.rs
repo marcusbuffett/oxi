@@ -2,10 +2,7 @@
 use crate::calibration::calibration_skill_band_label;
 use crate::calibration::RegretBin;
 #[cfg(feature = "train")]
-use crate::config::{
-    get_global_config, RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN, RETRIEVAL_OBJECTIVE_MIXED_GAME,
-    RETRIEVAL_OBJECTIVE_POLICY_OVERLAP, RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC,
-};
+use crate::config::get_global_config;
 use crate::config::{ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
 use crate::distribution_utils::beta_log_pdf;
 use crate::factorized_policy::FactorizedPolicyHead;
@@ -27,11 +24,9 @@ use crate::model_prediction_logger::log_model_predictions;
 #[cfg(feature = "train")]
 use crate::norm_debug::{log_tensor_stats, LayerScope, NormDebugScope, StreamScope};
 #[cfg(feature = "train")]
-use crate::opening_family_metric::compute_opening_family_neighbor_metrics;
-#[cfg(feature = "train")]
 use burn::tensor::backend::AutodiffBackend;
 #[cfg(feature = "train")]
-use burn::train::{TrainOutput, TrainStep, ValidStep};
+use burn::train::{InferenceStep, TrainOutput, TrainStep};
 
 #[cfg(not(feature = "train"))]
 use crate::train_stubs::*;
@@ -75,44 +70,6 @@ pub struct OXIModel<B: Backend> {
     aux_trunk_to_square_hidden: Linear<B>,
     cp_loss_head_hidden: Linear<B>,
     cp_loss_head: Linear<B>,
-    retrieval_smolgen_weight_gen: SmolgenWeightGen<B>,
-    retrieval_block: TransformerBlock<B>,
-    retrieval_pool_fc1: Linear<B>,
-    retrieval_pool_fc2: Linear<B>,
-    retrieval_head: Linear<B>,
-}
-
-#[cfg(feature = "train")]
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-struct RetrievalStructureComponents {
-    pawn_similarity: f32,
-    piece_similarity: f32,
-    non_pawn_similarity: f32,
-    role_count_similarity: f32,
-    non_pawn_role_count_similarity: f32,
-    pawn_file_similarity: f32,
-    white_pawn_file_similarity: f32,
-    black_pawn_file_similarity: f32,
-    balanced_pawn_file_similarity: f32,
-    pawn_file_missing_similarity: f32,
-    open_file_similarity: f32,
-    center_pawn_similarity: f32,
-    pawn_wing_similarity: f32,
-    nearby_non_pawn_similarity: f32,
-    ply_gate: f32,
-    material_gate: f32,
-    source_gate: f32,
-}
-
-#[cfg(feature = "train")]
-impl RetrievalStructureComponents {
-    fn current_score(self) -> f32 {
-        (self.pawn_similarity.powf(2.0)
-            * (0.5 + 0.5 * self.center_pawn_similarity)
-            * self.source_gate)
-            .clamp(0.0, 1.0)
-    }
 }
 
 impl<B: Backend> OXIModel<B> {
@@ -244,17 +201,6 @@ impl<B: Backend> OXIModel<B> {
         let cp_loss_head = LinearConfig::new(config.embed_dim(), RegretBin::COUNT)
             .with_initializer(std_init.clone())
             .init(device);
-        let retrieval_smolgen_weight_gen = SmolgenWeightGen::new(config, device);
-        let retrieval_block = TransformerBlock::new_for_head(config, device);
-        let retrieval_pool_fc1 = LinearConfig::new(config.embed_dim(), config.embed_dim())
-            .with_initializer(std_init.clone())
-            .init(device);
-        let retrieval_pool_fc2 = LinearConfig::new(config.embed_dim(), 1)
-            .with_initializer(std_init.clone())
-            .init(device);
-        let retrieval_head = LinearConfig::new(config.embed_dim(), config.embed_dim())
-            .with_initializer(std_init.clone())
-            .init(device);
 
         Self {
             embed_proj1,
@@ -294,936 +240,7 @@ impl<B: Backend> OXIModel<B> {
             aux_trunk_to_square_hidden,
             cp_loss_head_hidden,
             cp_loss_head,
-            retrieval_smolgen_weight_gen,
-            retrieval_block,
-            retrieval_pool_fc1,
-            retrieval_pool_fc2,
-            retrieval_head,
         }
-    }
-
-    fn retrieval_attention_pool(&self, tokens: Tensor<B, 3>) -> Tensor<B, 2> {
-        let batch_size = tokens.dims()[0];
-        let embed_dim = tokens.dims()[2];
-        let pool_hidden = silu(self.retrieval_pool_fc1.forward(tokens.clone()));
-        let pool_logits = self
-            .retrieval_pool_fc2
-            .forward(pool_hidden)
-            .reshape([batch_size, 64]);
-        let scale = (embed_dim as f64).sqrt();
-        let pool_weights = softmax(pool_logits / scale, 1).reshape([batch_size, 64, 1]);
-        (tokens * pool_weights)
-            .sum_dim(1)
-            .reshape([batch_size, embed_dim])
-    }
-
-    fn retrieval_embedding_from_pooled(&self, pooled: Tensor<B, 2>) -> Tensor<B, 2> {
-        let projected = self.retrieval_head.forward(pooled);
-        let norm = projected
-            .clone()
-            .powf_scalar(2.0)
-            .sum_dim(1)
-            .sqrt()
-            .clamp_min(1e-6);
-        projected / norm
-    }
-
-    fn normalized_mean_pooled_trunk(&self, trunk: Tensor<B, 3>) -> Tensor<B, 2> {
-        let batch_size = trunk.dims()[0];
-        let embed_dim = trunk.dims()[2];
-        let pooled = trunk.mean_dim(1).reshape([batch_size, embed_dim]);
-        let norm = pooled
-            .clone()
-            .powf_scalar(2.0)
-            .sum_dim(1)
-            .sqrt()
-            .clamp_min(1e-6);
-        pooled / norm
-    }
-
-    fn retrieval_embedding_from_trunk(
-        &self,
-        trunk: Tensor<B, 3>,
-        globals: Tensor<B, 2, Float>,
-    ) -> Tensor<B, 2> {
-        let retrieval_tokens = self.retrieval_block.forward_with_film(
-            trunk,
-            &self.retrieval_smolgen_weight_gen,
-            globals,
-        );
-        let pooled = self.retrieval_attention_pool(retrieval_tokens);
-        self.retrieval_embedding_from_pooled(pooled)
-    }
-
-    #[cfg(feature = "train")]
-    fn position_embedding_from_trunk(
-        &self,
-        trunk: Tensor<B, 3>,
-        globals: Tensor<B, 2, Float>,
-    ) -> Tensor<B, 2> {
-        match get_global_config().retrieval_embedding_source() {
-            RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN => self.normalized_mean_pooled_trunk(trunk),
-            _ => self.retrieval_embedding_from_trunk(trunk, globals),
-        }
-    }
-
-    #[cfg(feature = "train")]
-    fn compute_same_move_retrieval_loss_from_embeddings(
-        &self,
-        embeddings: Tensor<B, 2>,
-        items: &[crate::dataset::ChessItem],
-    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
-    where
-        B::FloatElem: From<f32>,
-    {
-        let batch_size = embeddings.dims()[0];
-        let device = embeddings.device();
-        let zero = || Tensor::<B, 1>::zeros([1], &device);
-        if batch_size < 2 || items.len() != batch_size {
-            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
-        let target_indices = items
-            .iter()
-            .map(|item| item.move_distribution.iter().position(|p| *p > 0.0))
-            .collect::<Vec<_>>();
-
-        let mut positive_mask_data = vec![0.0f32; batch_size * batch_size];
-        let mut negative_mask_data = vec![0.0f32; batch_size * batch_size];
-        let mut positive_count = 0.0f32;
-        let mut negative_count = 0.0f32;
-
-        for i in 0..batch_size {
-            let Some(query_move) = target_indices[i] else {
-                continue;
-            };
-            for j in 0..batch_size {
-                if i == j {
-                    continue;
-                }
-                let Some(neighbor_move) = target_indices[j] else {
-                    continue;
-                };
-                let query_legal_at_neighbor =
-                    items[j].legal_moves.get(query_move).copied().unwrap_or(0.0) > 0.0;
-                let neighbor_legal_at_query = items[i]
-                    .legal_moves
-                    .get(neighbor_move)
-                    .copied()
-                    .unwrap_or(0.0)
-                    > 0.0;
-                if !query_legal_at_neighbor || !neighbor_legal_at_query {
-                    continue;
-                }
-
-                let offset = i * batch_size + j;
-                if query_move == neighbor_move {
-                    positive_mask_data[offset] = 1.0;
-                    positive_count += 1.0;
-                } else {
-                    negative_mask_data[offset] = 1.0;
-                    negative_count += 1.0;
-                }
-            }
-        }
-
-        let pair_count = positive_count + negative_count;
-        if pair_count <= 0.0 {
-            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
-        let positive_mask =
-            Tensor::<B, 1>::from_data(TensorData::from(positive_mask_data.as_slice()), &device)
-                .reshape([batch_size, batch_size]);
-        let negative_mask =
-            Tensor::<B, 1>::from_data(TensorData::from(negative_mask_data.as_slice()), &device)
-                .reshape([batch_size, batch_size]);
-
-        let sim = embeddings.clone().matmul(embeddings.transpose());
-        let config = get_global_config();
-        let logits = (sim.clone() - config.retrieval_margin()) * config.retrieval_logit_scale();
-
-        // BCEWithLogits for labels in {0,1}. Logits are bounded by cosine scale,
-        // so the direct softplus form is stable enough and lets us mask pairs.
-        let bce = (logits.clone().exp() + 1.0).log() - logits * positive_mask.clone();
-
-        let positive_loss = (bce.clone() * positive_mask.clone()).sum() / positive_count.max(1.0);
-        let negative_loss = (bce * negative_mask.clone()).sum() / negative_count.max(1.0);
-        let positive_active = if positive_count > 0.0 { 1.0 } else { 0.0 };
-        let negative_active = if negative_count > 0.0 { 1.0 } else { 0.0 };
-        let active_terms: f32 = positive_active + negative_active;
-        let loss = (positive_loss * positive_active + negative_loss * negative_active)
-            / active_terms.max(1.0);
-
-        let positive_sim = if positive_count > 0.0 {
-            ((sim.clone() * positive_mask).sum() / positive_count)
-                .into_scalar()
-                .elem::<f32>()
-        } else {
-            0.0
-        };
-        let negative_sim = if negative_count > 0.0 {
-            ((sim * negative_mask).sum() / negative_count)
-                .into_scalar()
-                .elem::<f32>()
-        } else {
-            0.0
-        };
-        let loss_f32 = loss.clone().into_scalar().elem::<f32>();
-
-        (
-            loss,
-            loss_f32,
-            pair_count,
-            positive_count,
-            positive_sim,
-            negative_sim,
-        )
-    }
-
-    #[cfg(feature = "train")]
-    fn off_diagonal_mask(&self, batch_size: usize, device: &B::Device) -> (Tensor<B, 2>, f32) {
-        let mut mask_data = vec![1.0f32; batch_size * batch_size];
-        for i in 0..batch_size {
-            mask_data[i * batch_size + i] = 0.0;
-        }
-        let mask = Tensor::<B, 1>::from_data(TensorData::from(mask_data.as_slice()), device)
-            .reshape([batch_size, batch_size]);
-        (mask, (batch_size * batch_size - batch_size) as f32)
-    }
-
-    #[cfg(feature = "train")]
-    fn piece_identity_index(item: &crate::dataset::ChessItem, square: usize) -> Option<usize> {
-        let offset = square * FEATURES_PER_TOKEN;
-        let features = item
-            .board_encoded
-            .get(offset..offset + crate::config::PIECE_IDENTITY_FEATURES)?;
-        features.iter().position(|v| *v > 0.5)
-    }
-
-    #[cfg(feature = "train")]
-    fn retrieval_structure_similarity(
-        a: &crate::dataset::ChessItem,
-        b: &crate::dataset::ChessItem,
-    ) -> f32 {
-        Self::retrieval_structure_components(a, b).current_score()
-    }
-
-    #[cfg(feature = "train")]
-    fn retrieval_structure_components(
-        a: &crate::dataset::ChessItem,
-        b: &crate::dataset::ChessItem,
-    ) -> RetrievalStructureComponents {
-        let mut pawn_union = 0.0f32;
-        let mut pawn_same = 0.0f32;
-        let mut center_pawn_union = 0.0f32;
-        let mut center_pawn_same = 0.0f32;
-        let mut piece_union = 0.0f32;
-        let mut piece_same = 0.0f32;
-        let mut non_pawn_union = 0.0f32;
-        let mut non_pawn_same = 0.0f32;
-        let mut role_counts_a = [0.0f32; crate::config::PIECE_IDENTITY_FEATURES];
-        let mut role_counts_b = [0.0f32; crate::config::PIECE_IDENTITY_FEATURES];
-        let mut pawn_files_a = [0.0f32; 16];
-        let mut pawn_files_b = [0.0f32; 16];
-        let mut open_files_a = [0.0f32; 8];
-        let mut open_files_b = [0.0f32; 8];
-        let mut pawn_wings_a = [0.0f32; 6];
-        let mut pawn_wings_b = [0.0f32; 6];
-        let mut non_pawns_a = Vec::new();
-        let mut non_pawns_b = Vec::new();
-
-        for square in 0..64 {
-            let piece_a = Self::piece_identity_index(a, square);
-            let piece_b = Self::piece_identity_index(b, square);
-            if let Some(piece) = piece_a {
-                role_counts_a[piece] += 1.0;
-            }
-            if let Some(piece) = piece_b {
-                role_counts_b[piece] += 1.0;
-            }
-            if piece_a.is_some() || piece_b.is_some() {
-                piece_union += 1.0;
-                if piece_a == piece_b {
-                    piece_same += 1.0;
-                }
-            }
-
-            let pawn_a = matches!(piece_a, Some(0 | 6));
-            let pawn_b = matches!(piece_b, Some(0 | 6));
-            if pawn_a || pawn_b {
-                pawn_union += 1.0;
-                if piece_a == piece_b {
-                    pawn_same += 1.0;
-                }
-            }
-            if pawn_a {
-                let color_offset = if matches!(piece_a, Some(6)) { 8 } else { 0 };
-                pawn_files_a[color_offset + square % 8] = 1.0;
-                pawn_wings_a[Self::pawn_wing_index(square, piece_a)] += 1.0;
-            }
-            if pawn_b {
-                let color_offset = if matches!(piece_b, Some(6)) { 8 } else { 0 };
-                pawn_files_b[color_offset + square % 8] = 1.0;
-                pawn_wings_b[Self::pawn_wing_index(square, piece_b)] += 1.0;
-            }
-            if (3..=4).contains(&(square % 8)) && (pawn_a || pawn_b) {
-                center_pawn_union += 1.0;
-                if piece_a == piece_b {
-                    center_pawn_same += 1.0;
-                }
-            }
-
-            let non_pawn_a = piece_a.is_some() && !pawn_a;
-            let non_pawn_b = piece_b.is_some() && !pawn_b;
-            if non_pawn_a || non_pawn_b {
-                non_pawn_union += 1.0;
-                if piece_a == piece_b {
-                    non_pawn_same += 1.0;
-                }
-            }
-            if non_pawn_a {
-                non_pawns_a.push((piece_a.unwrap_or(0), square));
-            }
-            if non_pawn_b {
-                non_pawns_b.push((piece_b.unwrap_or(0), square));
-            }
-        }
-
-        let pawn_similarity = if pawn_union > 0.0 {
-            pawn_same / pawn_union
-        } else {
-            1.0
-        };
-        let piece_similarity = if piece_union > 0.0 {
-            piece_same / piece_union
-        } else {
-            1.0
-        };
-        let non_pawn_similarity = if non_pawn_union > 0.0 {
-            non_pawn_same / non_pawn_union
-        } else {
-            1.0
-        };
-        let center_pawn_similarity = if center_pawn_union > 0.0 {
-            center_pawn_same / center_pawn_union
-        } else {
-            pawn_similarity
-        };
-        let role_count_similarity = Self::count_jaccard(&role_counts_a, &role_counts_b);
-        let non_pawn_role_count_similarity =
-            Self::count_jaccard(&role_counts_a[1..6], &role_counts_b[1..6]).min(
-                Self::count_jaccard(&role_counts_a[7..12], &role_counts_b[7..12]),
-            );
-        let pawn_file_similarity = Self::count_jaccard(&pawn_files_a, &pawn_files_b);
-        let white_pawn_file_similarity =
-            Self::count_jaccard(&pawn_files_a[0..8], &pawn_files_b[0..8]);
-        let black_pawn_file_similarity =
-            Self::count_jaccard(&pawn_files_a[8..16], &pawn_files_b[8..16]);
-        let balanced_pawn_file_similarity =
-            white_pawn_file_similarity.min(black_pawn_file_similarity);
-        for file in 0..8 {
-            open_files_a[file] = if pawn_files_a[file] == 0.0 && pawn_files_a[file + 8] == 0.0 {
-                1.0
-            } else {
-                0.0
-            };
-            open_files_b[file] = if pawn_files_b[file] == 0.0 && pawn_files_b[file + 8] == 0.0 {
-                1.0
-            } else {
-                0.0
-            };
-        }
-        let pawn_file_missing_similarity = 1.0
-            - Self::binary_hamming_distance(&pawn_files_a, &pawn_files_b)
-                / pawn_files_a.len().max(1) as f32;
-        let open_file_similarity = Self::count_jaccard(&open_files_a, &open_files_b);
-        let pawn_wing_similarity = Self::count_jaccard(&pawn_wings_a, &pawn_wings_b);
-        let nearby_non_pawn_similarity = Self::nearby_piece_similarity(&non_pawns_a, &non_pawns_b);
-        let ply_gap = a
-            .global_features
-            .move_count
-            .abs_diff(b.global_features.move_count) as f32;
-        let ply_gate = (-ply_gap / 16.0).exp();
-        let material_gap = (a.material_imbalance - b.material_imbalance).abs() as f32;
-        let material_gate = (-material_gap / 6.0).exp();
-        let source_gate = if a.is_puzzle == b.is_puzzle {
-            1.0
-        } else {
-            0.25
-        };
-
-        RetrievalStructureComponents {
-            pawn_similarity,
-            piece_similarity,
-            non_pawn_similarity,
-            role_count_similarity,
-            non_pawn_role_count_similarity,
-            pawn_file_similarity,
-            white_pawn_file_similarity,
-            black_pawn_file_similarity,
-            balanced_pawn_file_similarity,
-            pawn_file_missing_similarity,
-            open_file_similarity,
-            center_pawn_similarity,
-            pawn_wing_similarity,
-            nearby_non_pawn_similarity,
-            ply_gate,
-            material_gate,
-            source_gate,
-        }
-    }
-
-    #[cfg(feature = "train")]
-    fn pawn_wing_index(square: usize, piece: Option<usize>) -> usize {
-        let color_offset = if matches!(piece, Some(6)) { 3 } else { 0 };
-        let file = square % 8;
-        let wing = if file <= 2 {
-            0
-        } else if file <= 4 {
-            1
-        } else {
-            2
-        };
-        color_offset + wing
-    }
-
-    #[cfg(feature = "train")]
-    fn count_jaccard(a: &[f32], b: &[f32]) -> f32 {
-        let mut intersection = 0.0f32;
-        let mut union = 0.0f32;
-        for (x, y) in a.iter().zip(b) {
-            intersection += x.min(*y);
-            union += x.max(*y);
-        }
-        if union > 0.0 {
-            intersection / union
-        } else {
-            1.0
-        }
-    }
-
-    #[cfg(feature = "train")]
-    fn binary_hamming_distance(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b)
-            .filter(|(x, y)| (**x > 0.5) != (**y > 0.5))
-            .count() as f32
-    }
-
-    #[cfg(feature = "train")]
-    fn nearby_piece_similarity(a: &[(usize, usize)], b: &[(usize, usize)]) -> f32 {
-        if a.is_empty() && b.is_empty() {
-            return 1.0;
-        }
-        if a.is_empty() || b.is_empty() {
-            return 0.0;
-        }
-        let forward = Self::directed_nearby_piece_similarity(a, b);
-        let backward = Self::directed_nearby_piece_similarity(b, a);
-        0.5 * (forward + backward)
-    }
-
-    #[cfg(feature = "train")]
-    fn directed_nearby_piece_similarity(a: &[(usize, usize)], b: &[(usize, usize)]) -> f32 {
-        let mut score = 0.0f32;
-        for (piece_a, square_a) in a {
-            let file_a = square_a % 8;
-            let rank_a = square_a / 8;
-            let best = b
-                .iter()
-                .filter(|(piece_b, _)| piece_a == piece_b)
-                .map(|(_, square_b)| {
-                    let file_b = square_b % 8;
-                    let rank_b = square_b / 8;
-                    let distance = file_a.abs_diff(file_b).max(rank_a.abs_diff(rank_b)) as f32;
-                    (1.0 - distance / 4.0).clamp(0.0, 1.0)
-                })
-                .fold(0.0f32, f32::max);
-            score += best;
-        }
-        score / a.len().max(1) as f32
-    }
-
-    #[cfg(feature = "train")]
-    fn retrieval_structure_gate(
-        &self,
-        items: &[crate::dataset::ChessItem],
-        batch_size: usize,
-        device: &B::Device,
-    ) -> Tensor<B, 2> {
-        let mut gate_data = vec![0.0f32; batch_size * batch_size];
-        for i in 0..batch_size {
-            for j in 0..batch_size {
-                if i == j {
-                    continue;
-                }
-                gate_data[i * batch_size + j] =
-                    Self::retrieval_structure_similarity(&items[i], &items[j]);
-            }
-        }
-        Tensor::<B, 1>::from_data(TensorData::from(gate_data.as_slice()), device)
-            .reshape([batch_size, batch_size])
-    }
-
-    #[cfg(feature = "train")]
-    fn compute_policy_overlap_retrieval_loss_from_embeddings(
-        &self,
-        embeddings: Tensor<B, 2>,
-        items: &[crate::dataset::ChessItem],
-        policy_probs: Tensor<B, 2>,
-    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
-    where
-        B::FloatElem: From<f32>,
-    {
-        let batch_size = embeddings.dims()[0];
-        let device = embeddings.device();
-        let zero = || Tensor::<B, 1>::zeros([1], &device);
-        if batch_size < 2 || policy_probs.dims()[0] != batch_size || items.len() != batch_size {
-            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
-        let (pair_mask, pair_count) = self.off_diagonal_mask(batch_size, &device);
-        let structure_gate = self.retrieval_structure_gate(items, batch_size, &device);
-        let probs_i = policy_probs.clone().detach().unsqueeze_dim::<3>(1);
-        let probs_j = policy_probs.detach().unsqueeze_dim::<3>(0);
-        let target = probs_i
-            .min_pair(probs_j)
-            .sum_dim(2)
-            .reshape([batch_size, batch_size])
-            * structure_gate.detach();
-
-        let sim = embeddings.clone().matmul(embeddings.transpose());
-        let diff = sim.clone() - target.clone();
-        let loss = (diff.powf_scalar(2.0) * pair_mask.clone()).sum() / pair_count;
-
-        let config = get_global_config();
-        let positive_mask = target
-            .greater_elem(config.retrieval_policy_positive_threshold())
-            .float()
-            * pair_mask.clone();
-        let positive_count = positive_mask.clone().sum().into_scalar().elem::<f32>();
-        let negative_mask = pair_mask - positive_mask.clone();
-        let negative_count = (pair_count - positive_count).max(0.0);
-
-        let positive_sim = if positive_count > 0.0 {
-            ((sim.clone() * positive_mask).sum() / positive_count)
-                .into_scalar()
-                .elem::<f32>()
-        } else {
-            0.0
-        };
-        let negative_sim = if negative_count > 0.0 {
-            ((sim * negative_mask).sum() / negative_count)
-                .into_scalar()
-                .elem::<f32>()
-        } else {
-            0.0
-        };
-        let loss_f32 = loss.clone().into_scalar().elem::<f32>();
-
-        (
-            loss,
-            loss_f32,
-            pair_count,
-            positive_count,
-            positive_sim,
-            negative_sim,
-        )
-    }
-
-    #[cfg(feature = "train")]
-    fn compute_structural_semantic_retrieval_loss_from_embeddings(
-        &self,
-        embeddings: Tensor<B, 2>,
-        semantic_embeddings: Tensor<B, 2>,
-        items: &[crate::dataset::ChessItem],
-    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
-    where
-        B::FloatElem: From<f32>,
-    {
-        let batch_size = embeddings.dims()[0];
-        let device = embeddings.device();
-        let zero = || Tensor::<B, 1>::zeros([1], &device);
-        if batch_size < 2
-            || semantic_embeddings.dims()[0] != batch_size
-            || items.len() != batch_size
-        {
-            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
-        let (pair_mask, pair_count) = self.off_diagonal_mask(batch_size, &device);
-        let structure_gate = self.retrieval_structure_gate(items, batch_size, &device);
-        let semantic_sim = (semantic_embeddings
-            .clone()
-            .detach()
-            .matmul(semantic_embeddings.detach().transpose())
-            + 1.0)
-            / 2.0;
-        let target = semantic_sim * structure_gate.detach();
-
-        let sim = embeddings.clone().matmul(embeddings.transpose());
-        let diff = sim.clone() - target.clone();
-        let loss = (diff.powf_scalar(2.0) * pair_mask.clone()).sum() / pair_count;
-
-        let config = get_global_config();
-        let positive_mask = target
-            .greater_elem(config.retrieval_policy_positive_threshold())
-            .float()
-            * pair_mask.clone();
-        let positive_count = positive_mask.clone().sum().into_scalar().elem::<f32>();
-        let negative_mask = pair_mask - positive_mask.clone();
-        let negative_count = (pair_count - positive_count).max(0.0);
-
-        let positive_sim = if positive_count > 0.0 {
-            ((sim.clone() * positive_mask).sum() / positive_count)
-                .into_scalar()
-                .elem::<f32>()
-        } else {
-            0.0
-        };
-        let negative_sim = if negative_count > 0.0 {
-            ((sim * negative_mask).sum() / negative_count)
-                .into_scalar()
-                .elem::<f32>()
-        } else {
-            0.0
-        };
-        let loss_f32 = loss.clone().into_scalar().elem::<f32>();
-
-        (
-            loss,
-            loss_f32,
-            pair_count,
-            positive_count,
-            positive_sim,
-            negative_sim,
-        )
-    }
-
-    #[cfg(feature = "train")]
-    fn retrieval_target_move_indices(items: &[crate::dataset::ChessItem]) -> Vec<Option<usize>> {
-        items
-            .iter()
-            .map(|item| item.move_distribution.iter().position(|p| *p > 0.0))
-            .collect()
-    }
-
-    #[cfg(feature = "train")]
-    fn retrieval_debiased_policy_overlap(
-        &self,
-        policy_probs: Tensor<B, 2>,
-        target_indices: &[Option<usize>],
-        batch_size: usize,
-        device: &B::Device,
-    ) -> Tensor<B, 2>
-    where
-        B::FloatElem: From<f32>,
-    {
-        let mut mask_data = vec![1.0f32; batch_size * LEGAL_MOVES];
-        for (row, target_idx) in target_indices.iter().enumerate() {
-            if let Some(target_idx) = target_idx {
-                if *target_idx < LEGAL_MOVES {
-                    mask_data[row * LEGAL_MOVES + target_idx] = 0.0;
-                }
-            }
-        }
-
-        let debias_mask = Tensor::<B, 1>::from_data(TensorData::from(mask_data.as_slice()), device)
-            .reshape([batch_size, LEGAL_MOVES]);
-        let debiased_probs = policy_probs.detach() * debias_mask;
-        let row_sum = debiased_probs.clone().sum_dim(1).clamp_min(1e-6);
-        let debiased_probs = debiased_probs / row_sum;
-        let probs_i = debiased_probs.clone().unsqueeze_dim::<3>(1);
-        let probs_j = debiased_probs.unsqueeze_dim::<3>(0);
-        probs_i
-            .min_pair(probs_j)
-            .sum_dim(2)
-            .reshape([batch_size, batch_size])
-    }
-
-    #[cfg(feature = "train")]
-    fn future_continuation_overlap(a: &[String], b: &[String], n: usize) -> f32 {
-        if a.len() < n || b.len() < n || n == 0 {
-            return 0.0;
-        }
-
-        let mut used = vec![false; n];
-        let mut matches = 0usize;
-        for move_a in a.iter().take(n) {
-            if let Some((idx, _)) = b
-                .iter()
-                .take(n)
-                .enumerate()
-                .find(|(idx, move_b)| !used[*idx] && *move_b == move_a)
-            {
-                used[idx] = true;
-                matches += 1;
-            }
-        }
-
-        matches as f32 / n as f32
-    }
-
-    #[cfg(feature = "train")]
-    fn retrieval_future_continuation_similarity_and_mask(
-        &self,
-        items: &[crate::dataset::ChessItem],
-        batch_size: usize,
-        continuation_plies: usize,
-        device: &B::Device,
-    ) -> (Tensor<B, 2>, Tensor<B, 2>, f32) {
-        let mut sim_data = vec![0.0f32; batch_size * batch_size];
-        let mut mask_data = vec![0.0f32; batch_size * batch_size];
-        let mut pair_count = 0.0f32;
-
-        for i in 0..batch_size {
-            if items[i].future_moves.len() < continuation_plies {
-                continue;
-            }
-
-            for j in 0..batch_size {
-                if i == j {
-                    continue;
-                }
-                if items[j].future_moves.len() < continuation_plies {
-                    continue;
-                }
-
-                let offset = i * batch_size + j;
-                mask_data[offset] = 1.0;
-                pair_count += 1.0;
-                sim_data[offset] = Self::future_continuation_overlap(
-                    &items[i].future_moves,
-                    &items[j].future_moves,
-                    continuation_plies,
-                );
-            }
-        }
-
-        let sim = Tensor::<B, 1>::from_data(TensorData::from(sim_data.as_slice()), device)
-            .reshape([batch_size, batch_size]);
-        let mask = Tensor::<B, 1>::from_data(TensorData::from(mask_data.as_slice()), device)
-            .reshape([batch_size, batch_size]);
-        (sim, mask, pair_count)
-    }
-
-    #[cfg(feature = "train")]
-    fn compute_mixed_game_retrieval_loss_from_embeddings(
-        &self,
-        embeddings: Tensor<B, 2>,
-        semantic_embeddings: Tensor<B, 2>,
-        items: &[crate::dataset::ChessItem],
-        policy_probs: Option<Tensor<B, 2>>,
-    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
-    where
-        B::FloatElem: From<f32>,
-    {
-        let batch_size = embeddings.dims()[0];
-        let device = embeddings.device();
-        let zero = || Tensor::<B, 1>::zeros([1], &device);
-        if batch_size < 2
-            || semantic_embeddings.dims()[0] != batch_size
-            || policy_probs
-                .as_ref()
-                .is_some_and(|policy_probs| policy_probs.dims()[0] != batch_size)
-            || items.len() != batch_size
-        {
-            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-
-        let config = get_global_config();
-        let continuation_plies = config.retrieval_continuation_plies();
-        let (continuation_sim, pair_mask, pair_count) = self
-            .retrieval_future_continuation_similarity_and_mask(
-                items,
-                batch_size,
-                continuation_plies,
-                &device,
-            );
-        if pair_count <= 0.0 {
-            return (zero(), 0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-        let structure_gate = self.retrieval_structure_gate(items, batch_size, &device);
-        let target_indices = Self::retrieval_target_move_indices(items);
-
-        let semantic_sim = (semantic_embeddings
-            .clone()
-            .detach()
-            .matmul(semantic_embeddings.detach().transpose())
-            + 1.0)
-            / 2.0;
-        let semantic_weight = config.retrieval_semantic_weight();
-        let policy_weight = if policy_probs.is_some() {
-            config.retrieval_policy_weight()
-        } else {
-            0.0
-        };
-        let continuation_weight = config.retrieval_continuation_weight();
-        let total_weight = (semantic_weight + policy_weight + continuation_weight).max(1e-6);
-
-        let mixed_target = if let Some(policy_probs) = policy_probs {
-            let policy_overlap = self.retrieval_debiased_policy_overlap(
-                policy_probs,
-                &target_indices,
-                batch_size,
-                &device,
-            );
-            (semantic_sim * semantic_weight
-                + policy_overlap * policy_weight
-                + continuation_sim * continuation_weight)
-                / total_weight
-        } else {
-            (semantic_sim * semantic_weight + continuation_sim * continuation_weight) / total_weight
-        };
-        let gate_strength = config.retrieval_structure_gate_strength();
-        let gate = structure_gate
-            .detach()
-            .powf_scalar(config.retrieval_structure_gate_power());
-        let target = mixed_target * (gate * gate_strength + (1.0 - gate_strength));
-
-        let sim = embeddings.clone().matmul(embeddings.transpose());
-        let diff = sim.clone() - target.clone();
-        let loss = (diff.powf_scalar(2.0) * pair_mask.clone()).sum() / pair_count;
-
-        let positive_mask = target
-            .greater_elem(config.retrieval_policy_positive_threshold())
-            .float()
-            * pair_mask.clone();
-        let positive_count = positive_mask.clone().sum().into_scalar().elem::<f32>();
-        let negative_mask = pair_mask - positive_mask.clone();
-        let negative_count = (pair_count - positive_count).max(0.0);
-
-        let positive_sim = if positive_count > 0.0 {
-            ((sim.clone() * positive_mask).sum() / positive_count)
-                .into_scalar()
-                .elem::<f32>()
-        } else {
-            0.0
-        };
-        let negative_sim = if negative_count > 0.0 {
-            ((sim * negative_mask).sum() / negative_count)
-                .into_scalar()
-                .elem::<f32>()
-        } else {
-            0.0
-        };
-        let loss_f32 = loss.clone().into_scalar().elem::<f32>();
-
-        (
-            loss,
-            loss_f32,
-            pair_count,
-            positive_count,
-            positive_sim,
-            negative_sim,
-        )
-    }
-
-    #[cfg(feature = "train")]
-    fn compute_retrieval_loss_from_embeddings(
-        &self,
-        embeddings: Tensor<B, 2>,
-        semantic_embeddings: Option<Tensor<B, 2>>,
-        items: &[crate::dataset::ChessItem],
-        policy_probs: Option<Tensor<B, 2>>,
-    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32)
-    where
-        B::FloatElem: From<f32>,
-    {
-        let config = get_global_config();
-        if config.retrieval_objective() == RETRIEVAL_OBJECTIVE_POLICY_OVERLAP {
-            if let Some(policy_probs) = policy_probs.clone() {
-                return self.compute_policy_overlap_retrieval_loss_from_embeddings(
-                    embeddings,
-                    items,
-                    policy_probs,
-                );
-            }
-        }
-        if config.retrieval_objective() == RETRIEVAL_OBJECTIVE_MIXED_GAME {
-            if let Some(semantic_embeddings) = semantic_embeddings.clone() {
-                return self.compute_mixed_game_retrieval_loss_from_embeddings(
-                    embeddings,
-                    semantic_embeddings,
-                    items,
-                    policy_probs,
-                );
-            }
-        }
-        if config.retrieval_objective() == RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC {
-            if let Some(semantic_embeddings) = semantic_embeddings {
-                return self.compute_structural_semantic_retrieval_loss_from_embeddings(
-                    embeddings,
-                    semantic_embeddings,
-                    items,
-                );
-            }
-        }
-
-        self.compute_same_move_retrieval_loss_from_embeddings(embeddings, items)
-    }
-
-    #[cfg(feature = "train")]
-    fn compute_retrieval_loss(
-        &self,
-        trunk_output: Tensor<B, 3>,
-        globals: Tensor<B, 2, Float>,
-        items: &[crate::dataset::ChessItem],
-        policy_probs: Option<Tensor<B, 2>>,
-    ) -> (Tensor<B, 1>, f32, f32, f32, f32, f32, f32, f32, f32)
-    where
-        B::FloatElem: From<f32>,
-    {
-        let semantic_z = self.normalized_mean_pooled_trunk(trunk_output.clone().detach());
-        let retrieval_z = self.position_embedding_from_trunk(trunk_output.detach(), globals);
-        let opening_family_metrics =
-            compute_opening_family_neighbor_metrics(retrieval_z.clone().detach(), items, 5);
-        let (loss, loss_f32, pair_count, positive_count, positive_sim, negative_sim) = self
-            .compute_retrieval_loss_from_embeddings(
-                retrieval_z,
-                Some(semantic_z),
-                items,
-                policy_probs,
-            );
-        (
-            loss,
-            loss_f32,
-            pair_count,
-            positive_count,
-            positive_sim,
-            negative_sim,
-            opening_family_metrics.match_rate,
-            opening_family_metrics.neighbor_pair_count,
-            opening_family_metrics.position_coverage,
-        )
-    }
-
-    #[cfg(feature = "train")]
-    fn compute_trunk_retrieval_metrics(
-        &self,
-        trunk_output: Tensor<B, 3>,
-        items: &[crate::dataset::ChessItem],
-        policy_probs: Option<Tensor<B, 2>>,
-    ) -> (f32, f32, f32, f32, f32)
-    where
-        B::FloatElem: From<f32>,
-    {
-        let trunk_z = self.normalized_mean_pooled_trunk(trunk_output.detach());
-        let (_, loss_f32, pair_count, positive_count, positive_sim, negative_sim) = self
-            .compute_retrieval_loss_from_embeddings(
-                trunk_z.clone(),
-                Some(trunk_z),
-                items,
-                policy_probs,
-            );
-        (
-            loss_f32,
-            pair_count,
-            positive_count,
-            positive_sim,
-            negative_sim,
-        )
     }
 
     pub fn forward(
@@ -1236,24 +253,13 @@ impl<B: Backend> OXIModel<B> {
         (policy, value, side_info, time_usage)
     }
 
-    pub fn forward_policy_and_retrieval_embedding(
-        &self,
-        board: Tensor<B, 3>,
-        globals: Tensor<B, 2, Float>,
-    ) -> (Tensor<B, 3>, Tensor<B, 2>) {
-        let (policy, _value, _side_info, _time_usage, trunk, _policy_tokens) =
-            self.forward_with_trunk(board, globals.clone());
-        let embedding = self.retrieval_embedding_from_trunk(trunk, globals);
-        (policy, embedding)
-    }
-
     /// Inference-only forward pass that returns the same four outputs as `forward`,
     /// AND a per-layer vector of post-softmax attention weights, AND the post-
     /// norm trunk tensor (the per-square embeddings fed into the policy/value
     /// heads). Shape of the trunk is `[batch, 64, embed_dim]`.
     ///
-    /// Used by analysis/bot paths that need attention plus the retrieval
-    /// position embedding.
+    /// Used by analysis/bot paths that need attention plus the trunk for
+    /// position embeddings.
     pub fn forward_with_attention_and_trunk(
         &self,
         board: Tensor<B, 3>,
@@ -1265,9 +271,8 @@ impl<B: Backend> OXIModel<B> {
         Tensor<B, 2>,
         Vec<Tensor<B, 4>>,
         Tensor<B, 3>,
-        Tensor<B, 2>,
     ) {
-        let (policy, value, side_info, time_usage, attn, trunk, embedding) =
+        let (policy, value, side_info, time_usage, attn, trunk) =
             self.forward_with_attention_inner(board, globals, true);
         (
             policy,
@@ -1276,7 +281,6 @@ impl<B: Backend> OXIModel<B> {
             time_usage,
             attn,
             trunk.expect("trunk must be present when capture_trunk=true"),
-            embedding.expect("embedding must be present when capture_trunk=true"),
         )
     }
 
@@ -1303,7 +307,7 @@ impl<B: Backend> OXIModel<B> {
         Tensor<B, 2>,
         Vec<Tensor<B, 4>>,
     ) {
-        let (policy, value, side_info, time_usage, attn, _trunk, _embedding) =
+        let (policy, value, side_info, time_usage, attn, _trunk) =
             self.forward_with_attention_inner(board, globals, false);
         (policy, value, side_info, time_usage, attn)
     }
@@ -1320,7 +324,6 @@ impl<B: Backend> OXIModel<B> {
         Tensor<B, 2>,
         Vec<Tensor<B, 4>>,
         Option<Tensor<B, 3>>,
-        Option<Tensor<B, 2>>,
     ) {
         start_forward_pass();
         let device = board.device();
@@ -1352,14 +355,8 @@ impl<B: Backend> OXIModel<B> {
         let mut x = self.token_norm.forward(token_embeds);
         log_tensor_stats("encoder.input_tokens", &x);
 
-        // Multi-scale trunk: average outputs from the last half of layers
-        let num_layers = self.blocks.len();
-        let avg_start = num_layers / 2;
-        let mut layer_sum: Option<Tensor<B, 3>> = None;
-        let mut avg_count = 0;
-
         // Collect per-layer attention weights in order.
-        let mut attention_maps: Vec<Tensor<B, 4>> = Vec::with_capacity(num_layers);
+        let mut attention_maps: Vec<Tensor<B, 4>> = Vec::with_capacity(self.blocks.len());
 
         {
             let _encoder_stream = StreamScope::enter("encoder");
@@ -1374,29 +371,11 @@ impl<B: Backend> OXIModel<B> {
                 x = new_x;
                 attention_maps.push(attn);
                 log_tensor_stats("encoder.post_block", &x);
-
-                if layer_idx >= avg_start {
-                    layer_sum = Some(match layer_sum {
-                        Some(sum) => sum + x.clone(),
-                        None => x.clone(),
-                    });
-                    avg_count += 1;
-                }
             }
-        }
-
-        if let Some(sum) = layer_sum {
-            x = sum / (avg_count as f32);
         }
 
         x = self.norm.forward(x);
         log_tensor_stats("encoder.post_norm", &x);
-
-        let embedding_out = if capture_trunk {
-            Some(self.retrieval_embedding_from_trunk(x.clone(), globals.clone()))
-        } else {
-            None
-        };
 
         let policy_logits = {
             let _stream = StreamScope::enter("policy");
@@ -1466,11 +445,10 @@ impl<B: Backend> OXIModel<B> {
             time_usage_logits,
             attention_maps,
             trunk_out,
-            embedding_out,
         )
     }
 
-    fn forward_with_trunk(
+    pub fn forward_with_trunk(
         &self,
         board: Tensor<B, 3>,
         globals: Tensor<B, 2, Float>,
@@ -1512,13 +490,6 @@ impl<B: Backend> OXIModel<B> {
         let mut x = self.token_norm.forward(token_embeds);
         log_tensor_stats("encoder.input_tokens", &x);
 
-        // Multi-scale trunk: average outputs from the last half of layers
-        // to provide richer multi-level features and gradient shortcuts.
-        let num_layers = self.blocks.len();
-        let avg_start = num_layers / 2; // Average the second half of layers
-        let mut layer_sum: Option<Tensor<B, 3>> = None;
-        let mut avg_count = 0;
-
         {
             let _encoder_stream = StreamScope::enter("encoder");
             let _encoder_timing = TimingScope::new_with_sync::<B>("encoder_blocks", &device);
@@ -1529,21 +500,7 @@ impl<B: Backend> OXIModel<B> {
 
                 x = block.forward_with_film(x, &self.smolgen_weight_gen, globals.clone());
                 log_tensor_stats("encoder.post_block", &x);
-
-                // Accumulate outputs from the second half of layers
-                if layer_idx >= avg_start {
-                    layer_sum = Some(match layer_sum {
-                        Some(sum) => sum + x.clone(),
-                        None => x.clone(),
-                    });
-                    avg_count += 1;
-                }
             }
-        }
-
-        // Use averaged multi-scale representation instead of just final layer
-        if let Some(sum) = layer_sum {
-            x = sum / (avg_count as f32);
         }
 
         x = self.norm.forward(x);
@@ -1634,7 +591,7 @@ impl<B: Backend> OXIModel<B> {
     {
         let batch_clone = batch.clone();
         let config = get_global_config();
-        let batch_size = batch.board_input.shape().dims[0];
+        let batch_size = batch.board_input.shape().dims::<3>()[0];
 
         let (
             policy_logits,
@@ -1991,98 +948,6 @@ impl<B: Backend> OXIModel<B> {
         let aux_term = base_aux_loss.clone() * config.aux_loss_weight;
 
         let (
-            base_retrieval_loss,
-            retrieval_loss_f32,
-            retrieval_pair_count_f32,
-            retrieval_positive_count_f32,
-            retrieval_positive_sim_f32,
-            retrieval_negative_sim_f32,
-            retrieval_opening_family_match_rate_f32,
-            retrieval_opening_family_pair_count_f32,
-            retrieval_opening_family_coverage_f32,
-            trunk_retrieval_loss_f32,
-            trunk_retrieval_pair_count_f32,
-            trunk_retrieval_positive_count_f32,
-            trunk_retrieval_positive_sim_f32,
-            trunk_retrieval_negative_sim_f32,
-        ) = if config.retrieval_loss_weight() > 0.0 {
-            let retrieval_policy_probs = if config.retrieval_needs_policy_probs() {
-                let temperature = config.retrieval_policy_temperature();
-                let logits = policy_logits_flat.clone() / temperature;
-                let probs = log_softmax(logits, 1)
-                    .mask_fill(mask.clone(), 0.0)
-                    .exp()
-                    .mask_fill(mask.clone(), 0.0)
-                    .detach();
-                Some(probs)
-            } else {
-                None
-            };
-
-            let (
-                base_retrieval_loss,
-                retrieval_loss_f32,
-                retrieval_pair_count_f32,
-                retrieval_positive_count_f32,
-                retrieval_positive_sim_f32,
-                retrieval_negative_sim_f32,
-                retrieval_opening_family_match_rate_f32,
-                retrieval_opening_family_pair_count_f32,
-                retrieval_opening_family_coverage_f32,
-            ) = self.compute_retrieval_loss(
-                trunk_output.clone(),
-                batch.global_features.clone(),
-                &batch.items,
-                retrieval_policy_probs.clone(),
-            );
-            let (
-                trunk_retrieval_loss_f32,
-                trunk_retrieval_pair_count_f32,
-                trunk_retrieval_positive_count_f32,
-                trunk_retrieval_positive_sim_f32,
-                trunk_retrieval_negative_sim_f32,
-            ) = self.compute_trunk_retrieval_metrics(
-                trunk_output.clone(),
-                &batch.items,
-                retrieval_policy_probs,
-            );
-
-            (
-                base_retrieval_loss,
-                retrieval_loss_f32,
-                retrieval_pair_count_f32,
-                retrieval_positive_count_f32,
-                retrieval_positive_sim_f32,
-                retrieval_negative_sim_f32,
-                retrieval_opening_family_match_rate_f32,
-                retrieval_opening_family_pair_count_f32,
-                retrieval_opening_family_coverage_f32,
-                trunk_retrieval_loss_f32,
-                trunk_retrieval_pair_count_f32,
-                trunk_retrieval_positive_count_f32,
-                trunk_retrieval_positive_sim_f32,
-                trunk_retrieval_negative_sim_f32,
-            )
-        } else {
-            (
-                zero_like(),
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            )
-        };
-
-        let (
             base_calibration_loss,
             calibration_head_loss_f32,
             calibration_policy_mae_f32,
@@ -2237,6 +1102,18 @@ impl<B: Backend> OXIModel<B> {
                     .copied()
                     .unwrap_or(0.0);
 
+                // Scale gate: rescale the hinge term to policy_regret_ref_cp
+                // whenever the batch hinge exceeds it (identity below). The
+                // policy_regret_hinge metric above is extracted pre-gate, so
+                // logged curves stay in raw centipawns.
+                let regret_ref_cp = config.policy_regret_ref_cp.max(1.0);
+                let regret_gate_denom = base_policy_regret_loss_tensor
+                    .clone()
+                    .detach()
+                    .clamp_min(regret_ref_cp);
+                let base_policy_regret_loss_tensor =
+                    base_policy_regret_loss_tensor * regret_gate_denom.recip() * regret_ref_cp;
+
                 // --- Argmax predicted move cp loss, bucketed by Elo band ---
                 // For each position, look up the Stockfish cp loss of the model's
                 // argmax predicted move. Average by Elo skill band.
@@ -2364,15 +1241,13 @@ impl<B: Backend> OXIModel<B> {
         let calibration_term = base_calibration_loss.clone() * config.calibration_loss_weight();
         let policy_regret_term =
             base_policy_regret_loss.clone() * config.policy_regret_loss_weight();
-        let retrieval_term = base_retrieval_loss.clone() * config.retrieval_loss_weight();
 
         let loss = config_weighted_policy_loss.clone()
             + value_term.clone()
             + time_usage_term.clone()
             + aux_term.clone()
             + calibration_term.clone()
-            + policy_regret_term.clone()
-            + retrieval_term.clone();
+            + policy_regret_term.clone();
 
         // Accuracy
         let targets = batch.move_distributions.clone().argmax(1).squeeze_dim(1);
@@ -2387,7 +1262,6 @@ impl<B: Backend> OXIModel<B> {
             time_usage_term.clone(),
             aux_term,
             calibration_term.clone(),
-            retrieval_term.clone(),
             policy_logits_flat,
             targets,
             value_logits,
@@ -2432,25 +1306,6 @@ impl<B: Backend> OXIModel<B> {
             policy_regret_term,
             policy_regret_loss_f32,
             argmax_cp_loss_by_elo,
-        )
-        .with_retrieval_metrics(
-            base_retrieval_loss,
-            retrieval_term,
-            retrieval_loss_f32,
-            retrieval_pair_count_f32,
-            retrieval_positive_count_f32,
-            retrieval_positive_sim_f32,
-            retrieval_negative_sim_f32,
-            retrieval_opening_family_match_rate_f32,
-            retrieval_opening_family_pair_count_f32,
-            retrieval_opening_family_coverage_f32,
-        )
-        .with_trunk_retrieval_metrics(
-            trunk_retrieval_loss_f32,
-            trunk_retrieval_pair_count_f32,
-            trunk_retrieval_positive_count_f32,
-            trunk_retrieval_positive_sim_f32,
-            trunk_retrieval_negative_sim_f32,
         )
     }
 
@@ -2561,15 +1416,14 @@ impl<B: Backend> OXIModel<B> {
 }
 
 #[cfg(feature = "train")]
-impl<B: AutodiffBackend>
-    TrainStep<crate::dataset::ChessBatch<B>, crate::chess_output::ChessOutput<B>> for OXIModel<B>
+impl<B: AutodiffBackend> TrainStep for OXIModel<B>
 where
     B::FloatElem: From<f32>,
 {
-    fn step(
-        &self,
-        batch: crate::dataset::ChessBatch<B>,
-    ) -> TrainOutput<crate::chess_output::ChessOutput<B>> {
+    type Input = crate::dataset::ChessBatch<B>;
+    type Output = crate::chess_output::ChessOutput<B>;
+
+    fn step(&self, batch: Self::Input) -> TrainOutput<Self::Output> {
         let item = self.forward_classification(batch);
         let grads = item.loss.backward();
 
@@ -2578,12 +1432,14 @@ where
 }
 
 #[cfg(feature = "train")]
-impl<B: Backend> ValidStep<crate::dataset::ChessBatch<B>, crate::chess_output::ChessOutput<B>>
-    for OXIModel<B>
+impl<B: Backend> InferenceStep for OXIModel<B>
 where
     B::FloatElem: From<f32>,
 {
-    fn step(&self, batch: crate::dataset::ChessBatch<B>) -> crate::chess_output::ChessOutput<B> {
+    type Input = crate::dataset::ChessBatch<B>;
+    type Output = crate::chess_output::ChessOutput<B>;
+
+    fn step(&self, batch: Self::Input) -> Self::Output {
         self.forward_classification(batch)
     }
 }
@@ -2594,573 +1450,6 @@ mod tests {
     use crate::config::{FEATURES_PER_TOKEN, NUM_GLOBALS};
     use crate::test_backend::{test_device, TestBackend};
     use burn::tensor::TensorData;
-    use rand::{Rng, SeedableRng};
-    use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
-
-    #[cfg(feature = "train")]
-    #[test]
-    fn test_future_continuation_overlap_is_orderless() {
-        let a = vec![
-            "e2e4".to_string(),
-            "g1f3".to_string(),
-            "f1b5".to_string(),
-            "e1g1".to_string(),
-        ];
-        let b = vec![
-            "a7a6".to_string(),
-            "e1g1".to_string(),
-            "g1f3".to_string(),
-            "c7c5".to_string(),
-        ];
-
-        assert_eq!(
-            OXIModel::<TestBackend>::future_continuation_overlap(&a, &b, 4),
-            0.5
-        );
-    }
-
-    #[cfg(feature = "train")]
-    #[test]
-    #[ignore]
-    fn structural_similarity_opening_family_proxy() {
-        let config = crate::config::global_config().cloned().unwrap_or_else(|| {
-            let config = ModelConfig::default();
-            let _ = crate::config::set_global_config(config.clone());
-            config
-        });
-        let data_path = std::env::var("STRUCTURAL_GATE_DATA_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("../data"));
-        let max_items = env_usize("STRUCTURAL_GATE_MAX_ITEMS", 2_000);
-        let max_scan = env_usize("STRUCTURAL_GATE_MAX_SCAN", 100_000);
-        let top_k = env_usize("STRUCTURAL_GATE_TOP_K", 5);
-        let seed = env_usize("STRUCTURAL_GATE_SEED", 42) as u64;
-        let gate_power = env_f32(
-            "STRUCTURAL_GATE_POWER",
-            config.retrieval_structure_gate_power(),
-        );
-
-        let examples_iter = crate::pgn_processor::process_pgn_directory_iter(&data_path)
-            .unwrap_or_else(|err| panic!("failed to load PGN examples from {data_path:?}: {err}"));
-        let dataset = crate::dataset::OXIDataset::new(Vec::new(), config);
-        let mut items = Vec::with_capacity(max_items);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let mut scanned = 0usize;
-        let mut labeled_seen = 0usize;
-        for example in examples_iter.take(max_scan) {
-            scanned += 1;
-            if example.opening_family_labels.is_empty() {
-                continue;
-            }
-            let Ok(item) = dataset.process_example(&example) else {
-                continue;
-            };
-            if item.opening_family_labels.is_empty() {
-                continue;
-            }
-            labeled_seen += 1;
-            if items.len() < max_items {
-                items.push(item);
-            } else {
-                let replacement_idx = rng.random_range(0..labeled_seen);
-                if replacement_idx < max_items {
-                    items[replacement_idx] = item;
-                }
-            }
-        }
-
-        assert!(
-            items.len() >= 100,
-            "need at least 100 opening-family-labeled items, got {} after scanning {} examples",
-            items.len(),
-            scanned
-        );
-
-        let label_sets = items
-            .iter()
-            .map(|item| {
-                item.opening_family_labels
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        let mut candidate_metrics = STRUCTURAL_PROXY_CANDIDATES
-            .iter()
-            .map(|name| StructuralProxyCandidateMetrics::new(name, items.len(), top_k))
-            .collect::<Vec<_>>();
-        let mut same_pair_count = 0usize;
-        let mut diff_pair_count = 0usize;
-
-        for i in 0..items.len() {
-            for j in (i + 1)..items.len() {
-                let same_family = label_sets[i]
-                    .iter()
-                    .any(|label| label_sets[j].contains(label));
-                let components =
-                    OXIModel::<TestBackend>::retrieval_structure_components(&items[i], &items[j]);
-                let scores = structural_proxy_candidate_scores(components);
-
-                if same_family {
-                    same_pair_count += 1;
-                } else {
-                    diff_pair_count += 1;
-                }
-                for (metric, score) in candidate_metrics.iter_mut().zip(scores) {
-                    if same_family {
-                        metric.positive_scores.push(score);
-                    } else {
-                        metric.negative_scores.push(score);
-                    }
-                    push_top_candidate(&mut metric.top[i], top_k, score, j);
-                    push_top_candidate(&mut metric.top[j], top_k, score, i);
-                }
-            }
-        }
-
-        assert!(
-            !candidate_metrics[0].positive_scores.is_empty()
-                && !candidate_metrics[0].negative_scores.is_empty(),
-            "need both positive and negative opening-family pairs, got pos={} neg={}",
-            candidate_metrics[0].positive_scores.len(),
-            candidate_metrics[0].negative_scores.len()
-        );
-
-        let positive_rate =
-            same_pair_count as f64 / (same_pair_count + diff_pair_count).max(1) as f64;
-        let mut results = candidate_metrics
-            .iter()
-            .map(|metric| {
-                let positive_mean = mean(&metric.positive_scores);
-                let negative_mean = mean(&metric.negative_scores);
-                StructuralProxyCandidateResult {
-                    name: metric.name,
-                    auc: roc_auc(&metric.positive_scores, &metric.negative_scores),
-                    top_match: top_k_match_rate(&metric.top, &label_sets),
-                    macro_top_match: macro_top_k_match_rate(&metric.top, &label_sets),
-                    positive_mean,
-                    negative_mean,
-                    mean_gap: positive_mean - negative_mean,
-                    raw_brier: balanced_brier(
-                        &metric.positive_scores,
-                        &metric.negative_scores,
-                        |x| x,
-                    ),
-                    raw_log_loss: balanced_log_loss(
-                        &metric.positive_scores,
-                        &metric.negative_scores,
-                        |x| x,
-                    ),
-                    effective_brier: balanced_brier(
-                        &metric.positive_scores,
-                        &metric.negative_scores,
-                        |x| x.powf(gate_power),
-                    ),
-                    effective_log_loss: balanced_log_loss(
-                        &metric.positive_scores,
-                        &metric.negative_scores,
-                        |x| x.powf(gate_power),
-                    ),
-                }
-            })
-            .collect::<Vec<_>>();
-        results.sort_by(|a, b| {
-            b.top_match
-                .total_cmp(&a.top_match)
-                .then_with(|| b.macro_top_match.total_cmp(&a.macro_top_match))
-                .then_with(|| b.auc.total_cmp(&a.auc))
-        });
-
-        println!(
-            "STRUCTURAL_FAMILY_PROXY data_path={} scanned={} labeled_seen={} sampled_items={} seed={} pairs={} positives={} negatives={} positive_rate={:.6}",
-            data_path.display(),
-            scanned,
-            labeled_seen,
-            items.len(),
-            seed,
-            same_pair_count + diff_pair_count,
-            same_pair_count,
-            diff_pair_count,
-            positive_rate
-        );
-        for result in &results {
-            println!(
-                "STRUCTURAL_FAMILY_PROXY candidate={} auc={:.6} top{}_match={:.6} macro_top{}_match={:.6} mean_pos={:.6} mean_neg={:.6} mean_gap={:.6} raw_brier={:.6} raw_log_loss={:.6} effective_power={:.3} effective_brier={:.6} effective_log_loss={:.6}",
-                result.name,
-                result.auc,
-                top_k,
-                result.top_match,
-                top_k,
-                result.macro_top_match,
-                result.positive_mean,
-                result.negative_mean,
-                result.mean_gap,
-                result.raw_brier,
-                result.raw_log_loss,
-                gate_power,
-                result.effective_brier,
-                result.effective_log_loss
-            );
-        }
-    }
-
-    const STRUCTURAL_PROXY_CANDIDATES: [&str; 58] = [
-        "current",
-        "pawn_exact",
-        "pawn_file",
-        "white_pawn_file",
-        "black_pawn_file",
-        "balanced_pawn_file",
-        "pawn_file_missing",
-        "open_file",
-        "center_pawn",
-        "pawn_wing",
-        "piece_exact",
-        "non_pawn_exact",
-        "role_counts",
-        "non_pawn_role_counts",
-        "nearby_non_pawn",
-        "pawn_piece_mean",
-        "pawn_file_piece_mean",
-        "pawn_file_role_mean",
-        "pawn_file_nearby_mean",
-        "pawn_file_center_mean",
-        "pawn_file_wing_mean",
-        "balanced_file_center_mean",
-        "missing_file_center_mean",
-        "open_file_center_mean",
-        "pawn_non_pawn_mean",
-        "pawn_file_non_pawn_mean",
-        "balanced_file_non_pawn_mean",
-        "pawn_exact_file_product",
-        "pawn_file_center_product",
-        "balanced_file_center_product",
-        "missing_file_center_product",
-        "open_file_center_product",
-        "pawn_file_role_product",
-        "pawn_file_nearby_product",
-        "pawn_file_non_pawn_product",
-        "pawn_file_piece_product",
-        "pawn_skeleton_role_product",
-        "pawn_skeleton_nearby_product",
-        "pawn_skeleton_center_product",
-        "pawn_skeleton_wing_product",
-        "pawn_skeleton_center_wing_product",
-        "pawn_skeleton_center_wing_soft",
-        "pawn_skeleton_center_wing_role",
-        "pawn_skeleton_center_wing_nearby",
-        "pawn_skeleton_balanced_file",
-        "pawn_skeleton_missing_file",
-        "pawn_skeleton_open_file",
-        "pawn_skeleton_center_balanced_file",
-        "pawn_skeleton_center_missing_file",
-        "pawn_skeleton_center_open_file",
-        "pawn_blend_soft_pieces",
-        "pawn_blend_soft_shape",
-        "piece_soft_gates",
-        "additive_soft_gates",
-        "pawn_first_soft",
-        "geometric_soft",
-        "current_no_ply_material",
-        "piece_no_ply_material",
-    ];
-
-    #[cfg(feature = "train")]
-    struct StructuralProxyCandidateMetrics {
-        name: &'static str,
-        positive_scores: Vec<f32>,
-        negative_scores: Vec<f32>,
-        top: Vec<Vec<(f32, usize)>>,
-    }
-
-    #[cfg(feature = "train")]
-    impl StructuralProxyCandidateMetrics {
-        fn new(name: &'static str, item_count: usize, top_k: usize) -> Self {
-            Self {
-                name,
-                positive_scores: Vec::new(),
-                negative_scores: Vec::new(),
-                top: vec![Vec::<(f32, usize)>::with_capacity(top_k + 1); item_count],
-            }
-        }
-    }
-
-    #[cfg(feature = "train")]
-    struct StructuralProxyCandidateResult {
-        name: &'static str,
-        auc: f64,
-        top_match: f64,
-        macro_top_match: f64,
-        positive_mean: f64,
-        negative_mean: f64,
-        mean_gap: f64,
-        raw_brier: f64,
-        raw_log_loss: f64,
-        effective_brier: f64,
-        effective_log_loss: f64,
-    }
-
-    #[cfg(feature = "train")]
-    fn structural_proxy_candidate_scores(c: RetrievalStructureComponents) -> [f32; 58] {
-        let soft_progress_gate = c.ply_gate.powf(0.25) * c.material_gate.powf(0.25) * c.source_gate;
-        let pawn_skeleton = c.pawn_similarity.powf(2.0) * c.source_gate;
-        let current_no_ply_material =
-            c.pawn_similarity.powf(2.0) * (0.25 + 0.75 * c.piece_similarity) * c.source_gate;
-        let average = |terms: &[(f32, f32)]| -> f32 {
-            let mut numerator = 0.0f32;
-            let mut denominator = 0.0f32;
-            for (weight, value) in terms {
-                numerator += weight * value;
-                denominator += weight;
-            }
-            if denominator > 0.0 {
-                numerator / denominator
-            } else {
-                0.0
-            }
-        };
-
-        [
-            c.current_score(),
-            c.pawn_similarity,
-            c.pawn_file_similarity,
-            c.white_pawn_file_similarity,
-            c.black_pawn_file_similarity,
-            c.balanced_pawn_file_similarity,
-            c.pawn_file_missing_similarity,
-            c.open_file_similarity,
-            c.center_pawn_similarity,
-            c.pawn_wing_similarity,
-            c.piece_similarity,
-            c.non_pawn_similarity,
-            c.role_count_similarity,
-            c.non_pawn_role_count_similarity,
-            c.nearby_non_pawn_similarity,
-            0.5 * c.pawn_similarity + 0.5 * c.piece_similarity,
-            0.55 * c.pawn_file_similarity + 0.45 * c.piece_similarity,
-            0.55 * c.pawn_file_similarity + 0.45 * c.role_count_similarity,
-            0.55 * c.pawn_file_similarity + 0.45 * c.nearby_non_pawn_similarity,
-            0.5 * c.pawn_file_similarity + 0.5 * c.center_pawn_similarity,
-            0.5 * c.pawn_file_similarity + 0.5 * c.pawn_wing_similarity,
-            0.5 * c.balanced_pawn_file_similarity + 0.5 * c.center_pawn_similarity,
-            0.5 * c.pawn_file_missing_similarity + 0.5 * c.center_pawn_similarity,
-            0.5 * c.open_file_similarity + 0.5 * c.center_pawn_similarity,
-            0.55 * c.pawn_similarity + 0.45 * c.non_pawn_similarity,
-            0.55 * c.pawn_file_similarity + 0.45 * c.non_pawn_similarity,
-            0.55 * c.balanced_pawn_file_similarity + 0.45 * c.non_pawn_similarity,
-            c.pawn_similarity * c.pawn_file_similarity,
-            c.pawn_file_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
-            c.balanced_pawn_file_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
-            c.pawn_file_missing_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
-            c.open_file_similarity * (0.5 + 0.5 * c.center_pawn_similarity),
-            c.pawn_file_similarity * (0.5 + 0.5 * c.role_count_similarity),
-            c.pawn_file_similarity * (0.5 + 0.5 * c.nearby_non_pawn_similarity),
-            c.pawn_file_similarity * (0.5 + 0.5 * c.non_pawn_similarity),
-            c.pawn_file_similarity * (0.5 + 0.5 * c.piece_similarity),
-            pawn_skeleton * (0.5 + 0.5 * c.role_count_similarity),
-            pawn_skeleton * (0.5 + 0.5 * c.nearby_non_pawn_similarity),
-            pawn_skeleton * (0.5 + 0.5 * c.center_pawn_similarity),
-            pawn_skeleton * (0.5 + 0.5 * c.pawn_wing_similarity),
-            pawn_skeleton * (0.5 + 0.25 * c.center_pawn_similarity + 0.25 * c.pawn_wing_similarity),
-            pawn_skeleton * (0.35 + 0.4 * c.center_pawn_similarity + 0.25 * c.pawn_wing_similarity),
-            pawn_skeleton
-                * (0.4
-                    + 0.25 * c.center_pawn_similarity
-                    + 0.2 * c.pawn_wing_similarity
-                    + 0.15 * c.role_count_similarity),
-            pawn_skeleton
-                * (0.4
-                    + 0.25 * c.center_pawn_similarity
-                    + 0.2 * c.pawn_wing_similarity
-                    + 0.15 * c.nearby_non_pawn_similarity),
-            pawn_skeleton * (0.5 + 0.5 * c.balanced_pawn_file_similarity),
-            pawn_skeleton * (0.5 + 0.5 * c.pawn_file_missing_similarity),
-            pawn_skeleton * (0.5 + 0.5 * c.open_file_similarity),
-            pawn_skeleton
-                * (0.45 + 0.35 * c.center_pawn_similarity + 0.2 * c.balanced_pawn_file_similarity),
-            pawn_skeleton
-                * (0.45 + 0.35 * c.center_pawn_similarity + 0.2 * c.pawn_file_missing_similarity),
-            pawn_skeleton * (0.45 + 0.35 * c.center_pawn_similarity + 0.2 * c.open_file_similarity),
-            average(&[
-                (0.55, c.pawn_similarity),
-                (0.25, c.pawn_file_similarity),
-                (0.20, c.piece_similarity),
-            ]),
-            average(&[
-                (0.45, c.pawn_similarity),
-                (0.25, c.pawn_file_similarity),
-                (0.15, c.center_pawn_similarity),
-                (0.15, c.role_count_similarity),
-            ]),
-            c.piece_similarity * soft_progress_gate,
-            (0.5 * c.pawn_similarity + 0.4 * c.non_pawn_similarity + 0.1 * c.piece_similarity)
-                * soft_progress_gate,
-            c.pawn_similarity * (0.5 + 0.5 * c.non_pawn_similarity) * soft_progress_gate,
-            c.pawn_similarity.sqrt() * (0.35 + 0.65 * c.piece_similarity) * soft_progress_gate,
-            current_no_ply_material,
-            c.piece_similarity * c.source_gate,
-        ]
-    }
-
-    #[cfg(feature = "train")]
-    fn env_usize(key: &str, default: usize) -> usize {
-        std::env::var(key)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(default)
-    }
-
-    #[cfg(feature = "train")]
-    fn env_f32(key: &str, default: f32) -> f32 {
-        std::env::var(key)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(default)
-    }
-
-    #[cfg(feature = "train")]
-    fn push_top_candidate(top: &mut Vec<(f32, usize)>, top_k: usize, score: f32, neighbor: usize) {
-        if top_k == 0 {
-            return;
-        }
-        top.push((score, neighbor));
-        top.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-        top.truncate(top_k);
-    }
-
-    #[cfg(feature = "train")]
-    fn top_k_match_rate(tops: &[Vec<(f32, usize)>], label_sets: &[HashSet<String>]) -> f64 {
-        let mut matches = 0usize;
-        let mut total = 0usize;
-        for (i, top) in tops.iter().enumerate() {
-            for (_, neighbor) in top {
-                total += 1;
-                if label_sets[i]
-                    .iter()
-                    .any(|label| label_sets[*neighbor].contains(label))
-                {
-                    matches += 1;
-                }
-            }
-        }
-        matches as f64 / total.max(1) as f64
-    }
-
-    #[cfg(feature = "train")]
-    fn macro_top_k_match_rate(tops: &[Vec<(f32, usize)>], label_sets: &[HashSet<String>]) -> f64 {
-        let mut per_label = HashMap::<String, (usize, usize)>::new();
-        for (i, top) in tops.iter().enumerate() {
-            for label in &label_sets[i] {
-                let entry = per_label.entry(label.clone()).or_default();
-                for (_, neighbor) in top {
-                    entry.1 += 1;
-                    if label_sets[*neighbor].contains(label) {
-                        entry.0 += 1;
-                    }
-                }
-            }
-        }
-        let mut sum = 0.0f64;
-        let mut count = 0usize;
-        for (matches, total) in per_label.values() {
-            if *total > 0 {
-                sum += *matches as f64 / *total as f64;
-                count += 1;
-            }
-        }
-        sum / count.max(1) as f64
-    }
-
-    #[cfg(feature = "train")]
-    fn mean(values: &[f32]) -> f64 {
-        values.iter().map(|value| *value as f64).sum::<f64>() / values.len().max(1) as f64
-    }
-
-    #[cfg(feature = "train")]
-    fn roc_auc(positive_scores: &[f32], negative_scores: &[f32]) -> f64 {
-        let mut ranked = Vec::with_capacity(positive_scores.len() + negative_scores.len());
-        ranked.extend(positive_scores.iter().map(|score| (*score, true)));
-        ranked.extend(negative_scores.iter().map(|score| (*score, false)));
-        ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-
-        let mut rank_sum_positive = 0.0f64;
-        let mut rank = 1usize;
-        let mut idx = 0usize;
-        while idx < ranked.len() {
-            let score = ranked[idx].0;
-            let start_rank = rank;
-            let mut end = idx + 1;
-            while end < ranked.len() && ranked[end].0 == score {
-                end += 1;
-            }
-            let end_rank = rank + (end - idx) - 1;
-            let average_rank = (start_rank + end_rank) as f64 / 2.0;
-            for (_, is_positive) in &ranked[idx..end] {
-                if *is_positive {
-                    rank_sum_positive += average_rank;
-                }
-            }
-            rank += end - idx;
-            idx = end;
-        }
-
-        let n_pos = positive_scores.len() as f64;
-        let n_neg = negative_scores.len() as f64;
-        (rank_sum_positive - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg).max(1.0)
-    }
-
-    #[cfg(feature = "train")]
-    fn balanced_brier(
-        positive_scores: &[f32],
-        negative_scores: &[f32],
-        transform: impl Fn(f32) -> f32,
-    ) -> f64 {
-        let pos = positive_scores
-            .iter()
-            .map(|score| {
-                let p = transform(*score) as f64;
-                (1.0 - p).powi(2)
-            })
-            .sum::<f64>()
-            / positive_scores.len().max(1) as f64;
-        let neg = negative_scores
-            .iter()
-            .map(|score| {
-                let p = transform(*score) as f64;
-                p.powi(2)
-            })
-            .sum::<f64>()
-            / negative_scores.len().max(1) as f64;
-        (pos + neg) / 2.0
-    }
-
-    #[cfg(feature = "train")]
-    fn balanced_log_loss(
-        positive_scores: &[f32],
-        negative_scores: &[f32],
-        transform: impl Fn(f32) -> f32,
-    ) -> f64 {
-        let eps = 1e-6f64;
-        let pos = positive_scores
-            .iter()
-            .map(|score| {
-                let p = (transform(*score) as f64).clamp(eps, 1.0 - eps);
-                -p.ln()
-            })
-            .sum::<f64>()
-            / positive_scores.len().max(1) as f64;
-        let neg = negative_scores
-            .iter()
-            .map(|score| {
-                let p = (transform(*score) as f64).clamp(eps, 1.0 - eps);
-                -(1.0 - p).ln()
-            })
-            .sum::<f64>()
-            / negative_scores.len().max(1) as f64;
-        (pos + neg) / 2.0
-    }
 
     #[test]
     fn test_beta_loss_matches_manual_nll() {

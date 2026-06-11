@@ -158,6 +158,26 @@ pub fn encode_move(uci_move: &UciMove) -> Option<(u8, u8)> {
     }
 }
 
+/// For each (from_square, policy_slot) pair, the index into a flattened
+/// [64 from x 64 to] square-pair logit matrix of the destination square that
+/// slot refers to. This lets the policy head route its from x to-square
+/// bilinear logits into the direction-distance slot layout used by
+/// `encode_move`. Slots that don't correspond to any move point at the
+/// from-square itself; they can never be legal, so the gathered value is
+/// always masked out.
+pub fn policy_slot_gather_indices() -> [i32; 64 * 76] {
+    let decode = get_move_decoding();
+    let mut out = [0i32; 64 * 76];
+    for from in 0..64usize {
+        for slot in 0..76usize {
+            let (to, _promo) = decode[from][slot];
+            let dest = if to < 64 { to as usize } else { from };
+            out[from * 76 + slot] = (from * 64 + dest) as i32;
+        }
+    }
+    out
+}
+
 pub fn decode_move(from: u8, idx: u8) -> Option<UciMove> {
     let mapping = get_move_decoding();
     let (to, promo_idx) = mapping[from as usize][idx as usize];

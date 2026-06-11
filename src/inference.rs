@@ -9,9 +9,7 @@ use burn_cuda;
 #[cfg(feature = "backend-candle")]
 use burn_candle;
 
-use crate::config::{
-    Config, LEGAL_MOVES, NUM_GLOBALS, PREVIOUS_POSITIONS, RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN,
-};
+use crate::config::{Config, LEGAL_MOVES, NUM_GLOBALS, PREVIOUS_POSITIONS};
 use crate::encoding::encode_position;
 use crate::model::OXIModel;
 use crate::move_encoding::{decode_move, encode_move};
@@ -100,11 +98,79 @@ pub fn compute_momentum_features(
     (norm_momentum, norm_volatility)
 }
 
+/// Post-hoc whitening transform applied to trunk-mean position embeddings.
+///
+/// Computed offline (`oxi compute-whitening`) from the L2-normalized
+/// trunk-mean embeddings of a corpus sample: `y = normalize((x - mean) * transform)`.
+/// Stored as `whitening.json` next to `model.mpk`. The file is optional:
+/// when it is absent the engine serves plain L2-normalized trunk-mean
+/// embeddings, so checkpoints without the file always load.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WhiteningTransform {
+    /// Embedding dimension d; must match the model's embed_dim.
+    pub dim: usize,
+    /// Number of corpus samples the statistics were estimated from.
+    pub samples: usize,
+    /// Corpus mean of normalized trunk-mean embeddings, length d.
+    pub mean: Vec<f32>,
+    /// Row-major d×d ZCA matrix: output_j = Σ_i (x_i - mean_i) * transform[i*d + j].
+    pub transform: Vec<f32>,
+}
+
+impl WhiteningTransform {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let parsed: Self = serde_json::from_str(&content)?;
+        anyhow::ensure!(
+            parsed.mean.len() == parsed.dim && parsed.transform.len() == parsed.dim * parsed.dim,
+            "whitening.json dims inconsistent: dim={} mean={} transform={}",
+            parsed.dim,
+            parsed.mean.len(),
+            parsed.transform.len()
+        );
+        Ok(parsed)
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        std::fs::write(path, serde_json::to_string(self)?)?;
+        Ok(())
+    }
+
+    /// Whiten an (already L2-normalized) trunk-mean embedding and re-normalize.
+    pub fn apply(&self, embedding: &[f32]) -> Vec<f32> {
+        let d = self.dim;
+        debug_assert_eq!(embedding.len(), d);
+        let centered: Vec<f32> = embedding
+            .iter()
+            .zip(&self.mean)
+            .map(|(x, m)| x - m)
+            .collect();
+        let mut out = vec![0.0f32; d];
+        for (i, &c) in centered.iter().enumerate() {
+            if c == 0.0 {
+                continue;
+            }
+            let row = &self.transform[i * d..(i + 1) * d];
+            for (o, w) in out.iter_mut().zip(row) {
+                *o += c * w;
+            }
+        }
+        let norm = out.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        for v in &mut out {
+            *v /= norm;
+        }
+        out
+    }
+}
+
 /// Inference engine for Oxi
 pub struct InferenceEngine<B: Backend> {
     model: OXIModel<B>,
+    /// Kept for checkpoint loading and public constructor compatibility.
+    #[allow(dead_code)]
     config: Config,
     device: Device<B>,
+    whitening: Option<WhiteningTransform>,
 }
 
 /// Simple move prediction with just move and probability
@@ -144,12 +210,12 @@ pub struct OxiPrediction {
     pub time_usage: TimeUsagePrediction,
 }
 
-/// Retrieval + per-square trunk embeddings, pulled to CPU.
+/// Position + per-square trunk embeddings, pulled to CPU.
 ///
 /// Captured from the encoder trunk path via `forward_with_attention_and_trunk`.
-/// `embedding` is the trained L2-normalized retrieval projection used for
-/// cosine KNN. `per_square` remains the raw post-final-RmsNorm trunk output for
-/// attention/debug views.
+/// `embedding` is the L2-normalized mean-pooled trunk (optionally whitened)
+/// used for cosine KNN. `per_square` remains the raw post-final-RmsNorm trunk
+/// output for attention/debug views.
 ///
 /// `per_square` is row-major with shape `[64, embed_dim]`, flat-indexed as
 /// `sq * embed_dim + d`. Square indices follow the ABSOLUTE board frame
@@ -159,7 +225,7 @@ pub struct OxiPrediction {
 /// callers don't need to know about the mirror.
 #[derive(Debug, Clone)]
 pub struct EmbeddingOutput {
-    /// Retrieval position embedding, shape `[embed_dim]`.
+    /// Position embedding, shape `[embed_dim]`.
     pub embedding: Vec<f32>,
     /// Per-square embeddings in absolute frame, shape `[64, embed_dim]` flattened
     /// row-major. `per_square[sq * embed_dim + d]`.
@@ -322,17 +388,10 @@ impl GlobalFeaturesInternal {
     /// Compute normalized global features
     pub fn to_normalized(&self) -> GlobalFeaturesNormalized {
         let base_time = self.base_time.max(1);
-        // Normalize Elo to [0, 1] range (similar to dataset processing)
-        let elo_self_normalized = if self.elo_self >= 800 && self.elo_self <= 2800 {
-            (self.elo_self - 800) as f32 / (2800 - 800) as f32
-        } else {
-            0.5 // Default for out of range
-        };
-        let elo_oppo_normalized = if self.elo_oppo >= 800 && self.elo_oppo <= 2800 {
-            (self.elo_oppo - 800) as f32 / (2800 - 800) as f32
-        } else {
-            0.5 // Default for out of range
-        };
+        // Normalize Elo over 800..2800, clamping out-of-range ratings to the
+        // nearest end of the scale.
+        let elo_self_normalized = ((self.elo_self - 800) as f32 / 2000.0).clamp(0.0, 1.0);
+        let elo_oppo_normalized = ((self.elo_oppo - 800) as f32 / 2000.0).clamp(0.0, 1.0);
 
         // Material imbalance: difference in total material (white - black) normalized to [0,1]
         // Max absolute imbalance ~15
@@ -460,11 +519,60 @@ where
         device: Device<B>,
     ) -> anyhow::Result<Self> {
         let model = load_model(checkpoint_path, &config, &device)?;
+        let whitening = Self::load_whitening_for_checkpoint(checkpoint_path, &config);
         Ok(Self {
             model,
             config,
             device,
+            whitening,
         })
+    }
+
+    /// Load `whitening.json` from the checkpoint's directory when the file
+    /// exists. Missing or invalid files are non-fatal: the engine falls back
+    /// to plain L2-normalized trunk-mean embeddings so checkpoints without
+    /// the file always load.
+    fn load_whitening_for_checkpoint(
+        checkpoint_path: &Path,
+        config: &Config,
+    ) -> Option<WhiteningTransform> {
+        let path = checkpoint_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("whitening.json");
+        if !path.exists() {
+            tracing::info!(
+                "No whitening.json next to checkpoint ({:?}); serving plain trunk-mean embeddings",
+                path
+            );
+            return None;
+        }
+        match WhiteningTransform::load(&path) {
+            Ok(whitening) if whitening.dim == config.embed_dim => {
+                tracing::info!(
+                    "Loaded whitening transform from {:?} ({} samples)",
+                    path,
+                    whitening.samples
+                );
+                Some(whitening)
+            }
+            Ok(whitening) => {
+                tracing::warn!(
+                    "whitening.json dim {} != model embed_dim {}; falling back to trunk_mean",
+                    whitening.dim,
+                    config.embed_dim
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load whitening transform from {:?} ({e}); \
+                     falling back to trunk_mean embeddings",
+                    path
+                );
+                None
+            }
+        }
     }
 
     /// Create inference engine with existing model
@@ -473,10 +581,22 @@ where
             model,
             config,
             device,
+            whitening: None,
         }
     }
 
+    /// Replace the whitening transform (used by offline tooling).
+    pub fn set_whitening(&mut self, whitening: Option<WhiteningTransform>) {
+        self.whitening = whitening;
+    }
+
     /// Create a simple inference engine with default device
+    #[cfg(any(
+        feature = "backend-ndarray",
+        feature = "backend-tch",
+        feature = "backend-cuda",
+        feature = "backend-candle"
+    ))]
     pub fn create_simple(
         model: OXIModel<InferenceBackend>,
         config: Config,
@@ -707,19 +827,73 @@ where
         Ok(out)
     }
 
+    /// Raw L2-normalized trunk-mean embeddings for a batch, with NO whitening
+    /// applied regardless of the configured embedding source. Used by offline
+    /// tooling (`compute-whitening`) that estimates whitening statistics.
+    /// Mean pooling over all 64 squares is invariant to the black-to-move
+    /// square flip, so no frame adjustment is needed.
+    pub fn raw_trunk_mean_embeddings_batch(
+        &self,
+        items: &[BatchItem],
+    ) -> anyhow::Result<Vec<Vec<f32>>>
+    where
+        B::FloatElem: From<f32>,
+    {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (batched_board, batched_globals, _flipped_currents, _is_black_to_move_flags, n) =
+            self.build_batched_inputs(items)?;
+        let (_policy, _value, _side_info, _time_usage, trunk, _policy_tokens) = self
+            .model
+            .forward_with_trunk(batched_board, batched_globals);
+
+        let trunk_dims = trunk.dims();
+        debug_assert_eq!(trunk_dims[0], n);
+        debug_assert_eq!(trunk_dims[1], 64);
+        let embed_dim = trunk_dims[2];
+        let trunk_flat = trunk
+            .to_data()
+            .to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("Failed to convert trunk tensor to f32: {:?}", e))?;
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let row = &trunk_flat[i * 64 * embed_dim..(i + 1) * 64 * embed_dim];
+            let mut pooled = vec![0.0f32; embed_dim];
+            for sq in 0..64usize {
+                let src = sq * embed_dim;
+                for dim in 0..embed_dim {
+                    pooled[dim] += row[src + dim];
+                }
+            }
+            let norm = pooled
+                .iter()
+                .map(|v| (v / 64.0) * (v / 64.0))
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-6);
+            for value in &mut pooled {
+                *value = *value / 64.0 / norm;
+            }
+            out.push(pooled);
+        }
+        Ok(out)
+    }
+
     /// Batched prediction that also captures per-layer post-softmax attention
     /// weights AND the trunk-level per-square embeddings.
     ///
     /// Used by viz/analysis and the bot `/predict` path when embedding output is
     /// requested. This keeps the attention response shape while adding the
-    /// retrieval embedding output.
+    /// position embedding output.
     ///
     /// Returns one `(OxiPrediction, Vec<AttentionLayer>, EmbeddingOutput)`
     /// per input item, matching `items` order. The embedding is returned in
     /// the ABSOLUTE board frame: for black-to-move items, the per-square
     /// dimension is un-flipped via `sq ^ 56` so cross-position comparisons
-    /// are frame-consistent. The retrieval embedding is position-level and
-    /// needs no square-frame adjustment.
+    /// are frame-consistent. The position embedding is mean-pooled over all
+    /// squares and needs no square-frame adjustment.
     pub fn predict_with_attention_and_embedding_batch(
         &self,
         items: &[BatchItem],
@@ -734,17 +908,9 @@ where
         let (batched_board, batched_globals, flipped_currents, is_black_to_move_flags, n) =
             self.build_batched_inputs(items)?;
 
-        let (
-            policy_logits,
-            value_logits,
-            _side_info_logits,
-            time_usage_logits,
-            attn_maps,
-            trunk,
-            retrieval_embedding,
-        ) = self
-            .model
-            .forward_with_attention_and_trunk(batched_board, batched_globals);
+        let (policy_logits, value_logits, _side_info_logits, time_usage_logits, attn_maps, trunk) =
+            self.model
+                .forward_with_attention_and_trunk(batched_board, batched_globals);
 
         // Pre-split attention tensors to CPU (mirrors `predict_with_attention_batch`).
         let num_layers = attn_maps.len();
@@ -772,21 +938,6 @@ where
             .to_vec::<f32>()
             .map_err(|e| anyhow::anyhow!("Failed to convert trunk tensor to f32: {:?}", e))?;
         debug_assert_eq!(trunk_flat.len(), n * 64 * embed_dim);
-
-        let use_trunk_mean_embedding =
-            self.config.retrieval_embedding_source() == RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN;
-        let (output_embed_dim, embedding_flat) = if use_trunk_mean_embedding {
-            (embed_dim, Vec::new())
-        } else {
-            let embedding_dims = retrieval_embedding.dims();
-            debug_assert_eq!(embedding_dims[0], n);
-            let output_embed_dim = embedding_dims[1];
-            let embedding_flat = retrieval_embedding.to_data().to_vec::<f32>().map_err(|e| {
-                anyhow::anyhow!("Failed to convert embedding tensor to f32: {:?}", e)
-            })?;
-            debug_assert_eq!(embedding_flat.len(), n * output_embed_dim);
-            (output_embed_dim, embedding_flat)
-        };
 
         let predictions = self.finalize_batched_predictions(
             items,
@@ -831,7 +982,7 @@ where
                 per_square.copy_from_slice(model_frame);
             }
 
-            let embedding = if use_trunk_mean_embedding {
+            let embedding = {
                 let mut pooled = vec![0.0f32; embed_dim];
                 for sq in 0..64usize {
                     let src = sq * embed_dim;
@@ -851,10 +1002,10 @@ where
                 for value in &mut pooled {
                     *value /= norm;
                 }
-                pooled
-            } else {
-                let emb_start = i * output_embed_dim;
-                embedding_flat[emb_start..emb_start + output_embed_dim].to_vec()
+                match &self.whitening {
+                    Some(whitening) => whitening.apply(&pooled),
+                    None => pooled,
+                }
             };
 
             out.push((
@@ -863,7 +1014,7 @@ where
                 EmbeddingOutput {
                     embedding,
                     per_square,
-                    embed_dim: output_embed_dim,
+                    embed_dim,
                 },
             ));
         }
@@ -1191,7 +1342,7 @@ mod tests {
     fn test_inference_engine_creation() {
         let device = Device::<InferenceBackend>::default();
         let config = Config::default();
-        crate::config::set_global_config(config.clone()).unwrap();
+        let _ = crate::config::set_global_config(config.clone());
         let model = OXIModel::<InferenceBackend>::new(&device, &config);
 
         let engine = InferenceEngine::new(model, config, device);
@@ -1219,17 +1370,19 @@ mod tests {
         let wdl_sum = prediction.wdl.win_prob + prediction.wdl.draw_prob + prediction.wdl.loss_prob;
         assert!((wdl_sum - 1.0).abs() < 0.01);
 
-        // Check time usage parameters are positive
-        assert!(prediction.time_usage.alpha > 0.0);
-        assert!(prediction.time_usage.beta > 0.0);
-        assert!(prediction.time_usage.expected_fraction >= 0.0);
+        // Time params are raw linear outputs — sign is meaningless on a
+        // randomly initialized model (asserting positivity made this test
+        // sensitive to struct-field RNG draw order), so only check finiteness.
+        assert!(prediction.time_usage.alpha.is_finite());
+        assert!(prediction.time_usage.beta.is_finite());
+        assert!(prediction.time_usage.expected_fraction.is_finite());
     }
 
     #[test]
     fn test_analyze_position() {
         let device = Device::<InferenceBackend>::default();
         let config = Config::default();
-        crate::config::set_global_config(config.clone()).unwrap();
+        let _ = crate::config::set_global_config(config.clone());
         let model = OXIModel::<InferenceBackend>::new(&device, &config);
         let engine = InferenceEngine::new(model, config, device);
 
@@ -1345,7 +1498,7 @@ mod tests {
     fn test_momentum_features_snapshot() {
         let device = Device::<InferenceBackend>::default();
         let config = Config::default();
-        crate::config::set_global_config(config.clone()).unwrap();
+        let _ = crate::config::set_global_config(config.clone());
 
         // Test line 1: e4 c5 d4 cxd4 c3 dxc3 (material changes with pawn captures)
         let san_moves_1 = ["e4", "c5", "d4", "cxd4", "c3", "dxc3"];

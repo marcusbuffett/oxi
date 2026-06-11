@@ -14,6 +14,7 @@ pub mod smolgen;
 pub mod spatial_conv;
 pub mod stockfish;
 pub mod value_tower;
+pub mod whitening;
 
 #[cfg(not(feature = "train"))]
 pub mod train_stubs {
@@ -81,13 +82,7 @@ pub mod forward_timing;
 #[cfg(feature = "train")]
 pub mod gradient_norm_metric;
 #[cfg(feature = "train")]
-pub mod gradnorm;
-#[cfg(feature = "train")]
-pub mod gradnorm_status_metric;
-#[cfg(feature = "train")]
 pub mod legal_move_probability_metric;
-#[cfg(feature = "train")]
-pub mod lr_plateau_metric;
 #[cfg(feature = "train")]
 pub mod metrics_renderer;
 #[cfg(feature = "train")]
@@ -97,15 +92,11 @@ pub mod move_accuracy_metric;
 #[cfg(feature = "train")]
 pub mod norm_debug;
 #[cfg(feature = "train")]
-pub mod opening_family_metric;
-#[cfg(feature = "train")]
 pub mod pgn_processor;
 #[cfg(feature = "train")]
 pub mod policy_loss_metric;
 #[cfg(feature = "train")]
 pub mod puzzle_processor;
-#[cfg(feature = "train")]
-pub mod reduce_on_plateau_scheduler;
 #[cfg(feature = "train")]
 pub mod time_usage_loss_metric;
 #[cfg(feature = "train")]
@@ -122,6 +113,10 @@ pub mod value_loss_metric;
 pub mod wdl_accuracy_metric;
 #[cfg(feature = "train")]
 pub mod weight_decay;
+#[cfg(feature = "train")]
+pub mod wsd_lr_metric;
+#[cfg(feature = "train")]
+pub mod wsd_scheduler;
 
 #[cfg(test)]
 pub mod test_backend;

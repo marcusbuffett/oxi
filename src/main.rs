@@ -115,6 +115,10 @@ enum Commands {
     /// Create a SQLite cache of Stockfish-labeled positions for calibrated-strength training
     CreateCalibrationDb(CreateCalibrationDbCli),
 
+    /// Estimate a ZCA whitening transform for trunk-mean embeddings and write
+    /// whitening.json next to the model (loaded automatically at inference time)
+    ComputeWhitening(ComputeWhiteningCli),
+
     /// Download TCEC (Top Chess Engine Championship) games for pretraining
     DownloadTcec {
         #[arg(long)]
@@ -297,6 +301,38 @@ struct QuickEvalCli {
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
+struct ComputeWhiteningCli {
+    /// Model directory (containing model.mpk and params.json)
+    #[arg(long)]
+    model_dir: PathBuf,
+
+    /// Training data directory to sample positions from
+    #[arg(long, default_value = "../data")]
+    data_path: PathBuf,
+
+    /// Number of positions to estimate statistics from
+    #[arg(long, default_value = "20000")]
+    num_positions: usize,
+
+    /// Output path (defaults to <model_dir>/whitening.json)
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Inference batch size
+    #[arg(long, default_value = "256")]
+    batch_size: usize,
+
+    /// Fixed Elo used for the embedding globals, so player metadata does not
+    /// leak into similarity
+    #[arg(long, default_value = "1500")]
+    model_elo: i32,
+
+    /// Number of close/far example pairs to print
+    #[arg(long, default_value = "5")]
+    examples: usize,
+}
+
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 struct CreateCalibrationDbCli {
     /// Directory containing PGN files to sample from
     #[arg(long)]
@@ -415,32 +451,6 @@ struct ModelParams {
     pub smolgen_global_dim: usize,
     #[serde(default = "default_smolgen_gen_size")]
     pub smolgen_gen_size: usize,
-    #[serde(default)]
-    pub retrieval_loss_weight: f32,
-    #[serde(default = "default_retrieval_objective")]
-    pub retrieval_objective: String,
-    #[serde(default = "default_retrieval_embedding_source")]
-    pub retrieval_embedding_source: String,
-    #[serde(default = "oxi::config::default_retrieval_logit_scale_for_serde")]
-    pub retrieval_logit_scale: f32,
-    #[serde(default = "oxi::config::default_retrieval_margin_for_serde")]
-    pub retrieval_margin: f32,
-    #[serde(default = "default_retrieval_policy_temperature")]
-    pub retrieval_policy_temperature: f32,
-    #[serde(default = "default_retrieval_policy_positive_threshold")]
-    pub retrieval_policy_positive_threshold: f32,
-    #[serde(default = "default_retrieval_semantic_weight")]
-    pub retrieval_semantic_weight: f32,
-    #[serde(default = "default_retrieval_policy_weight")]
-    pub retrieval_policy_weight: f32,
-    #[serde(default = "default_retrieval_continuation_weight")]
-    pub retrieval_continuation_weight: f32,
-    #[serde(default = "default_retrieval_continuation_plies")]
-    pub retrieval_continuation_plies: usize,
-    #[serde(default = "default_retrieval_structure_gate_strength")]
-    pub retrieval_structure_gate_strength: f32,
-    #[serde(default = "default_retrieval_structure_gate_power")]
-    pub retrieval_structure_gate_power: f32,
 }
 
 fn default_smolgen_hidden() -> usize {
@@ -451,36 +461,6 @@ fn default_smolgen_global_dim() -> usize {
 }
 fn default_smolgen_gen_size() -> usize {
     128
-}
-fn default_retrieval_objective() -> String {
-    oxi::config::RETRIEVAL_OBJECTIVE_MIXED_GAME.to_string()
-}
-fn default_retrieval_embedding_source() -> String {
-    oxi::config::RETRIEVAL_EMBEDDING_SOURCE_RETRIEVAL_HEAD.to_string()
-}
-fn default_retrieval_policy_temperature() -> f32 {
-    0.5
-}
-fn default_retrieval_policy_positive_threshold() -> f32 {
-    0.25
-}
-fn default_retrieval_semantic_weight() -> f32 {
-    0.5
-}
-fn default_retrieval_policy_weight() -> f32 {
-    0.0
-}
-fn default_retrieval_continuation_weight() -> f32 {
-    0.0
-}
-fn default_retrieval_continuation_plies() -> usize {
-    4
-}
-fn default_retrieval_structure_gate_strength() -> f32 {
-    1.0
-}
-fn default_retrieval_structure_gate_power() -> f32 {
-    0.2
 }
 /// Load a Config from a model directory's params.json file.
 /// Only reads architecture params, fills the rest with defaults — same approach as the production bot.
@@ -502,21 +482,221 @@ fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
         smolgen_hidden: params.smolgen_hidden,
         smolgen_global_dim: params.smolgen_global_dim,
         smolgen_gen_size: params.smolgen_gen_size,
-        retrieval_loss_weight: params.retrieval_loss_weight,
-        retrieval_objective: params.retrieval_objective,
-        retrieval_embedding_source: params.retrieval_embedding_source,
-        retrieval_logit_scale: params.retrieval_logit_scale,
-        retrieval_margin: params.retrieval_margin,
-        retrieval_policy_temperature: params.retrieval_policy_temperature,
-        retrieval_policy_positive_threshold: params.retrieval_policy_positive_threshold,
-        retrieval_semantic_weight: params.retrieval_semantic_weight,
-        retrieval_policy_weight: params.retrieval_policy_weight,
-        retrieval_continuation_weight: params.retrieval_continuation_weight,
-        retrieval_continuation_plies: params.retrieval_continuation_plies,
-        retrieval_structure_gate_strength: params.retrieval_structure_gate_strength,
-        retrieval_structure_gate_power: params.retrieval_structure_gate_power,
         ..Default::default()
     })
+}
+
+/// Stub for builds without train/backend-tch (the command needs the training
+/// stream for position sampling and tch for inference).
+#[cfg(not(all(feature = "train", feature = "backend-tch")))]
+fn compute_whitening_command(_cli: &ComputeWhiteningCli) -> Result<()> {
+    anyhow::bail!("compute-whitening requires the train and backend-tch features")
+}
+
+#[cfg(all(feature = "train", feature = "backend-tch"))]
+fn compute_whitening_command(cli: &ComputeWhiteningCli) -> Result<()> {
+    use oxi::inference::BatchItem;
+    use oxi::training_stream::sample_positions_from_human_training_stream;
+
+    type WhiteningBackend = burn::backend::LibTorch<f32>;
+    let device = if cfg!(target_os = "macos") {
+        burn_tch::LibTorchDevice::Mps
+    } else {
+        burn_tch::LibTorchDevice::Cpu
+    };
+
+    let config = load_config_from_model_dir(&cli.model_dir)?;
+    let _ = set_global_config(config.clone());
+    let engine = InferenceEngine::<WhiteningBackend>::from_checkpoint(
+        &cli.model_dir.join("model"),
+        config,
+        device,
+    )?;
+
+    println!(
+        "Sampling {} positions from {:?}...",
+        cli.num_positions, cli.data_path
+    );
+    let sampled = sample_positions_from_human_training_stream(&cli.data_path, cli.num_positions)?;
+    anyhow::ensure!(
+        !sampled.is_empty(),
+        "no positions sampled from {:?}",
+        cli.data_path
+    );
+
+    let mut fens: Vec<String> = Vec::with_capacity(sampled.len());
+    let mut items: Vec<BatchItem> = Vec::with_capacity(sampled.len());
+    for pos in &sampled {
+        let Ok(parsed) = pos.fen.parse::<shakmaty::fen::Fen>() else {
+            continue;
+        };
+        let Ok(chess) = parsed.into_position::<shakmaty::Chess>(shakmaty::CastlingMode::Standard)
+        else {
+            continue;
+        };
+        let globals = GlobalFeatures {
+            time_remaining_self: 300,
+            time_remaining_oppo: 300,
+            base_time: 300,
+            increment: 0,
+            move_count: pos.ply as usize,
+            elo_self: cli.model_elo,
+            elo_oppo: cli.model_elo,
+            is_puzzle: false,
+            is_in_check: chess.is_check(),
+            total_pieces: chess.board().occupied().count() as u32,
+        };
+        fens.push(pos.fen.clone());
+        items.push(BatchItem {
+            positions: vec![chess],
+            previous_moves: vec![],
+            globals,
+            temperature: 1.0,
+            top_k: 1,
+        });
+    }
+    println!("Embedding {} valid positions...", items.len());
+
+    let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(items.len());
+    for (i, chunk) in items.chunks(cli.batch_size).enumerate() {
+        embeddings.extend(engine.raw_trunk_mean_embeddings_batch(chunk)?);
+        if (i + 1) % 10 == 0 {
+            println!("  embedded {}/{}", embeddings.len(), items.len());
+        }
+    }
+
+    let transform = oxi::whitening::compute_whitening(&embeddings)?;
+    let output = cli
+        .output
+        .clone()
+        .unwrap_or_else(|| cli.model_dir.join("whitening.json"));
+    transform.save(&output)?;
+    println!(
+        "Wrote whitening transform (dim {}, {} samples) to {:?}",
+        transform.dim, transform.samples, output
+    );
+
+    report_whitening_similarity(&embeddings, &fens, &transform, cli.examples);
+    Ok(())
+}
+
+/// Print cosine-similarity distributions raw vs whitened, plus example
+/// close/far position pairs under the whitened geometry.
+#[cfg(all(feature = "train", feature = "backend-tch"))]
+fn report_whitening_similarity(
+    embeddings: &[Vec<f32>],
+    fens: &[String],
+    transform: &oxi::inference::WhiteningTransform,
+    num_examples: usize,
+) {
+    use oxi::whitening::{cosine, percentiles};
+
+    let n = embeddings.len();
+    let cap = n.min(800);
+    let stride = (n / cap).max(1);
+    let idx: Vec<usize> = (0..n).step_by(stride).take(cap).collect();
+    let whitened: Vec<Vec<f32>> = idx
+        .iter()
+        .map(|&i| transform.apply(&embeddings[i]))
+        .collect();
+
+    let mut raw_cos: Vec<f32> = Vec::new();
+    let mut white_cos: Vec<f32> = Vec::new();
+    // (whitened_sim, raw_sim, fen_index_a, fen_index_b)
+    let mut pairs: Vec<(f32, f32, usize, usize)> = Vec::new();
+    for a in 0..idx.len() {
+        for b in (a + 1)..idx.len() {
+            let raw = cosine(&embeddings[idx[a]], &embeddings[idx[b]]);
+            let white = cosine(&whitened[a], &whitened[b]);
+            raw_cos.push(raw);
+            white_cos.push(white);
+            pairs.push((white, raw, idx[a], idx[b]));
+        }
+    }
+
+    let raw_p = percentiles(&mut raw_cos);
+    let white_p = percentiles(&mut white_cos);
+    println!(
+        "\nPairwise cosine similarity ({} sampled pairs):",
+        pairs.len()
+    );
+    println!("            min     p5     p25    p50    p75    p95    max");
+    println!(
+        "  raw      {:+.3} {:+.3} {:+.3} {:+.3} {:+.3} {:+.3} {:+.3}",
+        raw_p[0], raw_p[1], raw_p[2], raw_p[3], raw_p[4], raw_p[5], raw_p[6]
+    );
+    println!(
+        "  whitened {:+.3} {:+.3} {:+.3} {:+.3} {:+.3} {:+.3} {:+.3}",
+        white_p[0], white_p[1], white_p[2], white_p[3], white_p[4], white_p[5], white_p[6]
+    );
+
+    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("\nClosest pairs (whitened):");
+    let mut shown = 0;
+    for &(white, raw, a, b) in pairs.iter() {
+        if fens[a] == fens[b] {
+            continue;
+        }
+        println!("  whitened={:+.3} raw={:+.3}", white, raw);
+        println!("    {}", lichess_analysis_link(&fens[a]));
+        println!("    {}", lichess_analysis_link(&fens[b]));
+        shown += 1;
+        if shown >= num_examples {
+            break;
+        }
+    }
+    println!("\nFarthest pairs (whitened):");
+    for &(white, raw, a, b) in pairs.iter().rev().take(num_examples) {
+        println!("  whitened={:+.3} raw={:+.3}", white, raw);
+        println!("    {}", lichess_analysis_link(&fens[a]));
+        println!("    {}", lichess_analysis_link(&fens[b]));
+    }
+}
+
+/// Lichess analysis-board link for a FEN (same scheme as the server's
+/// `gen_lichess_link`; FENs only need their spaces encoded).
+#[cfg(all(feature = "train", feature = "backend-tch"))]
+fn lichess_analysis_link(fen: &str) -> String {
+    format!("https://lichess.org/analysis/{}", fen.replace(' ', "%20"))
+}
+
+#[cfg(all(feature = "train", feature = "backend-tch"))]
+fn compute_whitening_after_training(config: &Config) -> Result<()> {
+    if !config.whiten_after_training() {
+        println!("Skipping post-training whitening (--whiten-after-training=false)");
+        return Ok(());
+    }
+    let Some(log_dir) = config.log_dir.as_ref() else {
+        println!("Skipping post-training whitening because --log-dir is not set");
+        return Ok(());
+    };
+    let Some(data_path) = config.data_path.clone() else {
+        println!("Skipping post-training whitening because --data-path is not set");
+        return Ok(());
+    };
+    let model_dir = log_dir.join("model");
+    let cli = ComputeWhiteningCli {
+        model_dir,
+        data_path,
+        num_positions: config.whitening_positions,
+        output: None,
+        batch_size: config.whitening_batch_size,
+        model_elo: 1500,
+        examples: 5,
+    };
+    println!(
+        "Computing post-training whitening transform ({} positions)...",
+        cli.num_positions
+    );
+    compute_whitening_command(&cli)
+}
+
+#[cfg(not(all(feature = "train", feature = "backend-tch")))]
+fn compute_whitening_after_training(config: &Config) -> Result<()> {
+    if config.whiten_after_training() {
+        println!("Skipping post-training whitening; this build lacks backend-tch");
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -590,6 +770,7 @@ async fn main() -> Result<()> {
                     train_custom::<Backend>(config.clone(), devices)?;
                 }
 
+                compute_whitening_after_training(&config)?;
                 Ok(())
             }
 
@@ -989,6 +1170,7 @@ async fn main() -> Result<()> {
             anyhow::bail!("Quick eval requires backend-ndarray feature. Run with: cargo run --features backend-ndarray")
         }
 
+        Commands::ComputeWhitening(config) => compute_whitening_command(&config),
         Commands::CreateCalibrationDb(config) => {
             println!("Creating calibration DB...");
             println!("  PGN path: {}", config.pgn_dir.display());
@@ -1000,8 +1182,11 @@ async fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
 
-            let global_config = calibration_stream_config();
-            let _ = set_global_config(global_config);
+            #[cfg(feature = "train")]
+            {
+                let global_config = calibration_stream_config();
+                let _ = set_global_config(global_config);
+            }
 
             let elo_buckets = vec![
                 (1000, 1200),
@@ -1023,7 +1208,7 @@ async fn main() -> Result<()> {
             )?;
 
             #[cfg(not(feature = "train"))]
-            let sampled = {
+            let sampled: Vec<oxi::eval_dataset::SampledPosition> = {
                 anyhow::bail!(
                     "create-calibration-db now uses the training PGN pipeline and requires the `train` feature"
                 );
@@ -1045,7 +1230,7 @@ async fn main() -> Result<()> {
             }
 
             let db = CalibrationDb::open(&config.output)?;
-            let mut existing_keys: HashSet<oxi::calibration::CalibrationKey> =
+            let mut existing_keys: std::collections::HashSet<oxi::calibration::CalibrationKey> =
                 db.load_existing_keys(config.depth)?;
             let existing_at_start = existing_keys.len();
             let mut engine = StockfishEngine::new(

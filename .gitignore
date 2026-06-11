@@ -14,3 +14,8 @@ metrics_logs
 .shadesmar/runs
 __pycache__
 research_runs
+sheet-*.txt
+*.log
+research_state.json
+candidate_model
+attention_viz.html

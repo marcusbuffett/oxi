@@ -35,13 +35,6 @@ pub const FEATURES_PER_TOKEN: usize = BOARD_FEATURES_PER_TOKEN + RECENCY_FEATURE
 pub const PREVIOUS_POSITIONS: usize = 5; // Used for decay horizon only
 pub const HISTORY_DECAY: f32 = 0.8; // Exponential decay factor for historical positions
 
-pub const RETRIEVAL_OBJECTIVE_SAME_MOVE: &str = "same_move";
-pub const RETRIEVAL_OBJECTIVE_POLICY_OVERLAP: &str = "policy_overlap";
-pub const RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC: &str = "structural_semantic";
-pub const RETRIEVAL_OBJECTIVE_MIXED_GAME: &str = "mixed_game";
-pub const RETRIEVAL_EMBEDDING_SOURCE_RETRIEVAL_HEAD: &str = "retrieval_head";
-pub const RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN: &str = "trunk_mean";
-
 // Global config storage
 static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 
@@ -83,7 +76,8 @@ pub struct Config {
     /// Batch size for training
     pub batch_size: Option<usize>,
 
-    /// Physical batch size (for gradient accumulation)
+    /// Physical batch size (for gradient accumulation).
+    /// 0 = auto: derive from model parameter count (see auto_physical_batch_size).
     pub physical_batch_size: usize,
 
     /// Random seed for reproducibility
@@ -92,35 +86,19 @@ pub struct Config {
     /// Number of data loader workers
     pub num_workers: usize,
 
-    /// Minimum learning rate (end of training)
+    /// Final learning rate at the end of the WSD decay phase
     pub lr_min: f64,
 
-    /// Fallback window size for plateau detection (number of scheduler steps).
-    /// Prefer lr_window_samples when set so statistical power is stable across
-    /// batch sizes.
-    pub lr_window_size: usize,
+    /// WSD schedule: fraction of the run budget (--timeout or --max-samples)
+    /// spent in the final linear decay phase. The rest of the run after warmup
+    /// holds LR constant.
+    #[serde(default = "default_wsd_decay_fraction")]
+    pub wsd_decay_fraction: f64,
 
-    /// Sample-count window for plateau detection. Converted to scheduler steps
-    /// using the effective batch size.
-    #[serde(default = "default_lr_window_samples")]
-    pub lr_window_samples: Option<usize>,
-
-    /// Welch's t-test threshold for plateau detection. Plateau is declared when t-statistic
-    /// falls below this value (i.e., we can't confidently say loss is still decreasing).
-    /// 1.65 ≈ p<0.05 one-sided, 2.33 ≈ p<0.01 one-sided.
-    pub lr_plateau_t_threshold: f64,
-
-    /// Factor to reduce learning rate by when plateau is detected (e.g., 0.5 means halve the LR)
-    pub lr_reduction_factor: f64,
-
-    /// Number of consecutive plateau windows required before reducing LR.
-    #[serde(default = "default_lr_plateau_patience")]
-    pub lr_plateau_patience: usize,
-
-    /// Cooldown after an LR reduction, in samples. Converted to scheduler steps
-    /// using the effective batch size.
-    #[serde(default = "default_lr_plateau_cooldown_samples")]
-    pub lr_plateau_cooldown_samples: usize,
+    /// Hold LR constant indefinitely (no decay phase). For open-ended runs
+    /// without a budget; anneal later by resuming the checkpoint with a budget.
+    #[serde(default)]
+    pub lr_hold: Option<bool>,
 
     /// Multiplier applied to the learning rate calculated from batch size
     pub lr_multiplier: f64,
@@ -140,8 +118,10 @@ pub struct Config {
     #[serde(default = "default_embedding_base_lr")]
     pub embedding_base_lr: f64,
 
-    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size scheduler steps
-    pub warmup_multiplier: f64,
+    /// Fraction of the run budget spent warming up. Uses --max-samples and/or
+    /// --timeout progress, so it is stable across hardware speed.
+    #[serde(default = "default_warmup_fraction")]
+    pub warmup_fraction: f64,
 
     /// Weight for policy loss
     pub policy_loss_weight: f32,
@@ -181,36 +161,6 @@ pub struct Config {
     /// Number of layers/modules to include when logging gradient breakdowns
     #[serde(default)]
     pub gradient_layer_limit: usize,
-
-    /// Enable adaptive GradNorm reweighting across heads
-    #[serde(default)]
-    pub enable_gradnorm: Option<bool>,
-
-    /// Optimizer steps between GradNorm weight updates
-    #[serde(default)]
-    pub gradnorm_interval: usize,
-
-    /// Alpha hyperparameter for GradNorm target scaling
-    pub gradnorm_alpha: f32,
-
-    /// Multiplicative learning rate used when adjusting GradNorm weights
-    pub gradnorm_learning_rate: f32,
-
-    /// Priority multiplier applied to policy GradNorm target (1.0 = neutral)
-    pub gradnorm_policy_priority: f32,
-
-    /// Priority multiplier applied to value GradNorm target (1.0 = neutral)
-    pub gradnorm_value_priority: f32,
-
-    /// Priority multiplier applied to time-usage GradNorm target (1.0 = neutral)
-    pub gradnorm_time_priority: f32,
-
-    /// Priority multiplier applied to auxiliary GradNorm target (1.0 = neutral)
-    pub gradnorm_aux_priority: f32,
-
-    /// Number of samples to materialize on the lead device when probing GradNorm weights
-    #[serde(default)]
-    pub gradnorm_probe_size: usize,
 
     /// Embedding dimension for tokens
     pub embed_dim: usize,
@@ -320,81 +270,14 @@ pub struct Config {
     #[serde(default = "default_policy_regret_loss_weight")]
     pub policy_regret_loss_weight: f32,
 
-    /// Weight for the retrieval embedding auxiliary loss. When zero, the
-    /// pairwise retrieval metrics are still logged during training, but the
-    /// retrieval loss has no effect on optimization. The embedding inference
-    /// path always returns the retrieval-head projection.
-    #[serde(default)]
-    pub retrieval_loss_weight: f32,
-
-    /// Retrieval target geometry. `mixed_game` regresses cosine similarity to a
-    /// weighted blend of detached trunk semantics, optional debiased
-    /// policy-distribution overlap, and future-continuation overlap,
-    /// optionally gated by handcrafted structure. `structural_semantic` uses
-    /// only trunk semantics plus structure; `same_move` uses the observed move
-    /// label; `policy_overlap` uses detached policy mass overlap plus
-    /// structure.
-    #[serde(default = "default_retrieval_objective")]
-    pub retrieval_objective: String,
-
-    /// Which position embedding is returned by inference/attention paths.
-    /// `retrieval_head` uses the dedicated retrieval transformer + projection.
-    /// `trunk_mean` returns L2-normalized mean pooling of the shared trunk.
-    #[serde(default = "default_retrieval_embedding_source")]
-    pub retrieval_embedding_source: String,
-
-    /// Logit scale for the retrieval pairwise BCE objective.
-    #[serde(default = "default_retrieval_logit_scale")]
-    pub retrieval_logit_scale: f32,
-
-    /// Cosine margin used by the retrieval BCE objective. Positive pairs are
-    /// pushed above this margin, mutually-legal negative pairs below it.
-    #[serde(default = "default_retrieval_margin")]
-    pub retrieval_margin: f32,
-
-    /// Temperature for the detached policy distribution used by
-    /// `policy_overlap`; values below 1 sharpen the candidate-move set.
-    #[serde(default = "default_retrieval_policy_temperature")]
-    pub retrieval_policy_temperature: f32,
-
-    /// Monitoring threshold for MSE-style retrieval metrics. Pairs with
-    /// policy-overlap or structural-semantic targets at or above this value
-    /// are reported as "positive".
-    #[serde(default = "default_retrieval_policy_positive_threshold")]
-    pub retrieval_policy_positive_threshold: f32,
-
-    /// Mixed-game retrieval target weights. They are normalized by their sum
-    /// at use time, so sweeps can set any component to zero without retuning
-    /// the other weights. The default keeps the target semantic-only after
-    /// continuation-overlap ablations underperformed.
-    #[serde(default = "default_retrieval_semantic_weight")]
-    pub retrieval_semantic_weight: f32,
-    #[serde(default = "default_retrieval_policy_weight")]
-    pub retrieval_policy_weight: f32,
-    #[serde(default = "default_retrieval_continuation_weight")]
-    pub retrieval_continuation_weight: f32,
-    #[serde(default = "default_retrieval_continuation_plies")]
-    pub retrieval_continuation_plies: usize,
-
-    /// How strongly the mixed-game target is gated by handcrafted structure.
-    /// 0 disables the gate; 1 fully multiplies by the gate. Power >1 sharpens
-    /// the gate and power <1 makes it more permissive.
-    #[serde(default = "default_retrieval_structure_gate_strength")]
-    pub retrieval_structure_gate_strength: f32,
-    #[serde(default = "default_retrieval_structure_gate_power")]
-    pub retrieval_structure_gate_power: f32,
-
-    /// Priority multiplier applied to calibration GradNorm target
-    #[serde(default = "default_gradnorm_calibration_priority")]
-    pub gradnorm_calibration_priority: f32,
-
-    /// Priority multiplier applied to policy-regret GradNorm target
-    #[serde(default = "default_gradnorm_policy_regret_priority")]
-    pub gradnorm_policy_regret_priority: f32,
-
-    /// Priority multiplier applied to retrieval-loss GradNorm target
-    #[serde(default = "default_gradnorm_retrieval_priority")]
-    pub gradnorm_retrieval_priority: f32,
+    /// Reference scale (centipawns) for the policy-regret hinge gate. Early in
+    /// training the policy is near-uniform, so the hinge sits at hundreds of cp
+    /// with gradients to match, crowding other tasks out of the gradient-clip
+    /// budget. When the batch hinge exceeds this reference, the loss term is
+    /// rescaled to the reference (gradients damped proportionally); at or below
+    /// it the gate is identity, so steady-state behavior is unchanged.
+    #[serde(default = "default_policy_regret_ref_cp")]
+    pub policy_regret_ref_cp: f32,
 
     // === VALUE TOWER CONFIGURATION ===
     /// Number of transformer layers in the value tower (separate from trunk)
@@ -444,6 +327,18 @@ pub struct Config {
     /// Enable bf16 mixed precision training (cast inputs to bf16, keep optimizer in f32)
     #[serde(default)]
     pub mixed_precision: Option<bool>,
+
+    /// Compute whitening.json next to the trained model after training exits.
+    #[serde(default = "default_whiten_after_training")]
+    pub whiten_after_training: Option<bool>,
+
+    /// Number of positions to use for the post-training whitening transform.
+    #[serde(default = "default_whitening_positions")]
+    pub whitening_positions: usize,
+
+    /// Inference batch size for the post-training whitening pass.
+    #[serde(default = "default_whitening_batch_size")]
+    pub whitening_batch_size: usize,
 }
 
 // Serde default functions for backwards compatibility with older params.json files
@@ -477,14 +372,20 @@ fn default_adamw_base_lr() -> f64 {
 fn default_embedding_base_lr() -> f64 {
     0.1125 // Was 0.075; increased 50% for faster convergence. Width-independent per μP.
 }
-fn default_lr_window_samples() -> Option<usize> {
-    Some(500_000)
+fn default_warmup_fraction() -> f64 {
+    0.02
 }
-fn default_lr_plateau_patience() -> usize {
-    1
+fn default_whiten_after_training() -> Option<bool> {
+    Some(true)
 }
-fn default_lr_plateau_cooldown_samples() -> usize {
-    250_000
+fn default_whitening_positions() -> usize {
+    200_000
+}
+fn default_whitening_batch_size() -> usize {
+    256
+}
+fn default_wsd_decay_fraction() -> f64 {
+    0.15
 }
 fn default_aux_loss_weight() -> f32 {
     0.06 // Was 0.04; increased to strengthen trunk-level auxiliary supervision signal
@@ -493,63 +394,12 @@ fn default_calibration_loss_weight() -> f32 {
     0.10
 }
 fn default_policy_regret_loss_weight() -> f32 {
-    // Seed weight for GradNorm; it rebalances based on measured gradient norms
-    // (target priority 2.0, same as calibration). An absolute floor in gradnorm.rs
-    // prevents collapse to zero, so the initial value is just a starting point —
-    // GradNorm typically drives the per-move hinge down to ~1e-3 within a few
-    // probes because its raw-cp gradient scale dominates.
     0.01
 }
-pub fn default_retrieval_logit_scale_for_serde() -> f32 {
-    10.0
-}
-pub fn default_retrieval_margin_for_serde() -> f32 {
-    0.5
-}
-fn default_retrieval_objective() -> String {
-    RETRIEVAL_OBJECTIVE_MIXED_GAME.to_string()
-}
-fn default_retrieval_embedding_source() -> String {
-    RETRIEVAL_EMBEDDING_SOURCE_RETRIEVAL_HEAD.to_string()
-}
-fn default_retrieval_logit_scale() -> f32 {
-    default_retrieval_logit_scale_for_serde()
-}
-fn default_retrieval_margin() -> f32 {
-    default_retrieval_margin_for_serde()
-}
-fn default_retrieval_policy_temperature() -> f32 {
-    0.5
-}
-fn default_retrieval_policy_positive_threshold() -> f32 {
-    0.25
-}
-fn default_retrieval_semantic_weight() -> f32 {
-    0.5
-}
-fn default_retrieval_policy_weight() -> f32 {
-    0.0
-}
-fn default_retrieval_continuation_weight() -> f32 {
-    0.0
-}
-fn default_retrieval_continuation_plies() -> usize {
-    4
-}
-fn default_retrieval_structure_gate_strength() -> f32 {
-    1.0
-}
-fn default_retrieval_structure_gate_power() -> f32 {
-    0.2
-}
-fn default_gradnorm_calibration_priority() -> f32 {
-    2.0
-}
-fn default_gradnorm_policy_regret_priority() -> f32 {
-    2.0
-}
-fn default_gradnorm_retrieval_priority() -> f32 {
-    2.0
+fn default_policy_regret_ref_cp() -> f32 {
+    // Steady-state hinge is ~18-36cp, so 50 leaves converged training untouched
+    // while damping the ~650cp near-uniform-policy phase by >10x.
+    50.0
 }
 /// Command-line overrides for Config. All fields are optional.
 /// Use `Config::with_overrides()` to merge with defaults.
@@ -585,7 +435,8 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub batch_size: Option<usize>,
 
-    /// Physical batch size (for gradient accumulation)
+    /// Physical batch size (for gradient accumulation). 0 = auto-derive from
+    /// model parameter count so larger models get a safe (smaller) batch.
     #[arg(long)]
     pub physical_batch_size: Option<usize>,
 
@@ -597,33 +448,17 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub num_workers: Option<usize>,
 
-    /// Minimum learning rate (end of training)
+    /// Final learning rate at the end of the WSD decay phase
     #[arg(long)]
     pub lr_min: Option<f64>,
 
-    /// Fallback window size for plateau detection (number of scheduler steps)
+    /// WSD schedule: fraction of the run budget spent in the final decay phase
     #[arg(long)]
-    pub lr_window_size: Option<usize>,
+    pub wsd_decay_fraction: Option<f64>,
 
-    /// Sample-count window for plateau detection. Overrides lr_window_size when set.
-    #[arg(long)]
-    pub lr_window_samples: Option<usize>,
-
-    /// Welch's t-test threshold for plateau detection (e.g., 1.65 = p<0.05)
-    #[arg(long)]
-    pub lr_plateau_t_threshold: Option<f64>,
-
-    /// Factor to reduce learning rate by when plateau is detected
-    #[arg(long)]
-    pub lr_reduction_factor: Option<f64>,
-
-    /// Consecutive plateau windows required before reducing LR
-    #[arg(long)]
-    pub lr_plateau_patience: Option<usize>,
-
-    /// Cooldown after an LR reduction, in samples
-    #[arg(long)]
-    pub lr_plateau_cooldown_samples: Option<usize>,
+    /// Hold LR constant indefinitely (no decay phase; for open-ended runs)
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub lr_hold: Option<bool>,
 
     /// Multiplier applied to the learning rate calculated from batch size
     #[arg(long)]
@@ -645,9 +480,9 @@ pub struct ConfigOverrides {
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub lr_range_finder: Option<bool>,
 
-    /// Warmup multiplier: warmup lasts for warmup_multiplier * effective_batch_size scheduler steps
+    /// Fraction of run budget spent warming up. Uses --timeout/--max-samples progress.
     #[arg(long)]
-    pub warmup_multiplier: Option<f64>,
+    pub warmup_fraction: Option<f64>,
 
     /// Weight for policy loss
     #[arg(long)]
@@ -692,42 +527,6 @@ pub struct ConfigOverrides {
     /// Number of layers/modules to include when logging gradient breakdowns
     #[arg(long)]
     pub gradient_layer_limit: Option<usize>,
-
-    /// Enable adaptive GradNorm reweighting across heads
-    #[arg(long, default_missing_value="true", num_args=0..=1)]
-    pub enable_gradnorm: Option<bool>,
-
-    /// Optimizer steps between GradNorm weight updates
-    #[arg(long)]
-    pub gradnorm_interval: Option<usize>,
-
-    /// Alpha hyperparameter for GradNorm target scaling
-    #[arg(long)]
-    pub gradnorm_alpha: Option<f32>,
-
-    /// Multiplicative learning rate used when adjusting GradNorm weights
-    #[arg(long)]
-    pub gradnorm_learning_rate: Option<f32>,
-
-    /// Priority multiplier applied to policy GradNorm target
-    #[arg(long)]
-    pub gradnorm_policy_priority: Option<f32>,
-
-    /// Priority multiplier applied to value GradNorm target
-    #[arg(long)]
-    pub gradnorm_value_priority: Option<f32>,
-
-    /// Priority multiplier applied to time-usage GradNorm target
-    #[arg(long)]
-    pub gradnorm_time_priority: Option<f32>,
-
-    /// Priority multiplier applied to auxiliary GradNorm target
-    #[arg(long)]
-    pub gradnorm_aux_priority: Option<f32>,
-
-    /// Number of samples to materialize on the lead device when probing GradNorm weights
-    #[arg(long)]
-    pub gradnorm_probe_size: Option<usize>,
 
     /// Embedding dimension for tokens
     #[arg(long)]
@@ -851,53 +650,9 @@ pub struct ConfigOverrides {
     #[arg(long)]
     pub policy_regret_loss_weight: Option<f32>,
 
+    /// Reference scale (centipawns) for the policy-regret hinge gate
     #[arg(long)]
-    pub retrieval_loss_weight: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_objective: Option<String>,
-
-    #[arg(long)]
-    pub retrieval_embedding_source: Option<String>,
-
-    #[arg(long)]
-    pub retrieval_logit_scale: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_margin: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_policy_temperature: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_policy_positive_threshold: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_semantic_weight: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_policy_weight: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_continuation_weight: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_continuation_plies: Option<usize>,
-
-    #[arg(long)]
-    pub retrieval_structure_gate_strength: Option<f32>,
-
-    #[arg(long)]
-    pub retrieval_structure_gate_power: Option<f32>,
-
-    #[arg(long)]
-    pub gradnorm_calibration_priority: Option<f32>,
-
-    #[arg(long)]
-    pub gradnorm_policy_regret_priority: Option<f32>,
-
-    #[arg(long)]
-    pub gradnorm_retrieval_priority: Option<f32>,
+    pub policy_regret_ref_cp: Option<f32>,
 
     /// Number of transformer layers in the value tower
     #[arg(long)]
@@ -942,6 +697,18 @@ pub struct ConfigOverrides {
     /// Enable bf16 mixed precision training (cast inputs to bf16, keep optimizer in f32)
     #[arg(long, default_missing_value="true", num_args=0..=1)]
     pub mixed_precision: Option<bool>,
+
+    /// Compute whitening.json next to the trained model after training exits.
+    #[arg(long, default_missing_value="true", num_args=0..=1)]
+    pub whiten_after_training: Option<bool>,
+
+    /// Number of positions to use for post-training whitening.
+    #[arg(long)]
+    pub whitening_positions: Option<usize>,
+
+    /// Inference batch size for post-training whitening.
+    #[arg(long)]
+    pub whitening_batch_size: Option<usize>,
 }
 
 impl Config {
@@ -985,23 +752,11 @@ impl Config {
         if let Some(v) = overrides.lr_min {
             config.lr_min = v;
         }
-        if let Some(v) = overrides.lr_window_size {
-            config.lr_window_size = v;
+        if let Some(v) = overrides.wsd_decay_fraction {
+            config.wsd_decay_fraction = v;
         }
-        if let Some(v) = overrides.lr_window_samples {
-            config.lr_window_samples = Some(v);
-        }
-        if let Some(v) = overrides.lr_plateau_t_threshold {
-            config.lr_plateau_t_threshold = v;
-        }
-        if let Some(v) = overrides.lr_reduction_factor {
-            config.lr_reduction_factor = v;
-        }
-        if let Some(v) = overrides.lr_plateau_patience {
-            config.lr_plateau_patience = v.max(1);
-        }
-        if let Some(v) = overrides.lr_plateau_cooldown_samples {
-            config.lr_plateau_cooldown_samples = v;
+        if let Some(v) = overrides.lr_hold {
+            config.lr_hold = Some(v);
         }
         if let Some(v) = overrides.lr_multiplier {
             config.lr_multiplier = v;
@@ -1015,8 +770,8 @@ impl Config {
         if let Some(v) = overrides.embedding_base_lr {
             config.embedding_base_lr = v;
         }
-        if let Some(v) = overrides.warmup_multiplier {
-            config.warmup_multiplier = v;
+        if let Some(v) = overrides.warmup_fraction {
+            config.warmup_fraction = v;
         }
         if let Some(v) = overrides.policy_loss_weight {
             config.policy_loss_weight = v;
@@ -1047,33 +802,6 @@ impl Config {
         }
         if let Some(v) = overrides.gradient_layer_limit {
             config.gradient_layer_limit = v;
-        }
-        if let Some(v) = overrides.enable_gradnorm {
-            config.enable_gradnorm = Some(v);
-        }
-        if let Some(v) = overrides.gradnorm_interval {
-            config.gradnorm_interval = v;
-        }
-        if let Some(v) = overrides.gradnorm_alpha {
-            config.gradnorm_alpha = v;
-        }
-        if let Some(v) = overrides.gradnorm_learning_rate {
-            config.gradnorm_learning_rate = v;
-        }
-        if let Some(v) = overrides.gradnorm_policy_priority {
-            config.gradnorm_policy_priority = v;
-        }
-        if let Some(v) = overrides.gradnorm_value_priority {
-            config.gradnorm_value_priority = v;
-        }
-        if let Some(v) = overrides.gradnorm_time_priority {
-            config.gradnorm_time_priority = v;
-        }
-        if let Some(v) = overrides.gradnorm_aux_priority {
-            config.gradnorm_aux_priority = v;
-        }
-        if let Some(v) = overrides.gradnorm_probe_size {
-            config.gradnorm_probe_size = v;
         }
         if let Some(v) = overrides.embed_dim {
             config.embed_dim = v;
@@ -1169,53 +897,8 @@ impl Config {
         if let Some(v) = overrides.policy_regret_loss_weight {
             config.policy_regret_loss_weight = v;
         }
-        if let Some(v) = overrides.retrieval_loss_weight {
-            config.retrieval_loss_weight = v;
-        }
-        if let Some(v) = overrides.retrieval_objective {
-            config.retrieval_objective = v;
-        }
-        if let Some(v) = overrides.retrieval_embedding_source {
-            config.retrieval_embedding_source = v;
-        }
-        if let Some(v) = overrides.retrieval_logit_scale {
-            config.retrieval_logit_scale = v;
-        }
-        if let Some(v) = overrides.retrieval_margin {
-            config.retrieval_margin = v;
-        }
-        if let Some(v) = overrides.retrieval_policy_temperature {
-            config.retrieval_policy_temperature = v;
-        }
-        if let Some(v) = overrides.retrieval_policy_positive_threshold {
-            config.retrieval_policy_positive_threshold = v;
-        }
-        if let Some(v) = overrides.retrieval_semantic_weight {
-            config.retrieval_semantic_weight = v;
-        }
-        if let Some(v) = overrides.retrieval_policy_weight {
-            config.retrieval_policy_weight = v;
-        }
-        if let Some(v) = overrides.retrieval_continuation_weight {
-            config.retrieval_continuation_weight = v;
-        }
-        if let Some(v) = overrides.retrieval_continuation_plies {
-            config.retrieval_continuation_plies = v;
-        }
-        if let Some(v) = overrides.retrieval_structure_gate_strength {
-            config.retrieval_structure_gate_strength = v;
-        }
-        if let Some(v) = overrides.retrieval_structure_gate_power {
-            config.retrieval_structure_gate_power = v;
-        }
-        if let Some(v) = overrides.gradnorm_calibration_priority {
-            config.gradnorm_calibration_priority = v;
-        }
-        if let Some(v) = overrides.gradnorm_policy_regret_priority {
-            config.gradnorm_policy_regret_priority = v;
-        }
-        if let Some(v) = overrides.gradnorm_retrieval_priority {
-            config.gradnorm_retrieval_priority = v;
+        if let Some(v) = overrides.policy_regret_ref_cp {
+            config.policy_regret_ref_cp = v;
         }
         if let Some(v) = overrides.value_tower_layers {
             config.value_tower_layers = v;
@@ -1252,6 +935,15 @@ impl Config {
         }
         if let Some(v) = overrides.mixed_precision {
             config.mixed_precision = Some(v);
+        }
+        if let Some(v) = overrides.whiten_after_training {
+            config.whiten_after_training = Some(v);
+        }
+        if let Some(v) = overrides.whitening_positions {
+            config.whitening_positions = v;
+        }
+        if let Some(v) = overrides.whitening_batch_size {
+            config.whitening_batch_size = v;
         }
         config
     }
@@ -1318,54 +1010,6 @@ impl Config {
 
     pub fn gradient_layer_limit(&self) -> usize {
         self.gradient_layer_limit.max(1)
-    }
-
-    pub fn gradnorm_enabled(&self) -> bool {
-        self.enable_gradnorm.unwrap_or(true)
-    }
-
-    pub fn gradnorm_interval(&self) -> usize {
-        self.gradnorm_interval.max(1)
-    }
-
-    pub fn gradnorm_alpha(&self) -> f32 {
-        self.gradnorm_alpha
-    }
-
-    pub fn gradnorm_learning_rate(&self) -> f32 {
-        self.gradnorm_learning_rate
-    }
-
-    pub fn gradnorm_policy_priority(&self) -> f32 {
-        self.gradnorm_policy_priority.max(0.0)
-    }
-
-    pub fn gradnorm_value_priority(&self) -> f32 {
-        self.gradnorm_value_priority.max(0.0)
-    }
-
-    pub fn gradnorm_time_priority(&self) -> f32 {
-        self.gradnorm_time_priority.max(0.0)
-    }
-
-    pub fn gradnorm_aux_priority(&self) -> f32 {
-        self.gradnorm_aux_priority.max(0.0)
-    }
-
-    pub fn gradnorm_calibration_priority(&self) -> f32 {
-        self.gradnorm_calibration_priority.max(0.0)
-    }
-
-    pub fn gradnorm_policy_regret_priority(&self) -> f32 {
-        self.gradnorm_policy_regret_priority.max(0.0)
-    }
-
-    pub fn gradnorm_retrieval_priority(&self) -> f32 {
-        self.gradnorm_retrieval_priority.max(0.0)
-    }
-
-    pub fn gradnorm_probe_size(&self) -> usize {
-        self.gradnorm_probe_size.max(1)
     }
 
     pub fn forward_timing_enabled(&self) -> bool {
@@ -1440,81 +1084,6 @@ impl Config {
         self.policy_regret_loss_weight.max(0.0)
     }
 
-    pub fn retrieval_loss_weight(&self) -> f32 {
-        self.retrieval_loss_weight.max(0.0)
-    }
-
-    pub fn retrieval_objective(&self) -> &str {
-        match self.retrieval_objective.as_str() {
-            RETRIEVAL_OBJECTIVE_POLICY_OVERLAP => RETRIEVAL_OBJECTIVE_POLICY_OVERLAP,
-            RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC => RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC,
-            RETRIEVAL_OBJECTIVE_MIXED_GAME => RETRIEVAL_OBJECTIVE_MIXED_GAME,
-            _ => RETRIEVAL_OBJECTIVE_SAME_MOVE,
-        }
-    }
-
-    pub fn retrieval_embedding_source(&self) -> &str {
-        match self.retrieval_embedding_source.as_str() {
-            RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN => RETRIEVAL_EMBEDDING_SOURCE_TRUNK_MEAN,
-            _ => RETRIEVAL_EMBEDDING_SOURCE_RETRIEVAL_HEAD,
-        }
-    }
-
-    pub fn retrieval_needs_policy_probs(&self) -> bool {
-        self.retrieval_objective() == RETRIEVAL_OBJECTIVE_POLICY_OVERLAP
-            || (self.retrieval_objective() == RETRIEVAL_OBJECTIVE_MIXED_GAME
-                && self.retrieval_policy_weight() > 0.0)
-    }
-
-    pub fn retrieval_uses_mse(&self) -> bool {
-        matches!(
-            self.retrieval_objective(),
-            RETRIEVAL_OBJECTIVE_POLICY_OVERLAP
-                | RETRIEVAL_OBJECTIVE_STRUCTURAL_SEMANTIC
-                | RETRIEVAL_OBJECTIVE_MIXED_GAME
-        )
-    }
-
-    pub fn retrieval_logit_scale(&self) -> f32 {
-        self.retrieval_logit_scale.max(1e-3)
-    }
-
-    pub fn retrieval_margin(&self) -> f32 {
-        self.retrieval_margin.clamp(-1.0, 1.0)
-    }
-
-    pub fn retrieval_policy_temperature(&self) -> f32 {
-        self.retrieval_policy_temperature.max(1e-3)
-    }
-
-    pub fn retrieval_policy_positive_threshold(&self) -> f32 {
-        self.retrieval_policy_positive_threshold.clamp(0.0, 1.0)
-    }
-
-    pub fn retrieval_semantic_weight(&self) -> f32 {
-        self.retrieval_semantic_weight.max(0.0)
-    }
-
-    pub fn retrieval_policy_weight(&self) -> f32 {
-        self.retrieval_policy_weight.max(0.0)
-    }
-
-    pub fn retrieval_continuation_weight(&self) -> f32 {
-        self.retrieval_continuation_weight.max(0.0)
-    }
-
-    pub fn retrieval_continuation_plies(&self) -> usize {
-        self.retrieval_continuation_plies.clamp(1, 16)
-    }
-
-    pub fn retrieval_structure_gate_strength(&self) -> f32 {
-        self.retrieval_structure_gate_strength.clamp(0.0, 1.0)
-    }
-
-    pub fn retrieval_structure_gate_power(&self) -> f32 {
-        self.retrieval_structure_gate_power.clamp(0.1, 4.0)
-    }
-
     /// Calculate value example weight based on ply (0 before start, ramps to 1 at full)
     pub fn value_ply_weight(&self, ply: usize) -> f32 {
         if ply < self.value_ply_ramp_start {
@@ -1561,34 +1130,23 @@ impl Default for Config {
             log_gradient_breakdown: Some(false),
             gradient_head_limit: 128,
             gradient_layer_limit: 128,
-            enable_gradnorm: Some(true),
-            gradnorm_interval: 20,
-            gradnorm_alpha: 0.5,
-            gradnorm_learning_rate: 0.1,
-            gradnorm_policy_priority: 5.0,
-            gradnorm_value_priority: 2.5,
-            gradnorm_time_priority: 1.0,
-            gradnorm_aux_priority: 1.5,
-            gradnorm_probe_size: 256,
             lr_min: 0.000001,
-            lr_window_size: 500,
-            lr_window_samples: default_lr_window_samples(),
-            lr_plateau_t_threshold: 0.0,
-            lr_reduction_factor: 0.6,
-            lr_plateau_patience: default_lr_plateau_patience(),
-            lr_plateau_cooldown_samples: default_lr_plateau_cooldown_samples(),
-            lr_multiplier: 1.5,
+            wsd_decay_fraction: default_wsd_decay_fraction(),
+            lr_hold: Some(false),
+            lr_multiplier: 1.0, // Was 1.5 (tuned on short research iters); destabilized the value head ~2.5k steps into an 8h run
             muon_base_lr: default_muon_base_lr(),
             adamw_base_lr: default_adamw_base_lr(),
             embedding_base_lr: default_embedding_base_lr(),
-            warmup_multiplier: 2.0,
+            warmup_fraction: default_warmup_fraction(),
             policy_loss_weight: 0.30,
             policy_label_smoothing: 0.0,
             value_loss_weight: 0.10,
             value_entropy_weight: 0.0,
-            embed_dim: 192,
-            num_layers: 8,
-            num_heads: 6,
+            // ~30M params (was 192/8/6 at ~9.7M). num_heads keeps head_dim at 32;
+            // base LRs are defined at LR_REFERENCE_DIM=256 and μP-scaled to this width.
+            embed_dim: 320,
+            num_layers: 16,
+            num_heads: 10,
 
             conv_layers: 0,
             max_samples: None,
@@ -1597,7 +1155,7 @@ impl Default for Config {
             resume: Some(false),
             single_legal_move_only: Some(false),
             checkmate_only: Some(false),
-            item_log_probability: 1.00,
+            item_log_probability: 0.01,
             log_tensor_norms: Some(false),
             norm_preview_limit: 6,
             time_usage_loss_weight: 0.0,
@@ -1623,22 +1181,7 @@ impl Default for Config {
             calibration_db_path: None,
             calibration_loss_weight: default_calibration_loss_weight(),
             policy_regret_loss_weight: default_policy_regret_loss_weight(),
-            retrieval_loss_weight: 0.0,
-            retrieval_objective: default_retrieval_objective(),
-            retrieval_embedding_source: default_retrieval_embedding_source(),
-            retrieval_logit_scale: default_retrieval_logit_scale(),
-            retrieval_margin: default_retrieval_margin(),
-            retrieval_policy_temperature: default_retrieval_policy_temperature(),
-            retrieval_policy_positive_threshold: default_retrieval_policy_positive_threshold(),
-            retrieval_semantic_weight: default_retrieval_semantic_weight(),
-            retrieval_policy_weight: default_retrieval_policy_weight(),
-            retrieval_continuation_weight: default_retrieval_continuation_weight(),
-            retrieval_continuation_plies: default_retrieval_continuation_plies(),
-            retrieval_structure_gate_strength: default_retrieval_structure_gate_strength(),
-            retrieval_structure_gate_power: default_retrieval_structure_gate_power(),
-            gradnorm_calibration_priority: default_gradnorm_calibration_priority(),
-            gradnorm_policy_regret_priority: default_gradnorm_policy_regret_priority(),
-            gradnorm_retrieval_priority: default_gradnorm_retrieval_priority(),
+            policy_regret_ref_cp: default_policy_regret_ref_cp(),
             value_tower_layers: 2,
             value_ply_ramp_start: 10,
             value_ply_ramp_full: 30,
@@ -1652,6 +1195,9 @@ impl Default for Config {
             muon_lr_adjust: None,
             aux_loss_weight: default_aux_loss_weight(),
             mixed_precision: Some(false),
+            whiten_after_training: default_whiten_after_training(),
+            whitening_positions: default_whitening_positions(),
+            whitening_batch_size: default_whitening_batch_size(),
         }
     }
 }
@@ -1664,6 +1210,56 @@ impl Config {
             Some(self.full_metrics_interval)
         }
     }
+
+    pub fn warmup_fraction_clamped(&self) -> f64 {
+        self.warmup_fraction.clamp(0.0, 1.0)
+    }
+
+    pub fn lr_hold(&self) -> bool {
+        self.lr_hold.unwrap_or(false)
+    }
+
+    pub fn whiten_after_training(&self) -> bool {
+        self.whiten_after_training.unwrap_or(true)
+    }
+
+    /// The WSD schedule needs a run budget to know when to start decaying.
+    /// Errors when neither --timeout nor --max-samples is set, unless
+    /// --lr-hold explicitly opts into an open-ended constant-LR run.
+    pub fn validate_lr_schedule(&self) -> Result<(), String> {
+        if self.lr_hold() || self.timeout.is_some() || self.max_samples.is_some() {
+            Ok(())
+        } else {
+            Err(
+                "WSD LR schedule needs a run budget: pass --timeout <secs> or \
+                 --max-samples <n> (decay covers the final wsd_decay_fraction \
+                 of the budget), or pass --lr-hold for an open-ended \
+                 constant-LR run that you anneal later"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// Known-good anchor for auto physical batch sizing on this hardware class:
+/// the 192-dim / 8-layer / 6-head model (AUTO_BATCH_REFERENCE_PARAMS params)
+/// trains comfortably at physical batch 2048 on an M4 Max via LibTorch/MPS,
+/// while 4096 collapses (~4x slower per sample). We keep the per-step working
+/// set roughly constant by scaling batch inversely with parameter count.
+pub const AUTO_BATCH_REFERENCE_PARAMS: usize = 9_731_513; // measured: 192-dim/8-layer/6-head
+pub const AUTO_BATCH_REFERENCE_BATCH: usize = 2048;
+
+/// Derive a safe physical batch size from the model's parameter count.
+/// Returns the power of two nearest to
+/// `AUTO_BATCH_REFERENCE_BATCH * AUTO_BATCH_REFERENCE_PARAMS / num_params`,
+/// clamped to [64, AUTO_BATCH_REFERENCE_BATCH]. The cap means we never exceed
+/// the empirically validated batch even for models smaller than the reference,
+/// since the MPS cliff was observed at the reference size.
+pub fn auto_physical_batch_size(num_params: usize) -> usize {
+    let target = AUTO_BATCH_REFERENCE_BATCH as f64 * AUTO_BATCH_REFERENCE_PARAMS as f64
+        / num_params.max(1) as f64;
+    let exponent = target.log2().round().clamp(6.0, 11.0) as u32; // 64..=2048
+    1usize << exponent
 }
 
 /// Calculate probability of keeping a position based on ply number
@@ -1767,3 +1363,68 @@ pub fn should_keep_game_by_elo(white_elo: i32, black_elo: i32, rng_value: f64) -
 // Legacy type aliases for backward compatibility during transition
 pub type ModelConfig = Config;
 pub type TrainingConfig = Config;
+
+#[cfg(test)]
+mod auto_batch_tests {
+    use super::*;
+
+    #[test]
+    fn reference_model_gets_reference_batch() {
+        assert_eq!(
+            auto_physical_batch_size(AUTO_BATCH_REFERENCE_PARAMS),
+            AUTO_BATCH_REFERENCE_BATCH
+        );
+    }
+
+    #[test]
+    fn double_params_halves_batch() {
+        assert_eq!(
+            auto_physical_batch_size(AUTO_BATCH_REFERENCE_PARAMS * 2),
+            AUTO_BATCH_REFERENCE_BATCH / 2
+        );
+    }
+
+    #[test]
+    fn rounds_to_nearest_power_of_two() {
+        // 1.6x params -> target 1280 -> nearest power of two is 1024
+        let params = (AUTO_BATCH_REFERENCE_PARAMS as f64 * 1.6) as usize;
+        assert_eq!(auto_physical_batch_size(params), 1024);
+        // 1.3x params -> target ~1575 -> nearest power of two is 2048
+        let params = (AUTO_BATCH_REFERENCE_PARAMS as f64 * 1.3) as usize;
+        assert_eq!(auto_physical_batch_size(params), 2048);
+    }
+
+    #[test]
+    fn never_exceeds_reference_batch() {
+        assert_eq!(
+            auto_physical_batch_size(AUTO_BATCH_REFERENCE_PARAMS / 8),
+            AUTO_BATCH_REFERENCE_BATCH
+        );
+    }
+
+    #[test]
+    fn huge_model_clamps_to_floor() {
+        assert_eq!(auto_physical_batch_size(usize::MAX / 2), 64);
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+
+    #[test]
+    fn default_warmup_fraction_is_two_percent() {
+        let config = Config::default();
+        assert_eq!(config.warmup_fraction_clamped(), 0.02);
+    }
+
+    #[test]
+    fn explicit_fraction_override_is_clamped() {
+        let overrides = ConfigOverrides {
+            warmup_fraction: Some(1.5),
+            ..Default::default()
+        };
+        let config = Config::with_overrides(overrides);
+        assert_eq!(config.warmup_fraction_clamped(), 1.0);
+    }
+}

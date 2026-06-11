@@ -2,10 +2,16 @@ use burn::module::Module;
 use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::backend::Backend;
+use once_cell::sync::Lazy;
 
 use crate::config::{Config, NUM_GLOBALS};
+use crate::move_encoding::policy_slot_gather_indices;
 
 const NUM_PROMO_PIECES: usize = 4;
+
+/// Precomputed routing from (from_square, policy_slot) to the from x to-square
+/// logit that slot represents. See `policy_slot_gather_indices`.
+static SLOT_GATHER_INDICES: Lazy<[i32; 64 * 76]> = Lazy::new(policy_slot_gather_indices);
 
 #[derive(Module, Debug)]
 pub struct FactorizedPolicyHead<B: Backend> {
@@ -101,13 +107,11 @@ impl<B: Backend> FactorizedPolicyHead<B> {
     fn compute_promotion_logits(&self, tokens: Tensor<B, 3>) -> Tensor<B, 4> {
         let [batch_size, _, embed_dim] = tokens.dims();
 
-        let white_from = tokens.clone().slice([0..batch_size, 48..56, 0..embed_dim]);
-        let white_to = tokens.clone().slice([0..batch_size, 56..64, 0..embed_dim]);
-        let black_from = tokens.clone().slice([0..batch_size, 8..16, 0..embed_dim]);
-        let black_to = tokens.slice([0..batch_size, 0..8, 0..embed_dim]);
-
-        let from_squares = Tensor::cat(vec![white_from, black_from], 1);
-        let to_squares = Tensor::cat(vec![white_to, black_to], 1);
+        // Positions are color-canonicalized so the side to move is always the
+        // white-frame player; only rank-7 -> rank-8 promotions can occur (the
+        // move encoding cannot even represent downward promotions).
+        let from_squares = tokens.clone().slice([0..batch_size, 48..56, 0..embed_dim]);
+        let to_squares = tokens.slice([0..batch_size, 56..64, 0..embed_dim]);
 
         let from_proj = self.promo_from_proj.forward(from_squares);
         let to_proj = self.promo_to_proj.forward(to_squares);
@@ -122,28 +126,38 @@ impl<B: Backend> FactorizedPolicyHead<B> {
         batch_size: usize,
         device: &B::Device,
     ) -> Tensor<B, 3> {
-        let mut output = Tensor::zeros([batch_size, 64, 76], device);
+        // Route every slot to the from x destination-square logit it represents:
+        // slot j of the 76-wide axis is a direction-distance code, not a square,
+        // so the bilinear from x to logits must be gathered through the
+        // (from, slot) -> destination mapping rather than copied column-wise.
+        let gather_idx = Tensor::<B, 1, Int>::from_data(
+            TensorData::from(SLOT_GATHER_INDICES.as_slice()),
+            device,
+        );
+        let flat = base_logits.reshape([batch_size, 64 * 64]);
+        let output = flat
+            .select(1, gather_idx)
+            .reshape([batch_size, 64, 76]);
 
-        output = output.slice_assign([0..batch_size, 0..64, 0..64], base_logits.clone());
-
+        // Add promotion-specific logits onto the promotion slots. Slot layout
+        // must match move_encoding::build_tables: straight = 64..68, capture
+        // toward the a-file = 68..72, capture toward the h-file = 72..76, each
+        // block ordered knight, bishop, rook, queen.
+        let mut promo_add = Tensor::zeros([batch_size, 64, 76], device);
         for from_file in 0..8usize {
-            let white_from_sq = 48 + from_file;
+            let from_sq = 48 + from_file;
 
-            for to_offset in 0..3usize {
-                let to_file = from_file as i32 + (to_offset as i32 - 1);
-                if to_file < 0 || to_file >= 8 {
+            for to_file_delta in -1i32..=1 {
+                let to_file = from_file as i32 + to_file_delta;
+                if !(0..8).contains(&to_file) {
                     continue;
                 }
-                let white_to_sq = 56 + to_file as usize;
-
-                let base_val = base_logits
-                    .clone()
-                    .slice([
-                        0..batch_size,
-                        white_from_sq..white_from_sq + 1,
-                        white_to_sq..white_to_sq + 1,
-                    ])
-                    .reshape([batch_size, 1]);
+                let dir_idx = match to_file_delta {
+                    0 => 0usize,
+                    -1 => 1,
+                    _ => 2,
+                };
+                let start_idx = 64 + dir_idx * 4;
 
                 let promo_4 = promo_logits
                     .clone()
@@ -153,72 +167,16 @@ impl<B: Backend> FactorizedPolicyHead<B> {
                         to_file as usize..(to_file as usize) + 1,
                         0..4,
                     ])
-                    .reshape([batch_size, 4]);
+                    .reshape([batch_size, 1, 4]);
 
-                let combined = (base_val + promo_4).reshape([batch_size, 1, 4]);
-
-                let dir_idx = to_offset;
-                let start_idx = 64 + dir_idx * 4;
-
-                output = output.slice_assign(
-                    [
-                        0..batch_size,
-                        white_from_sq..white_from_sq + 1,
-                        start_idx..start_idx + 4,
-                    ],
-                    combined,
+                promo_add = promo_add.slice_assign(
+                    [0..batch_size, from_sq..from_sq + 1, start_idx..start_idx + 4],
+                    promo_4,
                 );
             }
         }
 
-        for from_file in 0..8usize {
-            let black_from_sq = 8 + from_file;
-            let promo_from_idx = 8 + from_file;
-
-            for to_offset in 0..3usize {
-                let to_file = from_file as i32 + (to_offset as i32 - 1);
-                if to_file < 0 || to_file >= 8 {
-                    continue;
-                }
-                let black_to_sq = to_file as usize;
-                let promo_to_idx = 8 + to_file as usize;
-
-                let base_val = base_logits
-                    .clone()
-                    .slice([
-                        0..batch_size,
-                        black_from_sq..black_from_sq + 1,
-                        black_to_sq..black_to_sq + 1,
-                    ])
-                    .reshape([batch_size, 1]);
-
-                let promo_4 = promo_logits
-                    .clone()
-                    .slice([
-                        0..batch_size,
-                        promo_from_idx..promo_from_idx + 1,
-                        promo_to_idx..promo_to_idx + 1,
-                        0..4,
-                    ])
-                    .reshape([batch_size, 4]);
-
-                let combined = (base_val + promo_4).reshape([batch_size, 1, 4]);
-
-                let dir_idx = to_offset;
-                let start_idx = 64 + dir_idx * 4;
-
-                output = output.slice_assign(
-                    [
-                        0..batch_size,
-                        black_from_sq..black_from_sq + 1,
-                        start_idx..start_idx + 4,
-                    ],
-                    combined,
-                );
-            }
-        }
-
-        output
+        output + promo_add
     }
 }
 
@@ -265,6 +223,62 @@ mod tests {
         let tokens = Tensor::zeros([batch_size, 64, config.embed_dim()], &device);
 
         let promo = head.compute_promotion_logits(tokens);
-        assert_eq!(promo.dims(), [batch_size, 16, 16, 4]);
+        assert_eq!(promo.dims(), [batch_size, 8, 8, 4]);
+    }
+
+    /// The head's output slots must agree with `encode_move`'s slot semantics:
+    /// the logit at (from, slot) must be the bilinear logit for the move's
+    /// actual destination square, plus the matching promotion logit for
+    /// promotion slots. Guards against the direction-distance slot layout
+    /// drifting out of sync with the from x to-square factorization.
+    #[test]
+    fn test_slot_semantics_match_move_encoding() {
+        use crate::move_encoding::encode_move;
+        use shakmaty::uci::UciMove;
+
+        let device = test_device();
+        let config = Config::new(96, 2);
+        let head = FactorizedPolicyHead::<TestBackend>::new(&config, &device);
+
+        // base[from][to] = from*64 + to, so the gathered value identifies the
+        // exact square pair the slot consulted.
+        let base: Vec<f32> = (0..64 * 64).map(|i| i as f32).collect();
+        let base_logits =
+            Tensor::<TestBackend, 1>::from_data(TensorData::from(base.as_slice()), &device)
+                .reshape([1, 64, 64]);
+
+        // promo[from_file][to_file][role] = 10_000 + flat index, offset so the
+        // promotion contribution is distinguishable from any base value.
+        let promo: Vec<f32> = (0..8 * 8 * 4).map(|i| 10_000.0 + i as f32).collect();
+        let promo_logits =
+            Tensor::<TestBackend, 1>::from_data(TensorData::from(promo.as_slice()), &device)
+                .reshape([1, 8, 8, 4]);
+
+        let output = head.combine_logits_vectorized(base_logits, promo_logits, 1, &device);
+        let out = output.into_data().to_vec::<f32>().unwrap();
+
+        let slot_value = |uci: &str| -> f32 {
+            let m: UciMove = uci.parse().unwrap();
+            let (from, slot) = encode_move(&m).unwrap();
+            out[from as usize * 76 + slot as usize]
+        };
+        let base_val = |from: usize, to: usize| (from * 64 + to) as f32;
+        let promo_val = |from_file: usize, to_file: usize, role: usize| {
+            10_000.0 + ((from_file * 8 + to_file) * 4 + role) as f32
+        };
+
+        // Normal moves: pure base logit at the true destination square.
+        assert_eq!(slot_value("e2e4"), base_val(12, 28));
+        assert_eq!(slot_value("g1f3"), base_val(6, 21));
+        assert_eq!(slot_value("a1a8"), base_val(0, 56));
+        assert_eq!(slot_value("d1e1"), base_val(3, 4));
+
+        // Promotions: base at the destination plus the matching promo logit.
+        // Role order within each slot block is knight, bishop, rook, queen.
+        assert_eq!(slot_value("e7e8q"), base_val(52, 60) + promo_val(4, 4, 3));
+        assert_eq!(slot_value("e7d8n"), base_val(52, 59) + promo_val(4, 3, 0));
+        assert_eq!(slot_value("e7f8b"), base_val(52, 61) + promo_val(4, 5, 1));
+        assert_eq!(slot_value("a7b8r"), base_val(48, 57) + promo_val(0, 1, 2));
+        assert_eq!(slot_value("h7h8q"), base_val(55, 63) + promo_val(7, 7, 3));
     }
 }

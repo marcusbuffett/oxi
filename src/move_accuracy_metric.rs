@@ -38,7 +38,7 @@ impl<B: Backend> Metric for MoveAccuracyMetric<B> {
     type Input = MoveAccuracyInput<B>;
 
     fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
-        let batch_size = input.policy_logits.shape().dims[0];
+        let batch_size = input.policy_logits.shape().dims::<2>()[0];
 
         // Convert logits to probabilities
         let probs = softmax(input.policy_logits.clone(), 1);
@@ -105,7 +105,7 @@ impl<B: Backend> Metric for MoveTopKAccuracyMetric<B> {
     type Input = MoveAccuracyInput<B>;
 
     fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
-        let batch_size = input.policy_logits.shape().dims[0];
+        let batch_size = input.policy_logits.shape().dims::<2>()[0];
 
         let batch_accuracy = if batch_size > 0 {
             if self.k == 1 {

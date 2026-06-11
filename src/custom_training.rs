@@ -5,7 +5,6 @@ use crate::metrics_renderer::{
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataloader::Progress;
 use burn::grad_clipping::GradientClippingConfig;
-use burn::lr_scheduler::LrScheduler;
 use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::prelude::*;
@@ -15,8 +14,7 @@ use burn::train::metric::LossMetric;
 use burn_train::metric::IterationSpeedMetric;
 use burn_train::metric::{Adaptor, Metric, MetricMetadata, Numeric, NumericEntry, SerializedEntry};
 use burn_train::Interrupter;
-use rand::rng;
-use rand::seq::{IteratorRandom, SliceRandom};
+use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -33,20 +31,17 @@ use crate::aurora_optimizer::{AuroraConfig, MuonUpdateKind};
 use crate::chess_output::ChessOutput;
 use crate::config::Config;
 
-use crate::dataset::{ChessBatch, ChessBatcher, ChessExample, ChessItem, OXIDataset};
+use crate::dataset::{ChessBatcher, ChessExample, ChessItem, OXIDataset};
 use crate::debug_prediction_monitor::DebugPredictionMonitor;
 use crate::gradient_norm_metric::{
     compute_gradient_norm_with_breakdown, GradientNormBreakdown, GradientNormInput,
     GradientNormMetric,
 };
-use crate::gradnorm::{GradNormProbeResult, GradNormState, GradNormTask};
-use crate::lr_plateau_metric::{LrPlateauInput, LrPlateauMetric};
 use crate::model::OXIModel;
 use crate::move_accuracy_metric::MoveTopKAccuracyMetric;
 use crate::pgn_processor::process_tcec_directory_iter;
 use crate::policy_loss_metric::{PolicyLossInput, PolicyLossMetric};
 use crate::puzzle_processor::{process_puzzle_file_iter, MixedExampleIterator};
-use crate::reduce_on_plateau_scheduler::ReduceOnPlateauScheduler;
 use crate::time_usage_loss_metric::{TimeUsageLossInput, TimeUsageLossMetric};
 use crate::training_stage_metric::{TrainingStage, TrainingStageInput, TrainingStageMetric};
 use crate::training_stream::build_human_training_stream;
@@ -54,6 +49,8 @@ use crate::tui::OxiTuiRenderer;
 use crate::value_loss_metric::{ValueLossInput, ValueLossMetric};
 use crate::wdl_accuracy_metric::WdlAccuracyMetric;
 use crate::weight_decay::WeightDecayGroups;
+use crate::wsd_lr_metric::{WsdLrInput, WsdLrMetric};
+use crate::wsd_scheduler::WsdScheduler;
 
 /// Simple CLI renderer for when TUI is disabled
 struct SimpleCliRenderer;
@@ -223,7 +220,6 @@ const OPT_DECAY_NORMAL_FILE_NAME: &str = "optimizer_decay_normal.mpk";
 const OPT_DECAY_HIGH_FILE_NAME: &str = "optimizer_decay_high.mpk";
 const OPT_NO_DECAY_NORMAL_FILE_NAME: &str = "optimizer_no_decay_normal.mpk";
 const OPT_NO_DECAY_HIGH_FILE_NAME: &str = "optimizer_no_decay_high.mpk";
-const GRADNORM_STATE_FILE_NAME: &str = "gradnorm_state.bin";
 
 fn save_optimizer_state<B: AutodiffBackend, O>(
     optimizer: &O,
@@ -257,7 +253,6 @@ where
 fn save_training_state<B, OM, O1, O2, O3, O4>(
     model: &OXIModel<B>,
     config: &Config,
-    gradnorm_state: &GradNormState,
     optim_muon: &OM,
     optim_decay_normal: &O1,
     optim_decay_high: &O2,
@@ -308,11 +303,6 @@ where
         &recorder,
         directory.join(OPT_NO_DECAY_HIGH_FILE_NAME),
     )?;
-
-    let gradnorm_path = directory.join(GRADNORM_STATE_FILE_NAME);
-    let gradnorm_bytes = bincode::serde::encode_to_vec(gradnorm_state, bincode::config::standard())
-        .map_err(|err: bincode::error::EncodeError| anyhow::anyhow!(err))?;
-    std::fs::write(&gradnorm_path, gradnorm_bytes)?;
 
     Ok(())
 }
@@ -403,41 +393,26 @@ fn split_items_across_devices<T: Clone>(items: &[T], num_devices: usize) -> Vec<
     result
 }
 
-fn sample_gradnorm_items(items: &[ChessItem], sample_size: usize) -> Vec<ChessItem> {
-    if items.len() <= sample_size {
-        return items.to_vec();
-    }
-
-    let mut rng = rng();
-    items
-        .iter()
-        .choose_multiple(&mut rng, sample_size)
-        .into_iter()
-        .cloned()
-        .collect()
-}
-
+/// Static per-task loss weights from config.
 #[derive(Clone, Copy)]
-struct GradNormWeights {
+struct LossWeights {
     policy: f32,
     value: f32,
     time: f32,
     aux: f32,
     calibration: f32,
     policy_regret: f32,
-    retrieval: f32,
 }
 
-impl GradNormWeights {
-    fn from_state(state: &GradNormState) -> Self {
+impl LossWeights {
+    fn from_config(config: &Config) -> Self {
         Self {
-            policy: state.weight_for(GradNormTask::Policy),
-            value: state.weight_for(GradNormTask::Value),
-            time: state.weight_for(GradNormTask::TimeUsage),
-            aux: state.weight_for(GradNormTask::Auxiliary),
-            calibration: state.weight_for(GradNormTask::Calibration),
-            policy_regret: state.weight_for(GradNormTask::PolicyRegret),
-            retrieval: state.weight_for(GradNormTask::Retrieval),
+            policy: config.policy_loss_weight,
+            value: config.value_loss_weight,
+            time: config.time_usage_loss_weight,
+            aux: config.aux_loss_weight,
+            calibration: config.calibration_loss_weight(),
+            policy_regret: config.policy_regret_loss_weight(),
         }
     }
 }
@@ -450,13 +425,11 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         time_usage_loss: output.time_usage_loss.to_device(device),
         aux_loss: output.aux_loss.to_device(device),
         calibration_loss: output.calibration_loss.to_device(device),
-        retrieval_loss: output.retrieval_loss.to_device(device),
         base_policy_loss: output.base_policy_loss.to_device(device),
         base_value_loss: output.base_value_loss.to_device(device),
         base_time_usage_loss: output.base_time_usage_loss.to_device(device),
         base_aux_loss: output.base_aux_loss.to_device(device),
         base_calibration_loss: output.base_calibration_loss.to_device(device),
-        base_retrieval_loss: output.base_retrieval_loss.to_device(device),
         policy_output: output.policy_output.to_device(device),
         policy_targets: output.policy_targets.to_device(device),
         value_output: output.value_output.to_device(device),
@@ -489,41 +462,23 @@ fn move_output_to_device<B: Backend>(output: ChessOutput<B>, device: &B::Device)
         policy_regret_loss: output.policy_regret_loss.to_device(device),
         policy_regret_loss_f32: output.policy_regret_loss_f32,
         argmax_cp_loss_by_elo: output.argmax_cp_loss_by_elo,
-        retrieval_loss_f32: output.retrieval_loss_f32,
-        retrieval_pair_count: output.retrieval_pair_count,
-        retrieval_positive_count: output.retrieval_positive_count,
-        retrieval_positive_sim: output.retrieval_positive_sim,
-        retrieval_negative_sim: output.retrieval_negative_sim,
-        retrieval_opening_family_match_rate: output.retrieval_opening_family_match_rate,
-        retrieval_opening_family_pair_count: output.retrieval_opening_family_pair_count,
-        retrieval_opening_family_coverage: output.retrieval_opening_family_coverage,
-        trunk_retrieval_loss_f32: output.trunk_retrieval_loss_f32,
-        trunk_retrieval_pair_count: output.trunk_retrieval_pair_count,
-        trunk_retrieval_positive_count: output.trunk_retrieval_positive_count,
-        trunk_retrieval_positive_sim: output.trunk_retrieval_positive_sim,
-        trunk_retrieval_negative_sim: output.trunk_retrieval_negative_sim,
     }
     .detach()
 }
 
-fn apply_gradnorm_weights_to_output<B: Backend>(
-    output: &mut ChessOutput<B>,
-    weights: GradNormWeights,
-) {
+fn apply_loss_weights_to_output<B: Backend>(output: &mut ChessOutput<B>, weights: LossWeights) {
     output.policy_loss = output.base_policy_loss.clone() * weights.policy;
     output.value_loss = output.base_value_loss.clone() * weights.value;
     output.time_usage_loss = output.base_time_usage_loss.clone() * weights.time;
     output.aux_loss = output.base_aux_loss.clone() * weights.aux;
     output.calibration_loss = output.base_calibration_loss.clone() * weights.calibration;
     output.policy_regret_loss = output.base_policy_regret_loss.clone() * weights.policy_regret;
-    output.retrieval_loss = output.base_retrieval_loss.clone() * weights.retrieval;
     output.loss = output.policy_loss.clone()
         + output.value_loss.clone()
         + output.time_usage_loss.clone()
         + output.aux_loss.clone()
         + output.calibration_loss.clone()
-        + output.policy_regret_loss.clone()
-        + output.retrieval_loss.clone();
+        + output.policy_regret_loss.clone();
 }
 
 fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -> ChessOutput<B> {
@@ -540,14 +495,12 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_aux_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_calibration_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_policy_regret_loss = Tensor::<B, 1>::zeros([1], device);
-    let mut sum_retrieval_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_policy_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_value_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_time_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_aux_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_calibration_loss = Tensor::<B, 1>::zeros([1], device);
     let mut sum_base_policy_regret_loss = Tensor::<B, 1>::zeros([1], device);
-    let mut sum_base_retrieval_loss = Tensor::<B, 1>::zeros([1], device);
 
     let mut sum_aux_mobility_loss = 0.0f32;
     let mut sum_aux_material_loss = 0.0f32;
@@ -564,19 +517,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let mut sum_calibration_labeled_fraction = 0.0f32;
     let mut sum_calibration_overall_score = 0.0f32;
     let mut sum_policy_regret_loss_f32 = 0.0f32;
-    let mut sum_retrieval_loss_f32 = 0.0f32;
-    let mut sum_retrieval_pair_count = 0.0f32;
-    let mut sum_retrieval_positive_count = 0.0f32;
-    let mut sum_retrieval_positive_sim_weighted = 0.0f32;
-    let mut sum_retrieval_negative_sim_weighted = 0.0f32;
-    let mut sum_retrieval_opening_family_match_weighted = 0.0f32;
-    let mut sum_retrieval_opening_family_pair_count = 0.0f32;
-    let mut sum_retrieval_opening_family_coverage = 0.0f32;
-    let mut sum_trunk_retrieval_loss_f32 = 0.0f32;
-    let mut sum_trunk_retrieval_pair_count = 0.0f32;
-    let mut sum_trunk_retrieval_positive_count = 0.0f32;
-    let mut sum_trunk_retrieval_positive_sim_weighted = 0.0f32;
-    let mut sum_trunk_retrieval_negative_sim_weighted = 0.0f32;
 
     let all_raw_policy = outputs.iter().all(|o| o.raw_policy_loss.is_some());
     let all_raw_value = outputs.iter().all(|o| o.raw_value_loss.is_some());
@@ -604,7 +544,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_aux_loss = sum_aux_loss + output.aux_loss.clone() * batch_scalar;
         sum_calibration_loss =
             sum_calibration_loss + output.calibration_loss.clone() * batch_scalar;
-        sum_retrieval_loss = sum_retrieval_loss + output.retrieval_loss.clone() * batch_scalar;
 
         sum_base_policy_loss =
             sum_base_policy_loss + output.base_policy_loss.clone() * batch_scalar;
@@ -614,8 +553,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_base_aux_loss = sum_base_aux_loss + output.base_aux_loss.clone() * batch_scalar;
         sum_base_calibration_loss =
             sum_base_calibration_loss + output.base_calibration_loss.clone() * batch_scalar;
-        sum_base_retrieval_loss =
-            sum_base_retrieval_loss + output.base_retrieval_loss.clone() * batch_scalar;
 
         sum_aux_mobility_loss += output.aux_mobility_loss * batch_scalar;
         sum_aux_material_loss += output.aux_material_loss * batch_scalar;
@@ -632,29 +569,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         sum_calibration_labeled_fraction += output.calibration_labeled_fraction * batch_scalar;
         sum_calibration_overall_score += output.calibration_overall_score * batch_scalar;
         sum_policy_regret_loss_f32 += output.policy_regret_loss_f32 * batch_scalar;
-        sum_retrieval_loss_f32 += output.retrieval_loss_f32 * batch_scalar;
-        sum_retrieval_pair_count += output.retrieval_pair_count;
-        sum_retrieval_positive_count += output.retrieval_positive_count;
-        let retrieval_negative_count =
-            (output.retrieval_pair_count - output.retrieval_positive_count).max(0.0);
-        sum_retrieval_positive_sim_weighted +=
-            output.retrieval_positive_sim * output.retrieval_positive_count;
-        sum_retrieval_negative_sim_weighted +=
-            output.retrieval_negative_sim * retrieval_negative_count;
-        sum_retrieval_opening_family_match_weighted +=
-            output.retrieval_opening_family_match_rate * output.retrieval_opening_family_pair_count;
-        sum_retrieval_opening_family_pair_count += output.retrieval_opening_family_pair_count;
-        sum_retrieval_opening_family_coverage +=
-            output.retrieval_opening_family_coverage * batch_scalar;
-        sum_trunk_retrieval_loss_f32 += output.trunk_retrieval_loss_f32 * batch_scalar;
-        sum_trunk_retrieval_pair_count += output.trunk_retrieval_pair_count;
-        sum_trunk_retrieval_positive_count += output.trunk_retrieval_positive_count;
-        let trunk_retrieval_negative_count =
-            (output.trunk_retrieval_pair_count - output.trunk_retrieval_positive_count).max(0.0);
-        sum_trunk_retrieval_positive_sim_weighted +=
-            output.trunk_retrieval_positive_sim * output.trunk_retrieval_positive_count;
-        sum_trunk_retrieval_negative_sim_weighted +=
-            output.trunk_retrieval_negative_sim * trunk_retrieval_negative_count;
 
         sum_policy_regret_loss =
             sum_policy_regret_loss + output.policy_regret_loss.clone() * batch_scalar;
@@ -695,7 +609,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let time_usage_loss = sum_time_loss / total_scalar;
     let aux_loss = sum_aux_loss / total_scalar;
     let calibration_loss = sum_calibration_loss / total_scalar;
-    let retrieval_loss = sum_retrieval_loss / total_scalar;
 
     let base_policy_loss = sum_base_policy_loss / total_scalar;
     let base_value_loss = sum_base_value_loss / total_scalar;
@@ -704,7 +617,6 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     let base_calibration_loss = sum_base_calibration_loss / total_scalar;
     let policy_regret_loss = sum_policy_regret_loss / total_scalar;
     let base_policy_regret_loss = sum_base_policy_regret_loss / total_scalar;
-    let base_retrieval_loss = sum_base_retrieval_loss / total_scalar;
 
     let raw_policy_loss = sum_raw_policy_loss.map(|sum| sum / total_scalar);
     let raw_value_loss = sum_raw_value_loss.map(|sum| sum / total_scalar);
@@ -753,13 +665,11 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         time_usage_loss,
         aux_loss,
         calibration_loss,
-        retrieval_loss,
         base_policy_loss,
         base_value_loss,
         base_time_usage_loss,
         base_aux_loss,
         base_calibration_loss,
-        base_retrieval_loss,
         policy_output,
         policy_targets,
         value_output,
@@ -788,115 +698,13 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
         policy_regret_loss,
         policy_regret_loss_f32: sum_policy_regret_loss_f32 / total_scalar,
         argmax_cp_loss_by_elo,
-        retrieval_loss_f32: sum_retrieval_loss_f32 / total_scalar,
-        retrieval_pair_count: sum_retrieval_pair_count,
-        retrieval_positive_count: sum_retrieval_positive_count,
-        retrieval_positive_sim: if sum_retrieval_positive_count > 0.0 {
-            sum_retrieval_positive_sim_weighted / sum_retrieval_positive_count
-        } else {
-            0.0
-        },
-        retrieval_negative_sim: if sum_retrieval_pair_count > sum_retrieval_positive_count {
-            sum_retrieval_negative_sim_weighted
-                / (sum_retrieval_pair_count - sum_retrieval_positive_count)
-        } else {
-            0.0
-        },
-        retrieval_opening_family_match_rate: if sum_retrieval_opening_family_pair_count > 0.0 {
-            sum_retrieval_opening_family_match_weighted / sum_retrieval_opening_family_pair_count
-        } else {
-            0.0
-        },
-        retrieval_opening_family_pair_count: sum_retrieval_opening_family_pair_count,
-        retrieval_opening_family_coverage: sum_retrieval_opening_family_coverage / total_scalar,
-        trunk_retrieval_loss_f32: sum_trunk_retrieval_loss_f32 / total_scalar,
-        trunk_retrieval_pair_count: sum_trunk_retrieval_pair_count,
-        trunk_retrieval_positive_count: sum_trunk_retrieval_positive_count,
-        trunk_retrieval_positive_sim: if sum_trunk_retrieval_positive_count > 0.0 {
-            sum_trunk_retrieval_positive_sim_weighted / sum_trunk_retrieval_positive_count
-        } else {
-            0.0
-        },
-        trunk_retrieval_negative_sim: if sum_trunk_retrieval_pair_count
-            > sum_trunk_retrieval_positive_count
-        {
-            sum_trunk_retrieval_negative_sim_weighted
-                / (sum_trunk_retrieval_pair_count - sum_trunk_retrieval_positive_count)
-        } else {
-            0.0
-        },
     }
     .detach()
 }
 
-fn compute_gradnorm_probe<B: AutodiffBackend>(
-    model: OXIModel<B>,
-    batch: ChessBatch<B>,
-    weights: GradNormWeights,
-) -> Vec<GradNormProbeResult>
-where
-    B::FloatElem: From<f32>,
-    B::IntElem: From<i32>,
-{
-    let mut results = Vec::new();
-
-    let tasks = [
-        (GradNormTask::Policy, weights.policy),
-        (GradNormTask::Value, weights.value),
-        (GradNormTask::TimeUsage, weights.time),
-        (GradNormTask::Auxiliary, weights.aux),
-        (GradNormTask::Calibration, weights.calibration),
-        (GradNormTask::PolicyRegret, weights.policy_regret),
-    ];
-
-    for (task, weight) in tasks {
-        if weight <= 0.0 {
-            continue;
-        }
-
-        let output = model.forward_classification(batch.clone());
-        if matches!(task, GradNormTask::Calibration | GradNormTask::PolicyRegret)
-            && output.calibration_labeled_fraction <= 0.0
-        {
-            continue;
-        }
-        if matches!(task, GradNormTask::Retrieval) && output.retrieval_pair_count <= 0.0 {
-            continue;
-        }
-        let base_loss_tensor = match task {
-            GradNormTask::Policy => output.base_policy_loss.clone(),
-            GradNormTask::Value => output.base_value_loss.clone(),
-            GradNormTask::TimeUsage => output.base_time_usage_loss.clone(),
-            GradNormTask::Auxiliary => output.base_aux_loss.clone(),
-            GradNormTask::Calibration => output.base_calibration_loss.clone(),
-            GradNormTask::PolicyRegret => output.base_policy_regret_loss.clone(),
-            GradNormTask::Retrieval => output.base_retrieval_loss.clone(),
-        };
-        let base_loss_value = base_loss_tensor.clone().into_scalar().elem::<f32>();
-        // Use base (unweighted) loss for gradient norm measurement.
-        // GradNorm needs to compare the *intrinsic* gradient magnitudes of each task,
-        // not the currently-weighted ones, to avoid a feedback loop.
-        let grads = base_loss_tensor.backward();
-        let grads_params = GradientsParams::from_grads(grads, &model);
-        let breakdown = compute_gradient_norm_with_breakdown(&grads_params, &model, false);
-        results.push(GradNormProbeResult {
-            task,
-            base_loss: base_loss_value,
-            grad_norm: breakdown.total() as f32,
-        });
-    }
-
-    results
-}
-
 struct WorkerRequest {
     items: Vec<ChessItem>,
-    weights: GradNormWeights,
-}
-
-struct GradNormProbeRequest {
-    items: Vec<ChessItem>,
-    weights: GradNormWeights,
+    weights: LossWeights,
 }
 
 type ModelRecord<B> = <OXIModel<B> as Module<B>>::Record;
@@ -906,7 +714,6 @@ enum WorkerResponse<B: AutodiffBackend> {
         grads: GradientsParams,
         output: ChessOutput<B>,
     },
-    GradNormProbe(Vec<GradNormProbeResult>),
 }
 
 enum WorkerCommand<B: AutodiffBackend>
@@ -915,7 +722,6 @@ where
     B::IntElem: From<i32>,
 {
     Run(WorkerRequest),
-    GradNormProbe(GradNormProbeRequest),
     UpdateModel(ModelRecord<B>),
     Terminate,
 }
@@ -963,7 +769,7 @@ where
                         let mut output = model.forward_classification(batch);
                         let forward_time = t_forward_start.elapsed();
 
-                        apply_gradnorm_weights_to_output(&mut output, request.weights);
+                        apply_loss_weights_to_output(&mut output, request.weights);
 
                         let t_backward_start = Instant::now();
                         let loss = output.loss.clone();
@@ -984,27 +790,6 @@ where
                                 grads,
                                 output: output_main,
                             })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    WorkerCommand::GradNormProbe(request) => {
-                        if request.items.is_empty() {
-                            if response_tx
-                                .send(WorkerResponse::GradNormProbe(Vec::new()))
-                                .is_err()
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-
-                        let batch = batcher.batch(request.items, &device).to_device(&device);
-                        let probe_model = model.clone();
-                        let results = compute_gradnorm_probe(probe_model, batch, request.weights);
-                        if response_tx
-                            .send(WorkerResponse::GradNormProbe(results))
                             .is_err()
                         {
                             break;
@@ -1429,29 +1214,8 @@ fn write_scoresheet(
         config.adamw_base_lr * adamw_dim_scale * batch_scale * config.lr_multiplier;
     let initial_muon_lr = config.muon_base_lr * muon_dim_scale * batch_scale * config.lr_multiplier;
     let initial_embedding_lr = config.embedding_base_lr * batch_scale * config.lr_multiplier;
-    // Use AdamW LR as the scheduler's LR (the "base" for plateau reduction)
-    let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
-    let lr_window_size = config
-        .lr_window_samples
-        .map(|samples| samples.div_ceil(effective_batch_size).max(4))
-        .unwrap_or(config.lr_window_size);
-    let lr_plateau_cooldown_iterations = config
-        .lr_plateau_cooldown_samples
-        .div_ceil(effective_batch_size);
-
-    let initial_adamw_lr =
-        config.adamw_base_lr * adamw_dim_scale * batch_scale * config.lr_multiplier;
-    let initial_muon_lr = config.muon_base_lr * muon_dim_scale * batch_scale * config.lr_multiplier;
-    let initial_embedding_lr = config.embedding_base_lr * batch_scale * config.lr_multiplier;
-    // Use AdamW LR as the scheduler's LR (the "base" for plateau reduction)
-    let initial_lr = initial_adamw_lr;
-    let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
-    let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
-
     let train_size_display = if train_size == usize::MAX {
         "streaming".to_string()
     } else {
@@ -1514,16 +1278,10 @@ Model & Data Configuration\n\
 - Initial Embedding LR: {initial_embedding_lr:.6}\n\
 - Muon/AdamW LR ratio: {muon_to_adamw_lr_ratio:.2}x\n\
 - Embedding/AdamW LR ratio: {embedding_to_adamw_lr_ratio:.2}x\n\
-- LR min: {lr_min}\n\
+- LR min (decay end): {lr_min}\n\
 - LR multiplier: {lr_multiplier}\n\
-- Warmup iterations: {warmup_iterations}\n\
-- Warmup multiplier: {warmup_multiplier}\n\
-- LR window size: {lr_window_size}\n\
-- LR window samples: {lr_window_samples}\n\
-- LR plateau t-threshold: {lr_plateau_t_threshold:.2}\n\
-- LR reduction factor: {lr_reduction_factor}\n\
-- LR plateau patience: {lr_plateau_patience}\n\
-- LR plateau cooldown samples: {lr_plateau_cooldown_samples} ({lr_plateau_cooldown_iterations} iterations)\n\
+- Warmup fraction: {warmup_fraction:.1}%\n\
+- LR schedule: WSD (decay over final {wsd_decay_fraction:.0}% of budget, hold={lr_hold})\n\
 \n\
 Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         duration = training_duration.as_secs_f64(),
@@ -1559,18 +1317,9 @@ Metric Averages (last min({window}, N) updates)\n{metrics_section}\n",
         embedding_to_adamw_lr_ratio = embedding_to_adamw_lr_ratio,
         lr_min = config.lr_min,
         lr_multiplier = config.lr_multiplier,
-        warmup_iterations = warmup_iterations,
-        warmup_multiplier = config.warmup_multiplier,
-        lr_window_size = lr_window_size,
-        lr_window_samples = config
-            .lr_window_samples
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "N/A".to_string()),
-        lr_plateau_t_threshold = config.lr_plateau_t_threshold,
-        lr_reduction_factor = config.lr_reduction_factor,
-        lr_plateau_patience = config.lr_plateau_patience,
-        lr_plateau_cooldown_samples = config.lr_plateau_cooldown_samples,
-        lr_plateau_cooldown_iterations = lr_plateau_cooldown_iterations,
+        warmup_fraction = config.warmup_fraction_clamped() * 100.0,
+        wsd_decay_fraction = config.wsd_decay_fraction * 100.0,
+        lr_hold = config.lr_hold(),
         window = SCORE_WINDOW,
     );
 
@@ -1625,7 +1374,7 @@ fn load_tcec_examples(data_path: &Path, max_count: usize) -> anyhow::Result<Vec<
 }
 
 pub fn train_custom<B: AutodiffBackend>(
-    config: Config,
+    mut config: Config,
     devices: Vec<B::Device>,
 ) -> anyhow::Result<()>
 where
@@ -1634,6 +1383,10 @@ where
 {
     println!("Using custom training loop");
     tracing::info!("Using custom training loop");
+
+    if let Err(msg) = config.validate_lr_schedule() {
+        anyhow::bail!(msg);
+    }
 
     if config.forward_timing_enabled() {
         crate::forward_timing::enable_timing();
@@ -1650,6 +1403,40 @@ where
 
     // Create model
     let mut model: OXIModel<B> = OXIModel::new(&devices[0], &config);
+
+    let num_params = model.num_params();
+    println!("Model parameters: {num_params}");
+    tracing::info!("model_size: num_params={}", num_params);
+
+    // Resolve physical batch size. 0 means "auto": derive a safe batch from the
+    // parameter count so growing the model can't silently push the per-step
+    // working set past the MPS cliff (see auto_physical_batch_size).
+    let safe_batch = crate::config::auto_physical_batch_size(num_params);
+    if config.physical_batch_size == 0 {
+        config.physical_batch_size = safe_batch;
+        println!(
+            "Auto physical batch size: {} (num_params={})",
+            safe_batch, num_params
+        );
+        tracing::info!(
+            "auto_batch: physical_batch_size={} num_params={}",
+            safe_batch,
+            num_params
+        );
+    } else if cfg!(target_os = "macos") && config.physical_batch_size > safe_batch {
+        println!(
+            "WARNING: physical_batch_size={} exceeds the param-derived safe batch {} for this \
+             model size ({} params). LibTorch/MPS throughput collapses past its working-set \
+             limit (observed 4x slowdown). Consider --physical-batch-size={} or 0 for auto.",
+            config.physical_batch_size, safe_batch, num_params, safe_batch
+        );
+        tracing::warn!(
+            "auto_batch: physical_batch_size={} exceeds safe_batch={} (num_params={})",
+            config.physical_batch_size,
+            safe_batch,
+            num_params
+        );
+    }
 
     // Checkpoint directory: log_dir/model/ if log_dir is set, otherwise model/
     let checkpoint_dir: PathBuf = config
@@ -1955,14 +1742,6 @@ where
     let initial_lr = initial_adamw_lr;
     let muon_to_adamw_lr_ratio = initial_muon_lr / initial_adamw_lr;
     let embedding_to_adamw_lr_ratio = initial_embedding_lr / initial_adamw_lr;
-    let warmup_iterations = (config.warmup_multiplier * effective_batch_size as f64) as usize;
-    let lr_window_size = config
-        .lr_window_samples
-        .map(|samples| samples.div_ceil(effective_batch_size).max(4))
-        .unwrap_or(config.lr_window_size);
-    let lr_plateau_cooldown_iterations = config
-        .lr_plateau_cooldown_samples
-        .div_ceil(effective_batch_size);
     println!(
         "Effective batch size: {}, d_ref: {}, d: {}, adamw_dim_scale: {:.4}, muon_dim_scale: {:.4}",
         effective_batch_size,
@@ -1972,24 +1751,18 @@ where
         muon_dim_scale
     );
     println!(
-        "AdamW LR: {:.6}, Muon LR: {:.6} (ratio: {:.2}x), Embedding LR: {:.6} (ratio: {:.2}x), Warmup: {}",
+        "AdamW LR: {:.6}, Muon LR: {:.6} (ratio: {:.2}x), Embedding LR: {:.6} (ratio: {:.2}x), Warmup: {:.1}% of budget",
         initial_adamw_lr, initial_muon_lr, muon_to_adamw_lr_ratio,
-        initial_embedding_lr, embedding_to_adamw_lr_ratio, warmup_iterations
+        initial_embedding_lr, embedding_to_adamw_lr_ratio, config.warmup_fraction_clamped() * 100.0
     );
     println!(
-        "LR plateau: window={} steps (samples={:?}), threshold={:.3}, factor={:.3}, patience={}, cooldown={} steps (samples={})",
-        lr_window_size,
-        config.lr_window_samples,
-        config.lr_plateau_t_threshold,
-        config.lr_reduction_factor,
-        config.lr_plateau_patience,
-        lr_plateau_cooldown_iterations,
-        config.lr_plateau_cooldown_samples
-    );
-    println!(
-        "AdamW LR: {:.6}, Muon LR: {:.6} (ratio: {:.2}x), Embedding LR: {:.6} (ratio: {:.2}x), Warmup: {}",
-        initial_adamw_lr, initial_muon_lr, muon_to_adamw_lr_ratio,
-        initial_embedding_lr, embedding_to_adamw_lr_ratio, warmup_iterations
+        "LR schedule: WSD (warmup first {:.1}% of budget, decay over final {:.0}% of budget to lr_min={:.1e}, hold={}, budget: max_samples={:?} timeout={:?}s)",
+        config.warmup_fraction_clamped() * 100.0,
+        config.wsd_decay_fraction * 100.0,
+        config.lr_min,
+        config.lr_hold(),
+        config.max_samples,
+        config.timeout
     );
 
     // Create optimizers (5 groups: muon, adamw_decay+normal_lr, adamw_decay+high_lr, adamw_no_decay+normal_lr, adamw_no_decay+high_lr)
@@ -2057,7 +1830,7 @@ where
         .with_grad_clipping(grad_clipping)
         .init();
 
-    let mut gradnorm_state = GradNormState::new(&config);
+    let loss_weights = LossWeights::from_config(&config);
 
     if let Some(resume_dir) = resume_optimizer_dir.clone() {
         let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
@@ -2120,65 +1893,6 @@ where
                 OPT_NO_DECAY_HIGH_FILE_NAME
             );
         }
-
-        let gradnorm_path = resume_dir.join(GRADNORM_STATE_FILE_NAME);
-        if gradnorm_path.exists() {
-            match std::fs::read(&gradnorm_path) {
-                Ok(bytes) => {
-                    match bincode::serde::decode_from_slice::<GradNormState, _>(
-                        &bytes,
-                        bincode::config::standard(),
-                    ) {
-                        Ok((mut state, _)) => {
-                            println!("Loaded GradNorm state from {}", gradnorm_path.display());
-                            tracing::info!(
-                                "Loaded GradNorm state from {}",
-                                gradnorm_path.display()
-                            );
-                            state.reconcile_with_config(&config);
-                            if !config.gradnorm_enabled() {
-                                state.set_enabled(false);
-                                state.reset_weights_to_config(&config);
-                            }
-                            gradnorm_state = state;
-                        }
-                        Err(err) => {
-                            println!(
-                                "Warning: Failed to load GradNorm state from {}: {}",
-                                gradnorm_path.display(),
-                                err
-                            );
-                            tracing::warn!(
-                                "Failed to load GradNorm state from {}: {}",
-                                gradnorm_path.display(),
-                                err
-                            );
-                        }
-                    }
-                }
-                Err(err) => {
-                    println!(
-                        "Warning: Failed to read GradNorm state {}: {}",
-                        gradnorm_path.display(),
-                        err
-                    );
-                    tracing::warn!(
-                        "Failed to read GradNorm state {}: {}",
-                        gradnorm_path.display(),
-                        err
-                    );
-                }
-            }
-        } else {
-            println!(
-                "GradNorm state {} not found; continuing with fresh state",
-                GRADNORM_STATE_FILE_NAME
-            );
-            tracing::info!(
-                "GradNorm state {} not found; continuing with fresh state",
-                GRADNORM_STATE_FILE_NAME
-            );
-        }
     }
 
     // For streaming mode, we don't know total size upfront
@@ -2204,10 +1918,6 @@ where
     println!(
         "AdamW LR: {:.6}, Muon LR: {:.6}, Min LR: {}",
         initial_adamw_lr, initial_muon_lr, config.lr_min
-    );
-    println!(
-        "LR window: {}, LR plateau t-threshold: {:.2}, LR reduction factor: {}",
-        config.lr_window_size, config.lr_plateau_t_threshold, config.lr_reduction_factor
     );
 
     // ==================== LR RANGE FINDER MODE ====================
@@ -2292,7 +2002,6 @@ where
 
                 // Dispatch to workers
                 let device_splits = split_items_across_devices(&items, devices.len());
-                let gradnorm_weights = GradNormWeights::from_state(&gradnorm_state);
                 let mut active_workers_rf = Vec::new();
 
                 for (device_index, device_items) in device_splits.into_iter().enumerate() {
@@ -2303,7 +2012,7 @@ where
                         .get(device_index)
                         .send(WorkerCommand::Run(WorkerRequest {
                             items: device_items,
-                            weights: gradnorm_weights,
+                            weights: loss_weights,
                         }));
                     active_workers_rf.push(device_index);
                 }
@@ -2311,15 +2020,12 @@ where
                 // Collect grads and outputs for this micro-batch
                 let mut outputs: Vec<ChessOutput<B>> = Vec::new();
                 for device_index in active_workers_rf {
-                    if let Some(response) = device_workers.get(device_index).recv() {
-                        match response {
-                            WorkerResponse::Training { grads, output } => {
-                                let grads_main = grads.to_device(&devices[0], &model);
-                                grad_accumulator_rf.accumulate(&model, grads_main);
-                                outputs.push(output);
-                            }
-                            _ => {}
-                        }
+                    if let Some(WorkerResponse::Training { grads, output }) =
+                        device_workers.get(device_index).recv()
+                    {
+                        let grads_main = grads.to_device(&devices[0], &model);
+                        grad_accumulator_rf.accumulate(&model, grads_main);
+                        outputs.push(output);
                     }
                 }
 
@@ -2416,15 +2122,13 @@ where
     }
     // ==================== END LR RANGE FINDER ====================
 
-    let mut lr_scheduler = ReduceOnPlateauScheduler::new(
+    let mut lr_scheduler = WsdScheduler::new(
         initial_lr,
         config.lr_min,
-        config.lr_reduction_factor,
-        lr_window_size,
-        config.lr_plateau_t_threshold,
-        warmup_iterations,
-        config.lr_plateau_patience,
-        lr_plateau_cooldown_iterations,
+        config.warmup_fraction_clamped(),
+        config.wsd_decay_fraction,
+        config.max_samples,
+        config.timeout,
     );
 
     let mut loss_metric = LossMetric::new();
@@ -2443,7 +2147,7 @@ where
     let mut wdl_history = RollingMetric::new(SCORE_WINDOW);
     let mut gradient_norm_history = RollingMetric::new(SCORE_WINDOW);
     let mut iteration_speed_metric = IterationSpeedMetric::new();
-    let mut lr_metric = LrPlateauMetric::new();
+    let mut lr_metric = WsdLrMetric::new();
     let mut stage_metric = TrainingStageMetric::new();
     let metric_logger = MetricFileLogger::new(config.log_dir.as_deref());
 
@@ -2536,20 +2240,6 @@ where
             }
         }
 
-        if lr_scheduler.should_stop() {
-            println!(
-                "Training stopped: reached min LR (plateau: t < {:.2})",
-                config.lr_plateau_t_threshold
-            );
-            tracing::info!(
-                "EXIT_CONDITION: lr_min_reached at iteration {} (current_lr={:.2e}, min_lr={:.2e})",
-                loop_iteration,
-                lr_scheduler.get_lr(),
-                config.lr_min
-            );
-            break;
-        }
-
         if items_processed >= max_samples {
             println!(
                 "Training stopped: reached max_samples limit ({})",
@@ -2635,7 +2325,6 @@ where
 
         // Split batch across devices for parallel execution
         let device_splits = split_items_across_devices(&items_all, devices.len());
-        let gradnorm_weights = GradNormWeights::from_state(&gradnorm_state);
         let mut active_workers = Vec::new();
 
         for (device_index, device_items) in device_splits.into_iter().enumerate() {
@@ -2645,7 +2334,7 @@ where
 
             let request = WorkerRequest {
                 items: device_items,
-                weights: gradnorm_weights,
+                weights: loss_weights,
             };
 
             device_workers
@@ -2664,10 +2353,6 @@ where
                         let grads_main = grads.to_device(&devices[0], &model);
                         grad_accumulator.accumulate(&model, grads_main);
                         device_outputs.push(output);
-                    }
-                    WorkerResponse::GradNormProbe(_) => {
-                        // Probe responses should not be received during the training phase.
-                        continue;
                     }
                 }
             }
@@ -2701,23 +2386,20 @@ where
         );
 
         let t_post_main_loop = Instant::now();
-        gradnorm_state.record_batch_losses(iteration, &output);
 
-        // Record batch in ReduceOnPlateau scheduler using raw policy loss (so
-        // GradNorm weighting on other heads cannot prematurely trigger LR
-        // reductions).
-        let plateau_loss = {
+        // Log raw policy loss (un-reweighted) for cross-run comparison.
+        let raw_policy_loss = {
             let policy_loss_tensor = output
                 .raw_policy_loss
                 .clone()
                 .unwrap_or_else(|| output.base_policy_loss.clone());
             policy_loss_tensor.into_scalar().elem::<f32>() as f64
         };
-        metric_logger.log("plateau_loss", iteration, plateau_loss);
-        let _measurement_recorded = lr_scheduler.record_batch(plateau_loss);
+        metric_logger.log("raw_policy_loss", iteration, raw_policy_loss);
 
-        // Get current learning rate from scheduler
+        lr_scheduler.update(items_processed);
         current_lr = lr_scheduler.get_lr();
+        metric_logger.log("learning_rate", iteration, current_lr);
 
         // Update metrics metadata
         let metadata = MetricMetadata {
@@ -2813,26 +2495,6 @@ where
                 value: grad_norm_numeric,
             });
 
-            if gradnorm_state.should_update_weights(next_step) {
-                let probe_items = sample_gradnorm_items(&items_all, config.gradnorm_probe_size());
-                if !probe_items.is_empty() {
-                    let probe_device_index = if devices.len() > 1 { 1 } else { 0 };
-                    let probe_request = GradNormProbeRequest {
-                        items: probe_items,
-                        weights: GradNormWeights::from_state(&gradnorm_state),
-                    };
-                    device_workers
-                        .get(probe_device_index)
-                        .send(WorkerCommand::GradNormProbe(probe_request));
-
-                    if let Some(response) = device_workers.get(probe_device_index).recv() {
-                        if let WorkerResponse::GradNormProbe(results) = response {
-                            let _ = gradnorm_state.apply_probe_results(next_step, &results);
-                        }
-                    }
-                }
-            }
-
             // Apply different learning rates per optimizer group
             let adamw_lr = current_lr;
             let muon_lr = current_lr * muon_to_adamw_lr_ratio;
@@ -2876,8 +2538,6 @@ where
 
         let t_metrics_start = Instant::now();
         // Update each metric and send to renderer
-        let gradnorm_snapshot = gradnorm_state.status_snapshot();
-
         let t_loss = Instant::now();
         let loss_entry = loss_metric.update(&output.adapt(), &metadata);
         let loss_value = Numeric::value(&loss_metric);
@@ -2909,12 +2569,7 @@ where
 
         let t_policy = Instant::now();
         let mut policy_input: PolicyLossInput<B> = output.adapt();
-        if let Some(status) = gradnorm_snapshot
-            .iter()
-            .find(|status| status.task == GradNormTask::Policy)
-        {
-            policy_input = policy_input.with_grad_info(status.weight, status.last_grad_norm);
-        }
+        policy_input = policy_input.with_grad_info(loss_weights.policy, None);
         let policy_entry = policy_loss_metric.update(&policy_input, &metadata);
         let policy_value = Numeric::value(&policy_loss_metric);
         if let Some(value) = numeric_entry_value(&policy_value) {
@@ -2930,12 +2585,7 @@ where
 
         let t_value = Instant::now();
         let mut value_input: ValueLossInput<B> = output.adapt();
-        if let Some(status) = gradnorm_snapshot
-            .iter()
-            .find(|status| status.task == GradNormTask::Value)
-        {
-            value_input = value_input.with_grad_info(status.weight, status.last_grad_norm);
-        }
+        value_input = value_input.with_grad_info(loss_weights.value, None);
         let value_entry = value_loss_metric.update(&value_input, &metadata);
         let value_value = Numeric::value(&value_loss_metric);
         if let Some(value) = numeric_entry_value(&value_value) {
@@ -2951,12 +2601,7 @@ where
 
         let t_time_usage = Instant::now();
         let mut time_input: TimeUsageLossInput<B> = output.adapt();
-        if let Some(status) = gradnorm_snapshot
-            .iter()
-            .find(|status| status.task == GradNormTask::TimeUsage)
-        {
-            time_input = time_input.with_grad_info(status.weight, status.last_grad_norm);
-        }
+        time_input = time_input.with_grad_info(loss_weights.time, None);
         let _time_entry = time_usage_loss_metric.update(&time_input, &metadata);
         let time_value = Numeric::value(&time_usage_loss_metric);
         if let Some(value) = numeric_entry_value(&time_value) {
@@ -3170,199 +2815,6 @@ where
             }
         }
 
-        if output.retrieval_pair_count > 0.0 {
-            let retrieval_loss_kind = if config.retrieval_uses_mse() {
-                "MSE"
-            } else {
-                "BCE"
-            };
-            let retrieval_loss = output.retrieval_loss_f32 as f64;
-            let retrieval_pairs = output.retrieval_pair_count as f64;
-            let retrieval_positives = output.retrieval_positive_count as f64;
-            let retrieval_positive_sim = output.retrieval_positive_sim as f64;
-            let retrieval_negative_sim = output.retrieval_negative_sim as f64;
-            let retrieval_sim_gap = retrieval_positive_sim - retrieval_negative_sim;
-            let opening_family_match_rate = output.retrieval_opening_family_match_rate as f64;
-            let opening_family_pairs = output.retrieval_opening_family_pair_count as f64;
-            let opening_family_coverage = output.retrieval_opening_family_coverage as f64;
-            let retrieval_gradnorm = gradnorm_snapshot
-                .iter()
-                .find(|status| status.task == GradNormTask::Retrieval);
-
-            renderer.update_train(MetricState::Numeric {
-                name: format!("Retrieval Loss|{retrieval_loss_kind}"),
-                entry: SerializedEntry::new(
-                    format!("Retrieval {retrieval_loss_kind}: {retrieval_loss:.4}"),
-                    format!("{retrieval_loss:.4}"),
-                ),
-                value: NumericEntry::Value(retrieval_loss),
-            });
-            renderer.update_train(MetricState::Numeric {
-                name: "Retrieval Cosine|Positive".to_string(),
-                entry: SerializedEntry::new(
-                    format!("Positive: {retrieval_positive_sim:.4}"),
-                    format!("{retrieval_positive_sim:.4}"),
-                ),
-                value: NumericEntry::Value(retrieval_positive_sim),
-            });
-            renderer.update_train(MetricState::Numeric {
-                name: "Retrieval Cosine|Negative".to_string(),
-                entry: SerializedEntry::new(
-                    format!("Negative: {retrieval_negative_sim:.4}"),
-                    format!("{retrieval_negative_sim:.4}"),
-                ),
-                value: NumericEntry::Value(retrieval_negative_sim),
-            });
-            renderer.update_train(MetricState::Numeric {
-                name: "Retrieval Cosine|Gap".to_string(),
-                entry: SerializedEntry::new(
-                    format!("Gap: {retrieval_sim_gap:.4}"),
-                    format!("{retrieval_sim_gap:.4}"),
-                ),
-                value: NumericEntry::Value(retrieval_sim_gap),
-            });
-            if let Some(status) = retrieval_gradnorm {
-                let weight = status.weight as f64;
-                let weight_label = if status.enabled {
-                    "GradNorm Weight"
-                } else {
-                    "Fixed Weight"
-                };
-                renderer.update_train(MetricState::Numeric {
-                    name: format!("Retrieval Loss|{weight_label}"),
-                    entry: SerializedEntry::new(
-                        format!("Weight: {weight:.6}"),
-                        format!("{weight:.6}"),
-                    ),
-                    value: NumericEntry::Value(weight),
-                });
-                if status.enabled {
-                    metric_logger.log("retrieval_gradnorm_weight", iteration, weight);
-                    if let Some(grad_norm) = status.last_grad_norm {
-                        metric_logger.log("retrieval_gradnorm_grad", iteration, grad_norm as f64);
-                    }
-                } else {
-                    metric_logger.log("retrieval_fixed_weight", iteration, weight);
-                }
-            }
-
-            if opening_family_pairs > 0.0 {
-                renderer.update_train(MetricState::Numeric {
-                    name: "Retrieval Opening|Family Match".to_string(),
-                    entry: SerializedEntry::new(
-                        format!("Family match: {opening_family_match_rate:.3}"),
-                        format!("{opening_family_match_rate:.3}"),
-                    ),
-                    value: NumericEntry::Value(opening_family_match_rate),
-                });
-                renderer.update_train(MetricState::Numeric {
-                    name: "Retrieval Opening|Coverage".to_string(),
-                    entry: SerializedEntry::new(
-                        format!("Coverage: {opening_family_coverage:.3}"),
-                        format!("{opening_family_coverage:.3}"),
-                    ),
-                    value: NumericEntry::Value(opening_family_coverage),
-                });
-            }
-
-            metric_logger.log("retrieval_loss", iteration, retrieval_loss);
-            metric_logger.log("retrieval_pair_count", iteration, retrieval_pairs);
-            metric_logger.log("retrieval_positive_count", iteration, retrieval_positives);
-            metric_logger.log("retrieval_positive_sim", iteration, retrieval_positive_sim);
-            metric_logger.log("retrieval_negative_sim", iteration, retrieval_negative_sim);
-            metric_logger.log("retrieval_sim_gap", iteration, retrieval_sim_gap);
-            metric_logger.log(
-                "retrieval_opening_family_match_rate",
-                iteration,
-                opening_family_match_rate,
-            );
-            metric_logger.log(
-                "retrieval_opening_family_pair_count",
-                iteration,
-                opening_family_pairs,
-            );
-            metric_logger.log(
-                "retrieval_opening_family_coverage",
-                iteration,
-                opening_family_coverage,
-            );
-        }
-
-        if output.trunk_retrieval_pair_count > 0.0 {
-            let retrieval_loss_kind = if config.retrieval_uses_mse() {
-                "MSE"
-            } else {
-                "BCE"
-            };
-            let trunk_retrieval_loss = output.trunk_retrieval_loss_f32 as f64;
-            let trunk_retrieval_pairs = output.trunk_retrieval_pair_count as f64;
-            let trunk_retrieval_positives = output.trunk_retrieval_positive_count as f64;
-            let trunk_retrieval_positive_sim = output.trunk_retrieval_positive_sim as f64;
-            let trunk_retrieval_negative_sim = output.trunk_retrieval_negative_sim as f64;
-            let trunk_retrieval_sim_gap =
-                trunk_retrieval_positive_sim - trunk_retrieval_negative_sim;
-
-            renderer.update_train(MetricState::Numeric {
-                name: format!("Trunk Retrieval|{retrieval_loss_kind}"),
-                entry: SerializedEntry::new(
-                    format!("Trunk {retrieval_loss_kind}: {trunk_retrieval_loss:.4}"),
-                    format!("{trunk_retrieval_loss:.4}"),
-                ),
-                value: NumericEntry::Value(trunk_retrieval_loss),
-            });
-            renderer.update_train(MetricState::Numeric {
-                name: "Trunk Retrieval|Positive".to_string(),
-                entry: SerializedEntry::new(
-                    format!("Trunk positive: {trunk_retrieval_positive_sim:.4}"),
-                    format!("{trunk_retrieval_positive_sim:.4}"),
-                ),
-                value: NumericEntry::Value(trunk_retrieval_positive_sim),
-            });
-            renderer.update_train(MetricState::Numeric {
-                name: "Trunk Retrieval|Negative".to_string(),
-                entry: SerializedEntry::new(
-                    format!("Trunk negative: {trunk_retrieval_negative_sim:.4}"),
-                    format!("{trunk_retrieval_negative_sim:.4}"),
-                ),
-                value: NumericEntry::Value(trunk_retrieval_negative_sim),
-            });
-            renderer.update_train(MetricState::Numeric {
-                name: "Trunk Retrieval|Gap".to_string(),
-                entry: SerializedEntry::new(
-                    format!("Trunk gap: {trunk_retrieval_sim_gap:.4}"),
-                    format!("{trunk_retrieval_sim_gap:.4}"),
-                ),
-                value: NumericEntry::Value(trunk_retrieval_sim_gap),
-            });
-
-            metric_logger.log("trunk_retrieval_loss", iteration, trunk_retrieval_loss);
-            metric_logger.log(
-                "trunk_retrieval_pair_count",
-                iteration,
-                trunk_retrieval_pairs,
-            );
-            metric_logger.log(
-                "trunk_retrieval_positive_count",
-                iteration,
-                trunk_retrieval_positives,
-            );
-            metric_logger.log(
-                "trunk_retrieval_positive_sim",
-                iteration,
-                trunk_retrieval_positive_sim,
-            );
-            metric_logger.log(
-                "trunk_retrieval_negative_sim",
-                iteration,
-                trunk_retrieval_negative_sim,
-            );
-            metric_logger.log(
-                "trunk_retrieval_sim_gap",
-                iteration,
-                trunk_retrieval_sim_gap,
-            );
-        }
-
         let t_top1 = Instant::now();
         let _move_top1_entry = move_top1_metric.update(&output.adapt(), &metadata);
         let top1_metric_time = t_top1.elapsed();
@@ -3537,17 +2989,11 @@ where
             value: iteration_speed_value,
         });
 
-        let lr_plateau_input = LrPlateauInput::new(
-            current_lr,
-            lr_scheduler.t_statistic(),
-            lr_scheduler.relative_improvement(),
-            lr_scheduler.window_fill_ratio(),
-            lr_scheduler.num_reductions(),
-            config.lr_plateau_t_threshold,
-            lr_scheduler.is_warming_up(),
-            lr_scheduler.warmup_progress(),
-        );
-        let lr_entry = lr_metric.update(&lr_plateau_input, &metadata);
+        let wsd_lr_input = WsdLrInput {
+            lr: current_lr,
+            phase: lr_scheduler.phase(),
+        };
+        let lr_entry = lr_metric.update(&wsd_lr_input, &metadata);
         let lr_value = Numeric::value(&lr_metric);
         renderer.update_train(MetricState::Numeric {
             name: lr_metric.name().to_string(),
@@ -3643,7 +3089,6 @@ where
             save_training_state(
                 &model,
                 &config,
-                &gradnorm_state,
                 &optim_muon,
                 &optim_decay_normal,
                 &optim_decay_high,
@@ -3721,7 +3166,6 @@ where
     save_training_state(
         &model,
         &config,
-        &gradnorm_state,
         &optim_muon,
         &optim_decay_normal,
         &optim_decay_high,

@@ -23,7 +23,6 @@ use crate::{
 use crate::{
     config::{MAX_ELO, MAX_ELO_DIFF, MIN_CLOCK_TIME, MIN_ELO, MIN_PLY},
     moves::{mirror_fen, mirror_move},
-    opening_family_metric::opening_family_label_for_position,
 };
 
 fn is_pgn_path(path: &std::path::Path) -> bool {
@@ -62,14 +61,12 @@ pub struct PendingChessExample {
     pub outcome: f32,
     pub previous_fens: Vec<String>,
     pub previous_moves: Vec<String>,
-    pub future_moves: Vec<String>,
     pub time_remaining_self: u32,
     pub time_remaining_oppo: u32,
     pub time_used_for_move: Option<u32>,
     pub move_count: usize,
     pub turn: Color,
     pub material_imbalance_history: Vec<i32>,
-    pub opening_family_labels: Vec<String>,
 }
 
 /// PGN visitor that extracts training examples from games
@@ -98,7 +95,6 @@ pub struct PgnVisitor {
     previous_fens: VecDeque<BySide<String>>,
     previous_moves_uci: VecDeque<BySide<String>>, // UCI moves corresponding to previous_fens
     previous_material_imbalances: VecDeque<i32>,  // Material imbalance history for momentum
-    opening_family_labels: Vec<String>,
     max_examples_per_position: usize,
 }
 
@@ -140,7 +136,6 @@ impl PgnVisitor {
             previous_fens: VecDeque::new(),
             previous_moves_uci: VecDeque::new(),
             previous_material_imbalances: VecDeque::new(),
-            opening_family_labels: Vec::new(),
             moves: Vec::new(),
             previous_moves: Vec::new(),
             white_elo: None,
@@ -186,15 +181,11 @@ impl PgnVisitor {
         !self.pending_examples.is_empty()
     }
 
-    fn flush_pending_examples(&mut self, require_future_moves: bool) {
-        let required_future_moves = get_global_config().retrieval_continuation_plies();
+    fn flush_pending_examples(&mut self) {
         let mut still_pending = VecDeque::new();
 
         while let Some(pending_example) = self.pending_examples.pop_front() {
-            let has_required_future_moves =
-                pending_example.future_moves.len() >= required_future_moves;
-            let ready_to_emit = pending_example.time_used_for_move.is_some()
-                && (!require_future_moves || has_required_future_moves);
+            let ready_to_emit = pending_example.time_used_for_move.is_some();
             if ready_to_emit {
                 let emitted_move_count = pending_example.move_count + 1;
                 if emitted_move_count > MIN_PLY {
@@ -206,7 +197,6 @@ impl PgnVisitor {
                         outcome: pending_example.outcome,
                         previous_fens: pending_example.previous_fens,
                         previous_moves: pending_example.previous_moves,
-                        future_moves: pending_example.future_moves,
                         time_remaining_self: pending_example.time_remaining_self,
                         time_remaining_oppo: pending_example.time_remaining_oppo,
                         time_used_for_move: pending_example.time_used_for_move.unwrap_or(1),
@@ -214,7 +204,6 @@ impl PgnVisitor {
                         move_count: emitted_move_count,
                         material_imbalance_history: pending_example.material_imbalance_history,
                         is_puzzle: false,
-                        opening_family_labels: pending_example.opening_family_labels,
                     });
                 }
             } else {
@@ -236,7 +225,6 @@ impl Visitor for PgnVisitor {
         self.previous_fens.clear();
         self.previous_moves_uci.clear();
         self.previous_material_imbalances.clear();
-        self.opening_family_labels.clear();
         self.pending_examples.clear();
         self.white_elo = None;
         self.black_elo = None;
@@ -287,7 +275,7 @@ impl Visitor for PgnVisitor {
                                     Some(time_used_for_move.max(1) as u32);
                             }
                         };
-                        self.flush_pending_examples(true);
+                        self.flush_pending_examples();
 
                         match self.position.turn() {
                             Color::White => self.current_clock.black = Some(clock_seconds),
@@ -442,24 +430,9 @@ impl Visitor for PgnVisitor {
         };
 
         let config = get_global_config();
-        let future_move_limit = config.retrieval_continuation_plies();
-        for pending in &mut self.pending_examples {
-            if pending.future_moves.len() < future_move_limit {
-                let future_move = match pending.turn {
-                    Color::White => uci_move.clone(),
-                    Color::Black => mirrored_move.clone(),
-                };
-                pending.future_moves.push(future_move);
-            }
-        }
-        self.flush_pending_examples(true);
+        self.flush_pending_examples();
 
         let has_single_legal_move = self.position.legal_moves().len() == 1;
-        if let Some(label) = opening_family_label_for_position(&self.position) {
-            if !self.opening_family_labels.iter().any(|seen| seen == &label) {
-                self.opening_family_labels.push(label);
-            }
-        }
 
         let new_position = self.position.clone().play(chess_move).unwrap();
 
@@ -540,14 +513,12 @@ impl Visitor for PgnVisitor {
                     outcome,
                     previous_fens,
                     previous_moves,
-                    future_moves: Vec::new(),
                     time_remaining_oppo,
                     time_remaining_self,
                     time_used_for_move: Some(30),
                     move_count,
                     turn,
                     material_imbalance_history,
-                    opening_family_labels: self.opening_family_labels.clone(),
                 });
             } else {
                 self.pending_examples.push_back(PendingChessExample {
@@ -558,14 +529,12 @@ impl Visitor for PgnVisitor {
                     outcome,
                     previous_fens,
                     previous_moves,
-                    future_moves: Vec::new(),
                     time_remaining_oppo,
                     time_remaining_self,
                     time_used_for_move: None,
                     move_count,
                     turn,
                     material_imbalance_history,
-                    opening_family_labels: self.opening_family_labels.clone(),
                 });
             }
         }
@@ -610,7 +579,7 @@ impl Visitor for PgnVisitor {
     }
 
     fn end_game(&mut self) -> Self::Result {
-        self.flush_pending_examples(false);
+        self.flush_pending_examples();
     }
 }
 
@@ -1453,35 +1422,6 @@ mod tests {
     }
 
     #[test]
-    fn test_future_moves_are_attached_to_pgn_examples() {
-        let _config = create_test_config();
-        let pgn_content = r#"[Event "Test Game"]
-[White "Player1"]
-[Black "Player2"]
-[WhiteElo "1500"]
-[BlackElo "1600"]
-[TimeControl "600+0"]
-[Result "1-0"]
-
-1. e4 { [%clk 0:09:58] } 1... e5 { [%clk 0:09:57] }
-2. Nf3 { [%clk 0:09:56] } 2... Nc6 { [%clk 0:09:55] }
-3. Bb5 { [%clk 0:09:54] } 3... a6 { [%clk 0:09:53] } 1-0
-"#;
-
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let pgn_path = temp_dir.path().join("future_moves.pgn");
-        std::fs::write(&pgn_path, pgn_content).unwrap();
-
-        let examples = process_pgn_file(&pgn_path).unwrap();
-        let e4 = examples
-            .iter()
-            .find(|example| example.move_uci == "e2e4" && example.elo_self == 1500)
-            .expect("expected e4 example");
-
-        assert_eq!(&e4.future_moves[..4], ["e7e5", "g1f3", "b8c6", "f1b5"]);
-    }
-
-    #[test]
     #[ignore]
     fn test_pgn_processing_simple_game() {
         let config = create_test_config();
@@ -1658,7 +1598,6 @@ mod tests {
                 "e7e5".to_string(), // e5
                 "e2e4".to_string(), // e4
             ],
-            future_moves: vec![],
             time_remaining_self: 300,
             time_remaining_oppo: 300,
             time_used_for_move: 5,
@@ -1666,7 +1605,6 @@ mod tests {
             move_count: 5,
             material_imbalance_history: vec![0, 0, 0], // Starting position material imbalance is 0
             is_puzzle: false,
-            opening_family_labels: vec![],
         };
 
         // Verify the structure

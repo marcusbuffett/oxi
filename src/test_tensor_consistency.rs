@@ -183,7 +183,7 @@ mod tests {
             .reshape([1, 64, FEATURES_PER_TOKEN]);
 
         assert_eq!(
-            board_tensor.shape().dims,
+            board_tensor.dims(),
             [1, 64, FEATURES_PER_TOKEN],
             "Reshaped tensor should have correct dimensions"
         );

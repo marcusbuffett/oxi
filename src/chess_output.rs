@@ -33,11 +33,11 @@ pub struct ChessOutput<B: Backend> {
     pub base_value_loss: Tensor<B, 1>,
     /// Base (unweighted) time usage loss
     pub base_time_usage_loss: Tensor<B, 1>,
-    /// The auxiliary loss component (after GradNorm weighting)
+    /// The auxiliary loss component (after loss weighting)
     pub aux_loss: Tensor<B, 1>,
     /// Base (unweighted) auxiliary loss (mobility + material)
     pub base_aux_loss: Tensor<B, 1>,
-    /// The centipawn-loss calibration component (after GradNorm weighting)
+    /// The centipawn-loss calibration component (after loss weighting)
     pub calibration_loss: Tensor<B, 1>,
     /// Base (unweighted) centipawn-loss calibration loss
     pub base_calibration_loss: Tensor<B, 1>,
@@ -79,36 +79,6 @@ pub struct ChessOutput<B: Backend> {
     pub policy_regret_loss_f32: f32,
     /// Mean cp-loss of the model's argmax predicted move, bucketed by Elo skill band.
     pub argmax_cp_loss_by_elo: Vec<(String, f32)>,
-    /// Base (unweighted) retrieval embedding loss.
-    pub base_retrieval_loss: Tensor<B, 1>,
-    /// Weighted retrieval embedding loss that contributes to `loss`.
-    pub retrieval_loss: Tensor<B, 1>,
-    /// Scalar snapshot of the unweighted retrieval loss.
-    pub retrieval_loss_f32: f32,
-    /// Number of in-batch pairs used by the retrieval loss.
-    pub retrieval_pair_count: f32,
-    /// Number of positive/high-target pairs among the in-batch pairs.
-    pub retrieval_positive_count: f32,
-    /// Mean cosine similarity of positive/high-target retrieval pairs.
-    pub retrieval_positive_sim: f32,
-    /// Mean cosine similarity of negative/low-target retrieval pairs.
-    pub retrieval_negative_sim: f32,
-    /// Share of top retrieval neighbors with the same ECO-derived opening family.
-    pub retrieval_opening_family_match_rate: f32,
-    /// Number of labeled top-neighbor pairs used by the opening-family proxy.
-    pub retrieval_opening_family_pair_count: f32,
-    /// Fraction of batch positions that resolved to an ECO opening family.
-    pub retrieval_opening_family_coverage: f32,
-    /// Scalar snapshot of retrieval loss measured directly on normalized mean-pooled trunk.
-    pub trunk_retrieval_loss_f32: f32,
-    /// Number of in-batch pairs used by trunk retrieval metrics.
-    pub trunk_retrieval_pair_count: f32,
-    /// Number of positive/high-target pairs among trunk retrieval metrics.
-    pub trunk_retrieval_positive_count: f32,
-    /// Mean cosine similarity of positive/high-target pairs on normalized mean-pooled trunk.
-    pub trunk_retrieval_positive_sim: f32,
-    /// Mean cosine similarity of negative/low-target pairs on normalized mean-pooled trunk.
-    pub trunk_retrieval_negative_sim: f32,
 }
 
 impl<B: Backend> ChessOutput<B> {
@@ -121,7 +91,6 @@ impl<B: Backend> ChessOutput<B> {
         time_usage_loss: Tensor<B, 1>,
         aux_loss: Tensor<B, 1>,
         calibration_loss: Tensor<B, 1>,
-        retrieval_loss: Tensor<B, 1>,
         policy_output: Tensor<B, 2>,
         policy_targets: Tensor<B, 1, Int>,
         value_output: Tensor<B, 2>,
@@ -135,7 +104,6 @@ impl<B: Backend> ChessOutput<B> {
         let base_calibration_loss = calibration_loss.clone();
         let base_policy_regret_loss = loss.clone() * 0.0;
         let policy_regret_loss = loss.clone() * 0.0;
-        let base_retrieval_loss = retrieval_loss.clone();
 
         Self {
             loss,
@@ -146,8 +114,6 @@ impl<B: Backend> ChessOutput<B> {
             base_aux_loss,
             calibration_loss,
             base_calibration_loss,
-            retrieval_loss,
-            base_retrieval_loss,
             base_policy_loss,
             base_value_loss,
             base_time_usage_loss,
@@ -179,19 +145,6 @@ impl<B: Backend> ChessOutput<B> {
             policy_regret_loss,
             policy_regret_loss_f32: 0.0,
             argmax_cp_loss_by_elo: Vec::new(),
-            retrieval_loss_f32: 0.0,
-            retrieval_pair_count: 0.0,
-            retrieval_positive_count: 0.0,
-            retrieval_positive_sim: 0.0,
-            retrieval_negative_sim: 0.0,
-            retrieval_opening_family_match_rate: 0.0,
-            retrieval_opening_family_pair_count: 0.0,
-            retrieval_opening_family_coverage: 0.0,
-            trunk_retrieval_loss_f32: 0.0,
-            trunk_retrieval_pair_count: 0.0,
-            trunk_retrieval_positive_count: 0.0,
-            trunk_retrieval_positive_sim: 0.0,
-            trunk_retrieval_negative_sim: 0.0,
         }
     }
 
@@ -304,48 +257,6 @@ impl<B: Backend> ChessOutput<B> {
         self
     }
 
-    pub fn with_retrieval_metrics(
-        mut self,
-        base_retrieval_loss: Tensor<B, 1>,
-        retrieval_loss: Tensor<B, 1>,
-        retrieval_loss_f32: f32,
-        retrieval_pair_count: f32,
-        retrieval_positive_count: f32,
-        retrieval_positive_sim: f32,
-        retrieval_negative_sim: f32,
-        retrieval_opening_family_match_rate: f32,
-        retrieval_opening_family_pair_count: f32,
-        retrieval_opening_family_coverage: f32,
-    ) -> Self {
-        self.base_retrieval_loss = base_retrieval_loss;
-        self.retrieval_loss = retrieval_loss;
-        self.retrieval_loss_f32 = retrieval_loss_f32;
-        self.retrieval_pair_count = retrieval_pair_count;
-        self.retrieval_positive_count = retrieval_positive_count;
-        self.retrieval_positive_sim = retrieval_positive_sim;
-        self.retrieval_negative_sim = retrieval_negative_sim;
-        self.retrieval_opening_family_match_rate = retrieval_opening_family_match_rate;
-        self.retrieval_opening_family_pair_count = retrieval_opening_family_pair_count;
-        self.retrieval_opening_family_coverage = retrieval_opening_family_coverage;
-        self
-    }
-
-    pub fn with_trunk_retrieval_metrics(
-        mut self,
-        trunk_retrieval_loss_f32: f32,
-        trunk_retrieval_pair_count: f32,
-        trunk_retrieval_positive_count: f32,
-        trunk_retrieval_positive_sim: f32,
-        trunk_retrieval_negative_sim: f32,
-    ) -> Self {
-        self.trunk_retrieval_loss_f32 = trunk_retrieval_loss_f32;
-        self.trunk_retrieval_pair_count = trunk_retrieval_pair_count;
-        self.trunk_retrieval_positive_count = trunk_retrieval_positive_count;
-        self.trunk_retrieval_positive_sim = trunk_retrieval_positive_sim;
-        self.trunk_retrieval_negative_sim = trunk_retrieval_negative_sim;
-        self
-    }
-
     /// Get the total loss used for metrics display (sum of raw losses if available)
     /// This is the same calculation used by LossMetric
     pub fn total_loss(&self) -> Tensor<B, 1> {
@@ -361,7 +272,6 @@ impl<B: Backend> ChessOutput<B> {
                 + self.aux_loss.clone()
                 + self.calibration_loss.clone()
                 + self.policy_regret_loss.clone()
-                + self.retrieval_loss.clone()
         } else {
             // Fallback to combined loss
             self.loss.clone()
@@ -382,8 +292,6 @@ impl<B: Backend> ChessOutput<B> {
             base_aux_loss: self.base_aux_loss.detach(),
             calibration_loss: self.calibration_loss.detach(),
             base_calibration_loss: self.base_calibration_loss.detach(),
-            retrieval_loss: self.retrieval_loss.detach(),
-            base_retrieval_loss: self.base_retrieval_loss.detach(),
             policy_output: self.policy_output.detach(),
             policy_targets: self.policy_targets,
             value_output: self.value_output.detach(),
@@ -412,19 +320,6 @@ impl<B: Backend> ChessOutput<B> {
             policy_regret_loss: self.policy_regret_loss.detach(),
             policy_regret_loss_f32: self.policy_regret_loss_f32,
             argmax_cp_loss_by_elo: self.argmax_cp_loss_by_elo,
-            retrieval_loss_f32: self.retrieval_loss_f32,
-            retrieval_pair_count: self.retrieval_pair_count,
-            retrieval_positive_count: self.retrieval_positive_count,
-            retrieval_positive_sim: self.retrieval_positive_sim,
-            retrieval_negative_sim: self.retrieval_negative_sim,
-            retrieval_opening_family_match_rate: self.retrieval_opening_family_match_rate,
-            retrieval_opening_family_pair_count: self.retrieval_opening_family_pair_count,
-            retrieval_opening_family_coverage: self.retrieval_opening_family_coverage,
-            trunk_retrieval_loss_f32: self.trunk_retrieval_loss_f32,
-            trunk_retrieval_pair_count: self.trunk_retrieval_pair_count,
-            trunk_retrieval_positive_count: self.trunk_retrieval_positive_count,
-            trunk_retrieval_positive_sim: self.trunk_retrieval_positive_sim,
-            trunk_retrieval_negative_sim: self.trunk_retrieval_negative_sim,
         }
     }
 }
@@ -524,24 +419,11 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
         let calibration_policy_signed_error_by_elo = self.calibration_policy_signed_error_by_elo;
         let policy_regret_loss_f32 = self.policy_regret_loss_f32;
         let argmax_cp_loss_by_elo = self.argmax_cp_loss_by_elo;
-        let retrieval_loss_f32 = self.retrieval_loss_f32;
-        let retrieval_pair_count = self.retrieval_pair_count;
-        let retrieval_positive_count = self.retrieval_positive_count;
-        let retrieval_positive_sim = self.retrieval_positive_sim;
-        let retrieval_negative_sim = self.retrieval_negative_sim;
-        let retrieval_opening_family_match_rate = self.retrieval_opening_family_match_rate;
-        let retrieval_opening_family_pair_count = self.retrieval_opening_family_pair_count;
-        let retrieval_opening_family_coverage = self.retrieval_opening_family_coverage;
-        let trunk_retrieval_loss_f32 = self.trunk_retrieval_loss_f32;
-        let trunk_retrieval_pair_count = self.trunk_retrieval_pair_count;
-        let trunk_retrieval_positive_count = self.trunk_retrieval_positive_count;
-        let trunk_retrieval_positive_sim = self.trunk_retrieval_positive_sim;
-        let trunk_retrieval_negative_sim = self.trunk_retrieval_negative_sim;
         let raw_policy_loss = self.raw_policy_loss;
         let raw_value_loss = self.raw_value_loss;
         let raw_time_usage_loss = self.raw_time_usage_loss;
 
-        let [loss, policy_loss, value_loss, time_usage_loss, aux_loss, calibration_loss, policy_regret_loss, base_policy_regret_loss, retrieval_loss, base_retrieval_loss, policy_output, policy_targets, value_output, value_targets, legal_moves_mask] =
+        let [loss, policy_loss, value_loss, time_usage_loss, aux_loss, calibration_loss, policy_regret_loss, base_policy_regret_loss, policy_output, policy_targets, value_output, value_targets, legal_moves_mask] =
             Transaction::default()
                 .register(self.loss)
                 .register(self.policy_loss)
@@ -551,8 +433,6 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
                 .register(self.calibration_loss)
                 .register(self.policy_regret_loss)
                 .register(self.base_policy_regret_loss)
-                .register(self.retrieval_loss)
-                .register(self.base_retrieval_loss)
                 .register(self.policy_output)
                 .register(self.policy_targets)
                 .register(self.value_output)
@@ -598,13 +478,11 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             time_usage_loss: Tensor::from_data(time_usage_loss.clone(), device),
             aux_loss: Tensor::from_data(aux_loss.clone(), device),
             calibration_loss: Tensor::from_data(calibration_loss.clone(), device),
-            retrieval_loss: Tensor::from_data(retrieval_loss.clone(), device),
             base_policy_loss: Tensor::from_data(policy_loss, device),
             base_value_loss: Tensor::from_data(value_loss, device),
             base_time_usage_loss: Tensor::from_data(time_usage_loss, device),
             base_aux_loss: Tensor::from_data(aux_loss, device),
             base_calibration_loss: Tensor::from_data(calibration_loss, device),
-            base_retrieval_loss: Tensor::from_data(base_retrieval_loss, device),
             policy_output: Tensor::from_data(policy_output, device),
             policy_targets: Tensor::from_data(policy_targets, device),
             value_output: Tensor::from_data(value_output, device),
@@ -633,19 +511,6 @@ impl<B: Backend> ItemLazy for ChessOutput<B> {
             policy_regret_loss: Tensor::from_data(policy_regret_loss, device),
             policy_regret_loss_f32,
             argmax_cp_loss_by_elo,
-            retrieval_loss_f32,
-            retrieval_pair_count,
-            retrieval_positive_count,
-            retrieval_positive_sim,
-            retrieval_negative_sim,
-            retrieval_opening_family_match_rate,
-            retrieval_opening_family_pair_count,
-            retrieval_opening_family_coverage,
-            trunk_retrieval_loss_f32,
-            trunk_retrieval_pair_count,
-            trunk_retrieval_positive_count,
-            trunk_retrieval_positive_sim,
-            trunk_retrieval_negative_sim,
         }
     }
 }

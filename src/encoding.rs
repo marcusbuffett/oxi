@@ -368,8 +368,9 @@ fn pawn_structure_features(pos: &Chess, square: Square) -> (bool, bool, bool) {
         (friendly_pawns & Bitboard::from_file(File::new(file_idx as u32))).count() > 1;
     let doubled = has_same_file_pawn_same_color_other_rank;
 
-    // Backward: no friendly pawn on adjacent files behind this pawn (towards own home rank)
-    // Build mask of adjacent files and intersect with friendly pawns, then scan ranks
+    // Backward: no friendly pawn on adjacent files at the same rank or behind
+    // this pawn (towards own home rank). A same-rank neighbor counts as
+    // support, so pawns in their initial structure are not flagged.
     let adj_files_mask = if file_idx > 0 && file_idx < 7 {
         Bitboard::from_file(File::new((file_idx - 1) as u32))
             | Bitboard::from_file(File::new((file_idx + 1) as u32))
@@ -384,13 +385,13 @@ fn pawn_structure_features(pos: &Chess, square: Square) -> (bool, bool, bool) {
         let r = sq.rank() as i32;
         match piece.color {
             Color::White => {
-                if r < rank_idx {
+                if r <= rank_idx {
                     found_support = true;
                     break;
                 }
             }
             Color::Black => {
-                if r > rank_idx {
+                if r >= rank_idx {
                     found_support = true;
                     break;
                 }

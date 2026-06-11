@@ -9,7 +9,7 @@ pub struct PolicyLossInput<B: Backend> {
     pub loss: Tensor<B, 1>,
     /// Raw policy loss (before uncertainty weighting)
     pub raw_loss: Option<Tensor<B, 1>>,
-    /// Current GradNorm weight applied to this loss
+    /// Current loss weight applied to this loss
     pub grad_weight: Option<f32>,
     /// Last measured gradient norm for this head
     pub grad_norm: Option<f32>,

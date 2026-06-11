@@ -135,9 +135,11 @@ mod tests {
                 items_processed: 1,
                 items_total: 1,
             },
-            epoch: 0,
-            epoch_total: 1,
-            iteration: 0,
+            global_progress: Progress {
+                items_processed: 1,
+                items_total: 1,
+            },
+            iteration: Some(0),
             lr: None,
         };
         let entry = metric.update(&input, &metadata);
@@ -182,9 +184,11 @@ mod tests {
                 items_processed: 1,
                 items_total: 1,
             },
-            epoch: 0,
-            epoch_total: 1,
-            iteration: 0,
+            global_progress: Progress {
+                items_processed: 1,
+                items_total: 1,
+            },
+            iteration: Some(0),
             lr: None,
         };
         metric.update(&input, &metadata);
@@ -219,9 +223,11 @@ mod tests {
                 items_processed: 1,
                 items_total: 1,
             },
-            epoch: 0,
-            epoch_total: 1,
-            iteration: 0,
+            global_progress: Progress {
+                items_processed: 1,
+                items_total: 1,
+            },
+            iteration: Some(0),
             lr: None,
         };
         metric.update(&WdlAccuracyInput::new(outputs1, targets1), &metadata);
