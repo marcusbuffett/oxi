@@ -1,28 +1,62 @@
-# Oxi - Human-like Chess Engine
+# Oxi — Human-like Chess Engine
 
-Oxi models human decision making in chess across the full rating spectrum. To our knowledge, it is the most accurate to human play chess AI in the world. The stack is built in Rust on top of the Burn ML framework and ships end-to-end tooling for data acquisition, training, evaluation, and analysis.
+Oxi predicts the move a *human* would play — conditioned on their rating, their opponent's rating, the clock, and the phase of the game — rather than the best move. It powers [Chessbook](https://chessbook.com)'s human-like bot opponents and the learnability scoring that decides which opening moves are worth teaching. Built in Rust on the [Burn](https://burn.dev) ML framework, end to end: data acquisition, training, evaluation, and inference.
 
-## Highlights
-- State-of-the-art human move prediction accuracy with Elo-aware conditioning and timing signals.
-- Dual-stream board encoder with learned gating between token features and global context.
-- Smolgen dynamic positional attention with Peri-LN residual routing (14 layers by default).
-- Multi-task heads for policy (64x76 moves), value (win/draw/loss), auxiliary side information, and time usage, each with calibrated uncertainty estimates.
-- Adaptive training loop with GradNorm balancing, cosine schedules, curriculum sampling, and a Ratatui dashboard for live metrics.
+## Current accuracy
 
-## Requirements
-- Rust 1.75 or newer (install via `rustup`).
-- Cargo build tooling and a working C++ toolchain (needed for LibTorch).
-- libtorch (CPU, CUDA, or Metal) libraries. Burn will download a matching build automatically; follow the [Burn docs](https://tracel-ai.github.io/burn/) if you need to pin a specific version.
-- Optional but recommended: a modern NVIDIA GPU with CUDA 12+ (Linux) or Apple Silicon with Metal (macOS). Training on CPU works for smoke tests but is prohibitively slow for large-scale runs.
-- `zstd` CLI utilities if you plan to inspect downloaded PGN archives manually.
+A full-scale training run is in progress on an H100 (policy cross-entropy only). Mid-run numbers as of step ~17.7k:
+
+- **Top-1 accuracy: 54.7%** — predicting the exact move played by humans rated 1000–3000, across all game phases — and still climbing.
+
+We'll update this with final held-out numbers when the run completes.
+
+## Architecture
+
+A 320-dim, 16-layer, 10-head transformer over the 64 squares of the board (~scaled up from the previous production model's 192/8/6).
+
+**Board encoding.** Each square is a token with 65 hand-engineered features:
+
+| Group | Count | Contents |
+|-------|-------|----------|
+| Piece identity | 12 | One-hot piece/color |
+| Tactical | 22 | Attackers by role for both sides, attacker counts/material, pins, pin targets, hanging pieces, square control |
+| Positional | 25 | Legal-move targets, pawn structure, weak squares, open files, passed pawns, square color, rank/file one-hots |
+| Misc | 2 | En passant target, castling rights |
+| Recency | 4 | From/to squares of each side's last move, with exponential decay over the previous 5 positions |
+
+The tactical and positional groups are the interesting part: rather than making the network rediscover attack maps and pawn structure from piece placement alone, we compute them with [shakmaty](https://github.com/niklasf/shakmaty) at encode time. Humans see threats and structure directly; the features let the model do the same.
+
+**Global conditioning.** 11 scalar features — both players' Elo, remaining clock time and time ratios for both sides, increment, move number, material imbalance, piece count, and a puzzle flag — are injected into *every* transformer block via FiLM-conditioned RmsNorm: each block's normalization gamma/beta are generated from the globals. This is how one model plays like a 1100 or a 2300 depending on who it's imitating — rating conditioning modulates the entire trunk, not just a head.
+
+**Attention.** Smolgen-style dynamic attention (from the Leela Chess Zero lineage): per-position attention biases are generated from the board content itself, since "which squares should attend to each other" in chess depends on the position, not on fixed distances. Pre-norm residual blocks, RmsNorm, SiLU MLPs.
+
+**Heads.**
+
+- **Policy** — factorized into source-square and target-square projections (64×76 move slots including underpromotions), FiLM-modulated by the globals, with a dedicated transformer block before the head. Masked by legality.
+- **Value** — win/draw/loss logits, with its own pre-head transformer block.
+- **Time usage** — predicts what fraction of the remaining clock the player spends, supervised from PGN clock annotations.
+- **Centipawn loss** — predicts the regret distribution of the played move (how badly a player at this rating errs here).
+- **Auxiliary** — side info, mobility, material, and from/to-square heads that exist purely to shape trunk representations.
+
+Each head owns a learnable log-variance for uncertainty-weighted multi-task loss balancing. (The current run trains with policy CE only; the multi-task machinery is used for full runs.)
+
+## Position embeddings & retrieval
+
+The trunk doubles as a position-similarity encoder: mean-pooled trunk activations are extracted as position embeddings, then **ZCA-whitened** (`compute-whitening` produces a `whitening.json` served alongside the model). Raw transformer embeddings are anisotropic — all positions live in a narrow cone dominated by a few directions (side to move, material, phase) — so cosine similarity barely discriminates. Whitening centers the cone and equalizes variance, spreading the cosine range across the informative directions. Chessbook uses these embeddings for KNN retrieval over a user's repertoire when scoring move learnability.
+
+## Training
+
+- **Data**: Lichess standard rated games (streamed `.pgn.zst`, no decompression to disk), filtered to 1000–3000 Elo, ≤200 rating gap, sane time controls, ≥30s on the clock per move. Elo and ply sampling balance the curriculum across rating bands and game phases.
+- **Schedule**: warmup–stable–decay (WSD) learning rate. The stable phase can run open-ended (`--lr-hold`); the decay phase can be applied later by resuming the checkpoint with a budget (`--max-samples` or `--timeout`). This replaced GradNorm + reduce-on-plateau — simpler and easier to reason about mid-run.
+- **Monitoring**: a Ratatui TUI with live loss/accuracy/calibration breakdowns, plus per-metric logs under `metrics_logs/` for remote runs.
 
 ## Quickstart
 
 ```bash
-# 1. Fetch all standard rated Lichess PGNs since 2022 (downloads .pgn.zst files).
+# 1. Fetch standard rated Lichess PGNs (downloads .pgn.zst files)
 cargo run --release --bin oxi -- download-all --output-dir data/pgn
 
-# 2. Train with conservative batch sizes (adjust paths/flags as needed).
+# 2. Train
 cargo run --release --bin oxi -- train \
   --data-path data/pgn \
   --batch-size 1024 \
@@ -30,59 +64,59 @@ cargo run --release --bin oxi -- train \
   --num-devices 1
 ```
 
-- Add `--resume` to continue from the latest checkpoint in `checkpoints/model/`.
-- The TUI opens by default; disable it on headless systems with `--disable-tui`.
+- `--resume` continues from the latest checkpoint in `checkpoints/model/`.
+- `--disable-tui` for headless systems.
 
-## Command Reference
-- `train`: Full training loop. Accepts PGN directories or single files via `--data-path`. Supports curriculum controls such as `--max-samples`, `--enable-elo-sampling`, and `--checkpoint-interval`.
-- `download-all`: Concurrently downloads every standard rated Lichess archive (2022-present) to a target directory.
-- `download-pgn`: Fetches a single month (`--year`, `--month`) to a directory. Use `--local` to limit to one file for testing.
-- `filter-confident`: Generates a curated dataset of high-confidence positions for bootstrapping or curriculum learning.
-- `process-pgn`: Placeholder for pre-processing PGNs into serialized datasets (implementation pending).
-- `evaluate`: Stub for offline evaluation; currently prints a placeholder message.
-- `download`: Planned pretrained model fetcher; prints available tags today (`blitz`, `rapid`, `classical`).
-- `inference`: Loads a checkpoint and prepares the inference engine. Printing of ranked moves is under construction; for now, integrate directly via `InferenceEngine` in code.
+## Command reference
 
-Run any subcommand with `--help` for the full list of options and defaults.
+| Command | Purpose |
+|---------|---------|
+| `train` | Full training loop (PGN dirs/files via `--data-path`; curriculum, checkpointing, LR flags) |
+| `download-all` / `download-pgn` | Fetch Lichess monthly archives (all since 2022, or one month) |
+| `download-tcec` / `download-puzzles` | Engine games and Lichess puzzle data |
+| `create-eval-set` / `quick-eval` / `evaluate` | Build held-out eval sets and score checkpoints |
+| `compute-whitening` | Estimate the ZCA whitening transform for retrieval embeddings |
+| `create-calibration-db` | Build the centipawn-loss calibration database |
+| `inference` | Load a checkpoint and run the inference engine |
 
-## Training Notes
-- Data ingestion understands both plain `.pgn` and `.pgn.zst` files. Archives are streamed and decoded on the fly, so you can keep compressed files on disk.
-- Elo and ply sampling are enabled by default to emphasize underrepresented positions while keeping a balanced curriculum.
-- Checkpoints live under `checkpoints/model/` along with the AdamW optimizer shards and GradNorm state. Copy the entire directory when you want to resume elsewhere.
-- The training loop reports detailed accuracy breakdowns (move accuracy, grad norms, value calibration) in the TUI as well as in `train.log`.
-- Time usage targets are supervised from the PGN clock data; make sure your source PGNs include clock annotations if you want the time head to learn meaningful patterns.
+Run any subcommand with `--help` for full options.
 
-## Model Architecture
-- Board encoding splits each square into per-token features (piece identity, tactical, positional, misc) and recency channels for the latest moves.
-- Optional convolutional stem (disabled by default) can be enabled with `--conv-layers`.
-- Token and global streams are normalized separately, then fused through learned gates before entering the transformer stack.
-- Attention layers use Smolgen dynamic position-dependent biases with Peri-LN (post-residual normalization) in both the attention and MLP paths.
-- Policy head outputs 64x76 logits covering from-to square pairs (including underpromotions), masked by legality during training.
-- Value head predicts win/draw/loss logits and shares pooled representations with the side-information and time-usage heads.
-- Each head owns a learnable log-variance parameter, enabling adaptive loss weighting that works hand-in-hand with GradNorm.
+## Requirements
+
+- Rust 1.75+, a C++ toolchain, and libtorch (Burn downloads a matching build; see the [Burn docs](https://burn.dev) to pin one).
+- An NVIDIA GPU with CUDA 12+ (Linux) or Apple Silicon with Metal (macOS). CPU works for smoke tests only.
 
 ## Development
-- Build: `cargo build --release`
-- Tests: `cargo test`
-- Formatter: `cargo fmt`
-- Clippy: `cargo clippy --all-targets -- -D warnings`
 
-Logs land in `train.log`, `error.log`, and the rotating sheets under `sheet-*.txt` for detailed timeline snapshots.
+```bash
+cargo build --release
+cargo test
+cargo fmt
+cargo clippy --all-targets -- -D warnings
 
-## Project Layout
+# Compare CPU inference latency across architectures
+cargo test --release --features backend-tch --test model_size_bench -- --ignored --nocapture
+```
+
+## Project layout
+
 ```
 oxi/
-|-- src/
-|   |-- main.rs                # Unified CLI entry point
-|   |-- config.rs              # Training/inference configuration and defaults
-|   |-- custom_training.rs     # End-to-end training loop and metrics
-|   |-- model.rs               # OXIModel definition and multi-head outputs
-|   |-- relative_position_transformer.rs
-|   |-- dataset.rs             # PGN ingestion and feature encoding
-|   |-- inference.rs           # Inference engine used by the CLI and tests
-|   |-- encoding.rs, moves.rs  # Chess-specific feature engineering
-|   `-- ...                    # Metrics, schedulers, GradNorm utilities
-|-- tests/                     # Integration tests and tensor sanity checks
-|-- checkpoints/               # Training outputs (gitignored)
-`-- Cargo.toml
+├── src/
+│   ├── main.rs                          # CLI entry point
+│   ├── config.rs                        # Unified config + feature constants
+│   ├── custom_training.rs               # Training loop and metrics
+│   ├── model.rs                         # OXIModel and multi-head outputs
+│   ├── relative_position_transformer.rs # Transformer blocks, FiLM RmsNorm
+│   ├── smolgen.rs                       # Dynamic attention weight generation
+│   ├── factorized_policy.rs             # Source/target-factorized policy head
+│   ├── encoding.rs, move_encoding.rs    # Board/move feature engineering
+│   ├── dataset.rs, pgn_processor.rs     # PGN ingestion and batching
+│   ├── inference.rs                     # Inference engine
+│   ├── whitening.rs                     # ZCA whitening for retrieval embeddings
+│   ├── wsd_scheduler.rs                 # Warmup-stable-decay LR schedule
+│   └── ...                              # Metrics, TUI, calibration
+├── tests/                               # Integration tests, tensor checks, benchmarks
+├── checkpoints/                         # Training outputs (gitignored)
+└── Cargo.toml
 ```
