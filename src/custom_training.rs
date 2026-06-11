@@ -1616,7 +1616,7 @@ where
     }
 
     // Set up streaming iterator for human games
-    let pgn_iter: Box<dyn Iterator<Item = ChessExample>> = if data_path.is_dir() {
+    let mut pgn_iter: Box<dyn Iterator<Item = ChessExample>> = if data_path.is_dir() {
         println!(
             "Streaming data from PGN directory: {:?} (shuffle buffer: {})",
             data_path, config.shuffle_buffer_size
@@ -1628,6 +1628,18 @@ where
             data_path
         );
     };
+
+    // Honor --skip in streaming mode (previously it was silently ignored here —
+    // only the non-streaming loader applied it). The skipped examples still
+    // have to be parsed out of the PGN stream, so large skips take a while;
+    // prefer pointing --data-path at unconsumed archives when possible.
+    if let Some(skip) = config.skip.filter(|&n| n > 0) {
+        println!(
+            "Skipping first {skip} streamed examples (--skip); this parses through them and can take a while"
+        );
+        tracing::info!("Skipping first {skip} streamed examples (--skip)");
+        pgn_iter = Box::new(pgn_iter.skip(skip));
+    }
 
     // Set up puzzle iterator if puzzle sampling is enabled
     let puzzle_ratio = config.puzzle_sampling_ratio;
