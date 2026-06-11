@@ -15,7 +15,10 @@
 //! Clocks are reconstructed from `moves-seconds` (per-move think time derived
 //! from Lichess `%clk` annotations): a player's remaining time before their
 //! k-th move is `base - sum(their prior think times) + increment * (k - 1)`,
-//! mirroring how the training pipeline reads `%clk` directly.
+//! mirroring how the training pipeline reads `%clk` directly. The sub-30s
+//! rule is a truncation, not a per-move filter: the first time the side to
+//! move is under 30 seconds, the rest of the game is dropped. With this rule
+//! the position count matches the paper's 884,049 exactly.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -129,9 +132,9 @@ fn build_game_items(
     let mut uci_moves: Vec<String> = Vec::new();
     // Remaining clock for each side before their next move.
     let mut clocks = [base_time, base_time];
+    stats.plies_total += moves.len();
 
     for (ply, (&mv_str, &seconds)) in moves.iter().zip(&game.moves_seconds).enumerate() {
-        stats.plies_total += 1;
         let pos = positions.last().unwrap().clone();
         let side = ply % 2; // 0 = white
         let mover_clock = clocks[side];
@@ -140,11 +143,16 @@ fn build_game_items(
         let uci: UciMove = mv_str.parse().ok()?;
         let chess_move = uci.to_move(&pos).ok()?;
 
+        // The test set truncates each game the first time the side to move
+        // has under `min_clock` seconds — everything after is excluded, even
+        // if increments bring the clock back up. This (with skip_plies = 10)
+        // reproduces the paper's 884,049 positions exactly.
+        if mover_clock < params.min_clock {
+            stats.excluded_clock += moves.len() - ply;
+            break;
+        }
         let included = if ply < params.skip_plies {
             stats.excluded_opening += 1;
-            false
-        } else if mover_clock < params.min_clock {
-            stats.excluded_clock += 1;
             false
         } else {
             true
