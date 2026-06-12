@@ -883,7 +883,7 @@ fn main() -> Result<()> {
         positions.len()
     );
 
-    let device = <InferenceBackend as burn::tensor::backend::Backend>::Device::default();
+    let device = burn::tensor::Device::<InferenceBackend>::default();
     let config = load_config_from_model_dir(&model_dir)?;
     println!(
         "Loaded config: embed_dim={}, num_layers={}, num_heads={}",

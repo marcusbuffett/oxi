@@ -1,21 +1,10 @@
-use shakmaty::{Bitboard, Chess, Color, EnPassantMode, File, Position, Role, Square};
+use shakmaty::{Chess, Color, Position, Role, Square};
 
 use crate::config::{
     BOARD_FEATURES_PER_TOKEN, FEATURES_PER_TOKEN, HISTORY_DECAY, MISC_FEATURES,
     PIECE_IDENTITY_FEATURES, POSITIONAL_FEATURES, PREVIOUS_POSITIONS, RECENCY_FEATURES,
     TACTICAL_FEATURES,
 };
-
-const OPEN_DIRECTIONS: [(i32, i32); 8] = [
-    (0, 1),   // N
-    (0, -1),  // S
-    (1, 0),   // E
-    (-1, 0),  // W
-    (1, 1),   // NE
-    (-1, 1),  // NW
-    (1, -1),  // SE
-    (-1, -1), // SW
-];
 
 pub fn encode_position(
     pos: &Chess,
@@ -64,17 +53,7 @@ pub fn encode_position(
         }
     }
 
-    let ep_square = pos.ep_square(EnPassantMode::Legal);
     let board = pos.board();
-    let mut pinned_to: [Option<Square>; 64] = [None; 64];
-    let mut pin_targets = [false; 64];
-    for square in Square::ALL {
-        let pinned = is_piece_pinned(pos, square);
-        pinned_to[square as usize] = pinned;
-        if let Some(target_sq) = pinned {
-            pin_targets[target_sq as usize] = true;
-        }
-    }
 
     for square in Square::ALL {
         let mut feature_idx = 0;
@@ -82,31 +61,13 @@ pub fn encode_position(
 
         // Current position features
         let piece = board.piece_at(square);
-        let ep_active = if Some(square) == ep_square { 1.0 } else { 0.0 };
         let castling_right = if pos.castles().castling_rights().contains(square) {
             1.0
         } else {
             0.0
         };
-        let pinned_to_square = pinned_to[square as usize];
-        let absolute_pin = pinned_to_square
-            .and_then(|target_sq| board.piece_at(target_sq))
-            .map_or(0.0, |target_piece| {
-                if target_piece.role == Role::King {
-                    1.0
-                } else {
-                    0.0
-                }
-            });
-        let is_pin_target = pin_targets[square as usize];
         let is_hanging = is_piece_hanging(pos, square);
-        let has_pinned_def = has_pinned_defender(pos, square, &pinned_to);
-        let is_passed = is_passed_pawn(pos, square);
         let legal_moves_norm = normalized_legal_moves_for_square(pos, square);
-        let (isolated, backward, doubled) = pawn_structure_features(pos, square);
-        let weak_white_square = is_weak_square(pos, square, Color::White);
-        let weak_black_square = is_weak_square(pos, square, Color::Black);
-        let open_file = is_open_file(pos, square);
         let control_value = calculate_square_control(pos, square);
 
         let mut attacker_features = [[0.0f32; 8]; 2];
@@ -155,16 +116,7 @@ pub fn encode_position(
             }
             tactical_offset += 8;
         }
-        tokens[square_idx + feature_idx + tactical_offset] =
-            if pinned_to_square.is_some() { 1.0 } else { 0.0 };
-        tactical_offset += 1;
-        tokens[square_idx + feature_idx + tactical_offset] = absolute_pin;
-        tactical_offset += 1;
-        tokens[square_idx + feature_idx + tactical_offset] = if is_pin_target { 1.0 } else { 0.0 };
-        tactical_offset += 1;
         tokens[square_idx + feature_idx + tactical_offset] = if is_hanging { 1.0 } else { 0.0 };
-        tactical_offset += 1;
-        tokens[square_idx + feature_idx + tactical_offset] = if has_pinned_def { 1.0 } else { 0.0 };
         tactical_offset += 1;
         tokens[square_idx + feature_idx + tactical_offset] = control_value;
         tactical_offset += 1;
@@ -183,25 +135,6 @@ pub fn encode_position(
         // Positional group
         let mut positional_offset = 0;
         tokens[square_idx + feature_idx + positional_offset] = legal_moves_norm;
-        positional_offset += 1;
-        tokens[square_idx + feature_idx + positional_offset] = if isolated { 1.0 } else { 0.0 };
-        positional_offset += 1;
-        tokens[square_idx + feature_idx + positional_offset] = if backward { 1.0 } else { 0.0 };
-        positional_offset += 1;
-        tokens[square_idx + feature_idx + positional_offset] = if doubled { 1.0 } else { 0.0 };
-        positional_offset += 1;
-        tokens[square_idx + feature_idx + positional_offset] =
-            if weak_white_square { 1.0 } else { 0.0 };
-        positional_offset += 1;
-        tokens[square_idx + feature_idx + positional_offset] =
-            if weak_black_square { 1.0 } else { 0.0 };
-        positional_offset += 1;
-        tokens[square_idx + feature_idx + positional_offset] = if open_file { 1.0 } else { 0.0 };
-        positional_offset += 1;
-        tokens[square_idx + feature_idx + positional_offset] = if is_passed { 1.0 } else { 0.0 };
-        positional_offset += 1;
-        tokens[square_idx + feature_idx + positional_offset] =
-            if square.is_dark() { 1.0 } else { 0.0 };
         positional_offset += 1;
 
         let rank_base = square_idx + feature_idx + positional_offset;
@@ -226,8 +159,6 @@ pub fn encode_position(
 
         // Misc group
         let mut misc_offset = 0;
-        tokens[square_idx + feature_idx + misc_offset] = ep_active;
-        misc_offset += 1;
         tokens[square_idx + feature_idx + misc_offset] = castling_right;
         misc_offset += 1;
         debug_assert_eq!(misc_offset, MISC_FEATURES, "Misc group offset mismatch");
@@ -248,6 +179,25 @@ pub fn encode_position(
         tokens[square_idx + feature_idx] = black_to[sidx].clamp(0.0, 1.0);
         feature_idx += 1;
         debug_assert_eq!(RECENCY_FEATURES, 4);
+
+        // History occupancy planes (Maia-3 style): 12 piece one-hots for each
+        // of the past PREVIOUS_POSITIONS positions, most recent first.
+        // Positions are in the same (possibly mirrored) frame as the current
+        // board. Plies before the game start are all-zero.
+        for h in 0..PREVIOUS_POSITIONS {
+            let base = square_idx + feature_idx + h * PIECE_IDENTITY_FEATURES;
+            if let Some(prev) = previous_positions.get(h) {
+                if let Some(prev_piece) = prev.board().piece_at(square) {
+                    let piece_offset = prev_piece.role as usize - 1;
+                    let color_offset = match prev_piece.color {
+                        Color::White => 0,
+                        Color::Black => 6,
+                    };
+                    tokens[base + color_offset + piece_offset] = 1.0;
+                }
+            }
+        }
+        feature_idx += crate::config::HISTORY_OCCUPANCY_FEATURES;
 
         if feature_idx != FEATURES_PER_TOKEN {
             assert!(
@@ -335,130 +285,6 @@ fn normalized_legal_moves_for_square(pos: &Chess, square: Square) -> f32 {
     ((count as f32) / 20.0).clamp(0.0, 1.0)
 }
 
-/// Determine pawn structure features for a pawn on the given square
-/// Returns (isolated, backward, doubled)
-fn pawn_structure_features(pos: &Chess, square: Square) -> (bool, bool, bool) {
-    let board = pos.board();
-    let Some(piece) = board.piece_at(square) else {
-        return (false, false, false);
-    };
-    if piece.role != Role::Pawn {
-        return (false, false, false);
-    }
-    let friendly_pawns = board.pawns() & board.by_color(piece.color);
-
-    let file_idx = square.file() as i32; // 0..7
-    let rank_idx = square.rank() as i32; // 0..7
-
-    // Isolated: no pawns on adjacent files (any rank) of the same color
-    let mut has_adjacent_file_pawn_same_color = false;
-    for adj_file in [file_idx - 1, file_idx + 1] {
-        if adj_file < 0 || adj_file > 7 {
-            continue;
-        }
-        if (friendly_pawns & Bitboard::from_file(File::new(adj_file as u32))).count() > 0 {
-            has_adjacent_file_pawn_same_color = true;
-            break;
-        }
-    }
-    let isolated = !has_adjacent_file_pawn_same_color;
-
-    // Doubled: another pawn of same color on same file (different rank)
-    let has_same_file_pawn_same_color_other_rank =
-        (friendly_pawns & Bitboard::from_file(File::new(file_idx as u32))).count() > 1;
-    let doubled = has_same_file_pawn_same_color_other_rank;
-
-    // Backward: no friendly pawn on adjacent files at the same rank or behind
-    // this pawn (towards own home rank). A same-rank neighbor counts as
-    // support, so pawns in their initial structure are not flagged.
-    let adj_files_mask = if file_idx > 0 && file_idx < 7 {
-        Bitboard::from_file(File::new((file_idx - 1) as u32))
-            | Bitboard::from_file(File::new((file_idx + 1) as u32))
-    } else if file_idx > 0 {
-        Bitboard::from_file(File::new((file_idx - 1) as u32))
-    } else {
-        Bitboard::from_file(File::new((file_idx + 1) as u32))
-    };
-    let adjacent_friendly_pawns = friendly_pawns & adj_files_mask;
-    let mut found_support = false;
-    for sq in adjacent_friendly_pawns.into_iter() {
-        let r = sq.rank() as i32;
-        match piece.color {
-            Color::White => {
-                if r <= rank_idx {
-                    found_support = true;
-                    break;
-                }
-            }
-            Color::Black => {
-                if r >= rank_idx {
-                    found_support = true;
-                    break;
-                }
-            }
-        }
-    }
-    let backward = !found_support;
-
-    (isolated, backward, doubled)
-}
-
-/// Determine if a square is a "weak square" for the given color.
-/// A square is weak for a color IFF for the file on either side,
-/// there is (no pawn OR the pawn is further advanced than the square).
-/// "Further advanced" for white means lower rank (closer to rank 1).
-/// "Further advanced" for black means higher rank (closer to rank 8).
-fn is_weak_square(pos: &Chess, square: Square, color: Color) -> bool {
-    let board = pos.board();
-    let pawns = board.pawns() & board.by_color(color);
-    let square_rank = square.rank() as i32;
-    let square_file = square.file() as i32;
-
-    // Do not count trivial weak squares on unreachable-support ranks:
-    // - For White: ranks 1 and 2 (indices 0,1)
-    // - For Black: ranks 7 and 8 (indices 6,7)
-    match color {
-        Color::White if square_rank <= 1 => return false,
-        Color::Black if square_rank >= 6 => return false,
-        _ => {}
-    }
-
-    // Check adjacent files (left and right)
-    let adjacent_files = [square_file - 1, square_file + 1];
-
-    for adj_file in adjacent_files {
-        if adj_file < 0 || adj_file > 7 {
-            continue; // Skip invalid files
-        }
-
-        // Get all pawns of the given color on this adjacent file
-        let file_mask = Bitboard::from_file(File::new(adj_file as u32));
-        let pawns_on_file = pawns & file_mask;
-
-        let has_defending_pawn = pawns_on_file.into_iter().any(|pawn_square| {
-            let pawn_rank = pawn_square.rank() as i32;
-            match color {
-                Color::White => pawn_rank < square_rank, // White pawn is more advanced (lower rank)
-                Color::Black => pawn_rank > square_rank, // Black pawn is more advanced (higher rank)
-            }
-        });
-
-        if has_defending_pawn {
-            return false;
-        }
-    }
-
-    // If we get here, there are defending pawns on both adjacent files
-    true
-}
-
-/// Determine if the file of the given square is open (no pawns of either color on it)
-fn is_open_file(pos: &Chess, square: Square) -> bool {
-    let board = pos.board();
-    let file_mask = Bitboard::from_file(square.file());
-    ((board.pawns() & file_mask).count()) == 0
-}
-
 fn opposite_color(color: Color) -> Color {
     match color {
         Color::White => Color::Black,
@@ -510,196 +336,6 @@ fn is_piece_hanging(pos: &Chess, square: Square) -> bool {
     false
 }
 
-/// Detects pieces with illusory defense: defended by a pinned piece that can't recapture.
-fn has_pinned_defender(pos: &Chess, square: Square, pinned_squares: &[Option<Square>; 64]) -> bool {
-    let board = pos.board();
-    let Some(piece) = board.piece_at(square) else {
-        return false;
-    };
-
-    let defenders = board.attacks_to(square, piece.color, board.occupied());
-
-    for defender_sq in defenders {
-        if defender_sq == square {
-            continue;
-        }
-
-        if let Some(pinned_to) = pinned_squares[defender_sq as usize] {
-            let (defender_file, defender_rank) =
-                (defender_sq.file() as i32, defender_sq.rank() as i32);
-            let (target_file, target_rank) = (square.file() as i32, square.rank() as i32);
-            let (pinned_to_file, pinned_to_rank) =
-                (pinned_to.file() as i32, pinned_to.rank() as i32);
-
-            let pin_direction = (
-                (pinned_to_file - defender_file).signum(),
-                (pinned_to_rank - defender_rank).signum(),
-            );
-            let capture_direction = (
-                (target_file - defender_file).signum(),
-                (target_rank - defender_rank).signum(),
-            );
-
-            let capture_along_pin_ray = pin_direction == capture_direction
-                || pin_direction == (-capture_direction.0, -capture_direction.1);
-
-            if !capture_along_pin_ray {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn is_passed_pawn(pos: &Chess, square: Square) -> bool {
-    let board = pos.board();
-    let Some(piece) = board.piece_at(square) else {
-        return false;
-    };
-
-    if piece.role != Role::Pawn {
-        return false;
-    }
-
-    let enemy_color = opposite_color(piece.color);
-    let enemy_pawns = board.pawns() & board.by_color(enemy_color);
-
-    let file_idx = square.file() as i32;
-    let rank_idx = square.rank() as i32;
-
-    for df in -1..=1 {
-        let file = file_idx + df;
-        if file < 0 || file > 7 {
-            continue;
-        }
-
-        let file_mask = Bitboard::from_file(File::new(file as u32));
-        let pawns_on_file = enemy_pawns & file_mask;
-
-        for pawn_sq in pawns_on_file.into_iter() {
-            let pawn_rank = pawn_sq.rank() as i32;
-            match piece.color {
-                Color::White if pawn_rank > rank_idx => return false,
-                Color::Black if pawn_rank < rank_idx => return false,
-                _ => {}
-            }
-        }
-    }
-
-    true
-}
-
-/// Determine if the piece on the given square is pinned to its own king.
-/// A piece is pinned if, along a straight line from its king, there is exactly
-/// one friendly piece (the candidate), and beyond it on the same ray there is
-/// an enemy sliding piece (rook/bishop/queen) compatible with that ray.
-/// The king is never considered a pinned piece.
-fn is_piece_pinned(pos: &Chess, square: Square) -> Option<Square> {
-    let board = pos.board();
-    let Some(piece) = board.piece_at(square) else {
-        return None;
-    };
-
-    if piece.role == Role::King {
-        return None;
-    }
-
-    let color = piece.color;
-
-    for &(dx, dy) in OPEN_DIRECTIONS.iter() {
-        let Some(pinned_to_sq) = first_piece_along(board, square, dx, dy) else {
-            continue;
-        };
-
-        let Some(pinned_to_piece) = board.piece_at(pinned_to_sq) else {
-            continue;
-        };
-
-        if pinned_to_piece.color != color {
-            continue;
-        }
-
-        if pinned_to_piece.role != Role::King {
-            // Only treat this as a pin if moving exposes a strictly more valuable piece.
-            let pinned_value = get_piece_value(piece.role);
-            let shield_value = get_piece_value(pinned_to_piece.role);
-            if shield_value <= pinned_value {
-                continue;
-            }
-        }
-
-        if role_moves_in_direction(piece.role, (dx, dy)) {
-            continue;
-        }
-
-        let Some(pinner_sq) = first_piece_along(board, square, -dx, -dy) else {
-            continue;
-        };
-
-        let Some(pinner_piece) = board.piece_at(pinner_sq) else {
-            continue;
-        };
-
-        if pinner_piece.color == color {
-            continue;
-        }
-
-        if !pinner_can_attack_direction(pinner_piece.role, (dx, dy)) {
-            continue;
-        }
-
-        return Some(pinned_to_sq);
-    }
-
-    None
-}
-
-fn first_piece_along(board: &shakmaty::Board, origin: Square, dx: i32, dy: i32) -> Option<Square> {
-    let mut file = origin.file() as i32 + dx;
-    let mut rank = origin.rank() as i32 + dy;
-
-    while file >= 0 && file < 8 && rank >= 0 && rank < 8 {
-        let idx = (rank * 8 + file) as u32;
-        let sq = Square::new(idx);
-        if board.piece_at(sq).is_some() {
-            return Some(sq);
-        }
-        file += dx;
-        rank += dy;
-    }
-
-    None
-}
-
-fn role_moves_in_direction(role: Role, direction: (i32, i32)) -> bool {
-    let (dx, dy) = direction;
-    let is_cardinal = dx == 0 || dy == 0;
-    let is_diagonal = dx != 0 && dy != 0;
-
-    match role {
-        Role::Bishop => is_diagonal,
-        Role::Rook => is_cardinal,
-        Role::Queen => true,
-        Role::King => true,
-        Role::Pawn => false,
-        Role::Knight => false,
-    }
-}
-
-fn pinner_can_attack_direction(role: Role, direction: (i32, i32)) -> bool {
-    let (dx, dy) = direction;
-    let is_cardinal = dx == 0 || dy == 0;
-    let is_diagonal = dx != 0 && dy != 0;
-
-    match role {
-        Role::Queen => true,
-        Role::Rook => is_cardinal,
-        Role::Bishop => is_diagonal,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,30 +355,6 @@ mod tests {
             let square = Square::from_str(square).expect("Valid square");
             let control = calculate_square_control(&pos, square);
             formatted_output += &format!("{}: {:.6}\n", square, control);
-        }
-
-        insta::assert_snapshot!(formatted_output);
-    }
-
-    #[test]
-    fn test_weak_square() {
-        let fen = "r4rk1/pppqb1pp/1nn1bp2/4p3/8/2NP1NP1/PP1BPPBP/2RQR1K1 w - - 0 12";
-        let fen_parsed: Fen = fen.parse().expect("Valid FEN");
-        let pos: Chess = fen_parsed
-            .into_position(shakmaty::CastlingMode::Standard)
-            .expect("Valid position");
-        let mut formatted_output = String::new();
-        for square in ["d7", "d2"] {
-            for color in [Color::White, Color::Black] {
-                let square = Square::from_str(square).expect("Valid square");
-                let is_weak_square = is_weak_square(&pos, square, color);
-                let color_str = match color {
-                    Color::White => "White",
-                    Color::Black => "Black",
-                };
-                formatted_output +=
-                    &format!("{} weak for {}: {}\n", square, color_str, is_weak_square);
-            }
         }
 
         insta::assert_snapshot!(formatted_output);
@@ -897,50 +509,6 @@ mod tests {
         }
 
         println!("Empty move history test passed!");
-    }
-
-    #[test]
-    fn test_pinned_logic_and_king_not_pinned() {
-        // Position: White king on c1, white knight on b2, black bishop on a3 -> knight on b2 is pinned
-        // FEN components:
-        // - h8 black king
-        // - a3 black bishop
-        // - b2 white knight
-        // - c1 white king
-        let fen = "7k/8/8/8/8/b7/1N6/2K5 w - - 0 1";
-        let fen_parsed: Fen = fen.parse().expect("Valid FEN");
-        let pos: Chess = fen_parsed
-            .into_position(shakmaty::CastlingMode::Standard)
-            .expect("Valid position");
-
-        let e2 = Square::from_str("b2").unwrap();
-        let e1 = Square::from_str("c1").unwrap();
-
-        let pinned_target = is_piece_pinned(&pos, e2);
-        let expected_target = Square::from_str("c1").unwrap();
-        assert_eq!(
-            pinned_target,
-            Some(expected_target),
-            "Knight on b2 should be pinned to c1"
-        );
-        assert!(
-            is_piece_pinned(&pos, e1).is_none(),
-            "King should never be considered pinned"
-        );
-
-        // Now test a case where the side is in check by a knight; unrelated pieces should not be marked pinned
-        // Position: White king e1, white rook a1, black knight c2 (checking e1)
-        let fen2 = "8/1k6/8/8/8/8/2n5/R3K3 w - - 0 1";
-        let fen_parsed2: Fen = fen2.parse().expect("Valid FEN");
-        let pos2: Chess = fen_parsed2
-            .into_position(shakmaty::CastlingMode::Standard)
-            .expect("Valid position");
-
-        let a1 = Square::from_str("a1").unwrap();
-        assert!(
-            is_piece_pinned(&pos2, a1).is_none(),
-            "Rook on a1 should not be marked pinned just because king is in check"
-        );
     }
 
     #[test]
@@ -1237,49 +805,5 @@ mod tests {
         println!("Total time: {:?}", elapsed);
         println!("Per position: {:?}", per_position);
         println!("Positions/sec: {:.0}", positions_per_sec);
-    }
-
-    #[test]
-    fn test_has_pinned_defender() {
-        // Position: Black rook a3 "defended" by pawn b4, but pawn is pinned to queen b6 by rook b1
-        // Tactic: Qxa3, bxa3??, Rxb6 wins the queen
-        let fen = "7k/8/1q6/8/1p6/r7/1Q6/1R2K3 w - - 0 1";
-        let fen_parsed: Fen = fen.parse().expect("Valid FEN");
-        let pos: Chess = fen_parsed
-            .into_position(shakmaty::CastlingMode::Standard)
-            .expect("Valid position");
-
-        let mut pinned_to: [Option<Square>; 64] = [None; 64];
-        for square in Square::ALL {
-            pinned_to[square as usize] = is_piece_pinned(&pos, square);
-        }
-
-        let mut output = String::new();
-
-        let b4 = Square::from_str("b4").unwrap();
-        let b6 = Square::from_str("b6").unwrap();
-        let a3 = Square::from_str("a3").unwrap();
-        let b2 = Square::from_str("b2").unwrap();
-        let b1 = Square::from_str("b1").unwrap();
-
-        output += &format!("b4 pawn pinned to: {:?}\n", pinned_to[b4 as usize]);
-        output += &format!(
-            "a3 rook has_pinned_defender: {}\n",
-            has_pinned_defender(&pos, a3, &pinned_to)
-        );
-        output += &format!(
-            "b6 queen has_pinned_defender: {}\n",
-            has_pinned_defender(&pos, b6, &pinned_to)
-        );
-        output += &format!(
-            "b2 queen has_pinned_defender: {}\n",
-            has_pinned_defender(&pos, b2, &pinned_to)
-        );
-        output += &format!(
-            "b1 rook has_pinned_defender: {}\n",
-            has_pinned_defender(&pos, b1, &pinned_to)
-        );
-
-        insta::assert_snapshot!(output);
     }
 }
