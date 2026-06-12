@@ -1,4 +1,4 @@
-use shakmaty::{Chess, Color, Position, Role, Square};
+use shakmaty::{Bitboard, Chess, Color, Position, Role, Square};
 
 use crate::config::{
     BOARD_FEATURES_PER_TOKEN, FEATURES_PER_TOKEN, HISTORY_DECAY, MISC_FEATURES,
@@ -69,6 +69,10 @@ pub fn encode_position(
         let is_hanging = is_piece_hanging(pos, square);
         let legal_moves_norm = normalized_legal_moves_for_square(pos, square);
         let control_value = calculate_square_control(pos, square);
+        let see_white_initiates = static_exchange_eval(pos, square, Color::White);
+        let see_black_initiates = static_exchange_eval(pos, square, Color::Black);
+        let (xray_white_count, xray_white_material) = xray_attackers(pos, square, Color::White);
+        let (xray_black_count, xray_black_material) = xray_attackers(pos, square, Color::Black);
 
         let mut attacker_features = [[0.0f32; 8]; 2];
         for (color_idx, color) in [Color::White, Color::Black].iter().enumerate() {
@@ -119,6 +123,27 @@ pub fn encode_position(
         tokens[square_idx + feature_idx + tactical_offset] = if is_hanging { 1.0 } else { 0.0 };
         tactical_offset += 1;
         tokens[square_idx + feature_idx + tactical_offset] = control_value;
+        tactical_offset += 1;
+        // SEE: graded capture outcome (capturer's perspective, pawns / 9)
+        tokens[square_idx + feature_idx + tactical_offset] =
+            (see_white_initiates.unwrap_or(0) as f32 / 9.0).clamp(-1.0, 1.0);
+        tactical_offset += 1;
+        tokens[square_idx + feature_idx + tactical_offset] =
+            (see_black_initiates.unwrap_or(0) as f32 / 9.0).clamp(-1.0, 1.0);
+        tactical_offset += 1;
+        // X-ray attackers (count, material) per side, same normalization as
+        // the direct attacker channels
+        tokens[square_idx + feature_idx + tactical_offset] =
+            (xray_white_count as f32 / 6.0).clamp(0.0, 1.0);
+        tactical_offset += 1;
+        tokens[square_idx + feature_idx + tactical_offset] =
+            (xray_white_material / 24.0).clamp(0.0, 1.0);
+        tactical_offset += 1;
+        tokens[square_idx + feature_idx + tactical_offset] =
+            (xray_black_count as f32 / 6.0).clamp(0.0, 1.0);
+        tactical_offset += 1;
+        tokens[square_idx + feature_idx + tactical_offset] =
+            (xray_black_material / 24.0).clamp(0.0, 1.0);
         tactical_offset += 1;
 
         debug_assert_eq!(
@@ -292,6 +317,108 @@ fn opposite_color(color: Color) -> Color {
     }
 }
 
+/// Standard piece values for static exchange evaluation, in pawns.
+fn see_value(role: Role) -> i32 {
+    match role {
+        Role::Pawn => 1,
+        Role::Knight => 3,
+        Role::Bishop => 3,
+        Role::Rook => 5,
+        Role::Queen => 9,
+        Role::King => 100,
+    }
+}
+
+/// Static exchange evaluation: net material gain, in pawns, for
+/// `attacker_color` initiating the capture sequence on `square`. Each side
+/// recaptures with its least valuable attacker; removing a capturer from the
+/// occupancy reveals x-ray backup automatically (`attacks_to` is
+/// occupancy-parameterized); either side may stand pat. The king joins only
+/// when the opponent has no defender left. Returns None when there is no
+/// enemy piece on the square or no attacker.
+pub fn static_exchange_eval(pos: &Chess, square: Square, attacker_color: Color) -> Option<i32> {
+    let board = pos.board();
+    let target = board.piece_at(square)?;
+    if target.color == attacker_color {
+        return None;
+    }
+
+    let mut occupied = board.occupied();
+    let mut captured_value = see_value(target.role);
+    let mut side = attacker_color;
+    let mut gains: Vec<i32> = Vec::with_capacity(8);
+
+    loop {
+        let attackers = board.attacks_to(square, side, occupied) & occupied;
+        let mut least: Option<(Square, Role)> = None;
+        for sq in attackers {
+            if let Some(piece) = board.piece_at(sq) {
+                if least.map_or(true, |(_, role)| see_value(piece.role) < see_value(role)) {
+                    least = Some((sq, piece.role));
+                }
+            }
+        }
+        let Some((from_sq, role)) = least else { break };
+
+        if role == Role::King {
+            let mut without_king = occupied;
+            without_king.toggle(from_sq);
+            let defenders =
+                board.attacks_to(square, opposite_color(side), without_king) & without_king;
+            if !defenders.is_empty() {
+                break;
+            }
+        }
+
+        gains.push(captured_value);
+        captured_value = see_value(role);
+        occupied.toggle(from_sq);
+        side = opposite_color(side);
+    }
+
+    if gains.is_empty() {
+        return None;
+    }
+
+    // Speculative running totals, then backward negamax with standing pat.
+    let mut spec = gains.clone();
+    for i in 1..spec.len() {
+        spec[i] = gains[i] - spec[i - 1];
+    }
+    for i in (1..spec.len()).rev() {
+        spec[i - 1] = -std::cmp::max(-spec[i - 1], spec[i]);
+    }
+    Some(spec[0])
+}
+
+/// Count and material of `color`'s sliders that attack `square` through
+/// exactly one intervening piece: batteries (own piece in front), pins and
+/// skewers (enemy piece in front), and discovered-attack potential. Direct
+/// attackers (zero blockers) are excluded — they live in the regular
+/// attacker channels.
+pub fn xray_attackers(pos: &Chess, square: Square, color: Color) -> (usize, f32) {
+    use shakmaty::attacks;
+    let board = pos.board();
+    let occupied = board.occupied();
+    let by_color = board.by_color(color);
+    let rook_like = (board.by_role(Role::Rook) | board.by_role(Role::Queen)) & by_color;
+    let bishop_like = (board.by_role(Role::Bishop) | board.by_role(Role::Queen)) & by_color;
+    let snipers = (attacks::rook_attacks(square, Bitboard::EMPTY) & rook_like)
+        | (attacks::bishop_attacks(square, Bitboard::EMPTY) & bishop_like);
+
+    let mut count = 0usize;
+    let mut material = 0.0f32;
+    for sniper in snipers {
+        if (attacks::between(square, sniper) & occupied).count() == 1 {
+            if let Some(piece) = board.piece_at(sniper) {
+                count += 1;
+                material += get_piece_value(piece.role);
+            }
+        }
+    }
+    (count, material)
+}
+
 fn attacker_can_move_to(board: &shakmaty::Board, attacker_sq: Square, target_sq: Square) -> bool {
     let mut board_clone = board.clone();
     let Some(attacker_piece) = board_clone.remove_piece_at(attacker_sq) else {
@@ -341,6 +468,78 @@ mod tests {
     use super::*;
     use shakmaty::fen::Fen;
     use std::str::FromStr;
+
+    fn parse_fen(fen: &str) -> Chess {
+        fen.parse::<Fen>()
+            .expect("valid FEN")
+            .into_position(shakmaty::CastlingMode::Standard)
+            .expect("valid position")
+    }
+
+    #[test]
+    fn test_see_simple_hanging_pawn() {
+        // White queen attacks an undefended black pawn on d5.
+        let pos = parse_fen("4k3/8/8/3p4/8/8/3Q4/4K3 w - - 0 1");
+        assert_eq!(
+            static_exchange_eval(&pos, Square::D5, Color::White),
+            Some(1),
+            "undefended pawn: clean win of 1"
+        );
+        assert_eq!(
+            static_exchange_eval(&pos, Square::D5, Color::Black),
+            None,
+            "black can't capture its own pawn"
+        );
+    }
+
+    #[test]
+    fn test_see_defended_pawn_bad_for_queen() {
+        // Black pawn on d5 defended by a pawn on e6; only white attacker is the queen.
+        let pos = parse_fen("4k3/8/4p3/3p4/8/8/3Q4/4K3 w - - 0 1");
+        assert_eq!(
+            static_exchange_eval(&pos, Square::D5, Color::White),
+            Some(-8),
+            "QxP, PxQ: win 1, lose 9"
+        );
+    }
+
+    #[test]
+    fn test_see_knight_takes_defended_queen() {
+        // Black queen on d5 defended by pawn e6; white knight on c3 can take.
+        let pos = parse_fen("4k3/8/4p3/3q4/8/2N5/8/4K3 w - - 0 1");
+        assert_eq!(
+            static_exchange_eval(&pos, Square::D5, Color::White),
+            Some(6),
+            "NxQ, PxN: win 9, lose 3"
+        );
+    }
+
+    #[test]
+    fn test_see_xray_recapture_through_battery() {
+        // The Complex Sicilian Probe blunder square: white Qb2 with Rb1
+        // behind it. A black rook landing on b3 is captured by the queen,
+        // and the rook's recapture is backed by the x-ray rook.
+        let pos = parse_fen("6k1/5p1p/1q2p1p1/p3P3/1p3P2/1r2b2P/1Q2N1P1/1R3K2 w - - 2 34");
+        assert_eq!(
+            static_exchange_eval(&pos, Square::B3, Color::White),
+            Some(5),
+            "Qxb3 wins the rook; Qxb3 recapture is covered by Rb1 x-ray"
+        );
+    }
+
+    #[test]
+    fn test_xray_battery_and_blocked_ray() {
+        // Probe position: Qb2 directly covers b3, Rb1 covers it only by x-ray.
+        let pos = parse_fen("6k1/5p1p/1q2p1p1/p3P3/1p3P2/r3b2P/1Q2N1P1/1R3K2 b - - 1 33");
+        let (count, material) = xray_attackers(&pos, Square::B3, Color::White);
+        assert_eq!(count, 1, "Rb1 x-rays b3 through Qb2");
+        assert_eq!(material as i32, 5);
+
+        // No black slider x-rays b3 (queen on b6 attacks it directly through
+        // nothing; b4 pawn blocks the file with two pieces between for b8).
+        let (b_count, _) = xray_attackers(&pos, Square::G2, Color::Black);
+        assert_eq!(b_count, 0, "no black x-ray onto g2");
+    }
 
     #[test]
     fn test_square_control_f6_and_d4() {

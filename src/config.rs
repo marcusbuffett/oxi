@@ -13,15 +13,16 @@ pub const LEGAL_MOVES: usize = 64 * 76;
 // dark square, and en passant were all measured near zero reliance on the
 // trained model and removed.
 // - Piece identity group (12): white/black one-hots for all roles
-// - Tactical group (18): attackers by role + material + count for both
-//   colors (8 each), hanging flag, square control
+// - Tactical group (24): attackers by role + material + count for both
+//   colors (8 each), hanging flag, square control, per-side SEE capture
+//   outcomes (2), per-side x-ray attacker count + material (4)
 // - Positional group (17): legal-move count, rank one-hot, file one-hot
 // - Misc group (1): local castling right
 // - Recency channels (4): white/black from/to of recent moves, decayed
 // - History occupancy (7x12): piece one-hots of the past 7 positions,
 //   most recent first (Maia-3-style board history)
 pub const PIECE_IDENTITY_FEATURES: usize = 12;
-pub const TACTICAL_FEATURES: usize = 18;
+pub const TACTICAL_FEATURES: usize = 24;
 pub const POSITIONAL_FEATURES: usize = 17;
 pub const MISC_FEATURES: usize = 1;
 pub const RECENCY_FEATURES: usize = 4; // white_from, white_to, black_from, black_to
@@ -228,6 +229,21 @@ pub struct Config {
     /// Number of iterations between checkpoints
     pub checkpoint_interval: usize,
 
+    /// Decay factor for the EMA copy of the weights kept as training
+    /// instrumentation (and saved as model_ema.mpk at each checkpoint).
+    #[serde(default = "default_ema_beta")]
+    pub ema_beta: f64,
+
+    /// Allie test set JSONL evaluated at every checkpoint with both the live
+    /// and EMA weights (metrics: allie_top1_live / allie_top1_ema). The EMA
+    /// curve shows real progress through the constant-LR noise floor.
+    #[serde(default)]
+    pub ema_eval_dataset: Option<std::path::PathBuf>,
+
+    /// Number of games loaded from the eval dataset (~50 positions each)
+    #[serde(default = "default_ema_eval_games")]
+    pub ema_eval_games: usize,
+
     /// Number of TCEC (computer engine) samples to use for pretraining (0 to disable)
     pub pretrain_samples: usize,
 
@@ -388,6 +404,12 @@ fn default_whitening_batch_size() -> usize {
 }
 fn default_wsd_decay_fraction() -> f64 {
     0.15
+}
+fn default_ema_beta() -> f64 {
+    0.999
+}
+fn default_ema_eval_games() -> usize {
+    200
 }
 fn default_aux_loss_weight() -> f32 {
     0.06 // Was 0.04; increased to strengthen trunk-level auxiliary supervision signal
@@ -614,6 +636,18 @@ pub struct ConfigOverrides {
     /// Number of iterations between checkpoints
     #[arg(long)]
     pub checkpoint_interval: Option<usize>,
+
+    /// EMA decay factor for the instrumentation copy of the weights
+    #[arg(long)]
+    pub ema_beta: Option<f64>,
+
+    /// Allie test set JSONL for checkpoint-cadence live/EMA eval
+    #[arg(long)]
+    pub ema_eval_dataset: Option<std::path::PathBuf>,
+
+    /// Number of games loaded from the EMA eval dataset
+    #[arg(long)]
+    pub ema_eval_games: Option<usize>,
 
     /// Number of TCEC samples to use for pretraining
     #[arg(long)]
@@ -868,6 +902,15 @@ impl Config {
         }
         if let Some(v) = overrides.checkpoint_interval {
             config.checkpoint_interval = v;
+        }
+        if let Some(v) = overrides.ema_beta {
+            config.ema_beta = v;
+        }
+        if let Some(v) = overrides.ema_eval_dataset.clone() {
+            config.ema_eval_dataset = Some(v);
+        }
+        if let Some(v) = overrides.ema_eval_games {
+            config.ema_eval_games = v;
         }
         if let Some(v) = overrides.pretrain_samples {
             config.pretrain_samples = v;
@@ -1178,6 +1221,9 @@ impl Default for Config {
             max_ply: None,
             enable_elo_sampling: Some(true),
             checkpoint_interval: 100,
+            ema_beta: default_ema_beta(),
+            ema_eval_dataset: None,
+            ema_eval_games: default_ema_eval_games(),
             pretrain_samples: 0,
             shuffle_buffer_size: 100000,
             disable_training_shuffle: Some(false),

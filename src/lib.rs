@@ -80,6 +80,8 @@ pub mod dataset;
 #[cfg(feature = "train")]
 pub mod debug_prediction_monitor;
 #[cfg(feature = "train")]
+pub mod ema;
+#[cfg(feature = "train")]
 pub mod forward_timing;
 #[cfg(feature = "train")]
 pub mod gradient_norm_metric;

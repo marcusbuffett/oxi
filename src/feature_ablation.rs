@@ -29,30 +29,33 @@ const PROB_FLOOR: f32 = 1e-9;
 /// Named channel ranges within the per-square feature vector. Must stay in
 /// sync with `encoding::encode_position`.
 pub const CHANNEL_GROUPS: &[(&str, std::ops::Range<usize>)] = &[
-    // Coarse groups (post-2026-06 pruning layout)
+    // Coarse groups (post-2026-06 pruning layout + SEE/x-ray)
     ("piece_identity (ALL)", 0..12),
-    ("tactical (ALL)", 12..30),
-    ("positional (ALL)", 30..47),
-    ("recency (ALL)", 48..52),
-    ("history_occupancy (ALL)", 52..136),
+    ("tactical (ALL)", 12..36),
+    ("positional (ALL)", 36..53),
+    ("recency (ALL)", 54..58),
+    ("history_occupancy (ALL)", 58..142),
     // Tactical subgroups
     ("attackers_white", 12..20),
     ("attackers_black", 20..28),
     ("hanging", 28..29),
     ("square_control", 29..30),
+    ("see (both sides)", 30..32),
+    ("xray_white (count/material)", 32..34),
+    ("xray_black (count/material)", 34..36),
     // Positional subgroups
-    ("mobility (legal_moves_norm)", 30..31),
-    ("rank_onehot", 31..39),
-    ("file_onehot", 39..47),
+    ("mobility (legal_moves_norm)", 36..37),
+    ("rank_onehot", 37..45),
+    ("file_onehot", 45..53),
     // Misc
-    ("castling_right", 47..48),
+    ("castling_right", 53..54),
     // Recency subgroups
-    ("recency_white (from/to)", 48..50),
-    ("recency_black (from/to)", 50..52),
+    ("recency_white (from/to)", 54..56),
+    ("recency_black (from/to)", 56..58),
     // History occupancy by age (12 channels per past position)
-    ("history_t-1", 52..64),
-    ("history_t-2", 64..76),
-    ("history_t-3..7", 76..136),
+    ("history_t-1", 58..70),
+    ("history_t-2", 70..82),
+    ("history_t-3..7", 82..142),
 ];
 
 struct SweepResult {

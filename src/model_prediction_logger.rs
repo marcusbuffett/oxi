@@ -273,7 +273,19 @@ fn format_square_encoding(square_idx: usize, encoded_board: &[f32]) -> String {
         "\t\tSquare control: {:.2}\n",
         tactical_features[17]
     ));
-    debug_assert_eq!(TACTICAL_FEATURES, 18);
+    output.push_str(&format!(
+        "\t\tSEE (white initiates, black initiates): {:.2}, {:.2}\n",
+        tactical_features[18], tactical_features[19]
+    ));
+    output.push_str(&format!(
+        "\t\tX-ray white (count, material): {:.2}, {:.2}\n",
+        tactical_features[20], tactical_features[21]
+    ));
+    output.push_str(&format!(
+        "\t\tX-ray black (count, material): {:.2}, {:.2}\n",
+        tactical_features[22], tactical_features[23]
+    ));
+    debug_assert_eq!(TACTICAL_FEATURES, 24);
 
     // Positional group: mobility, rank one-hot, file one-hot
     let positional_features = &square_features[idx..idx + POSITIONAL_FEATURES];

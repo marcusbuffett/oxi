@@ -57,8 +57,19 @@ mobility, rank/file one-hots, castling_right, recency. Everything kept measures
 
 **Added** (same change set): history occupancy planes — 12 piece one-hots for
 each of the past 7 positions (84 channels), Maia-3-style, replacing nothing
-(recency channels stay). `PREVIOUS_POSITIONS` 5 → 7. Net: 65 → 136 channels
-per square.
+(recency channels stay). `PREVIOUS_POSITIONS` 5 → 7.
+
+**Added** (follow-up, same branch): two channel families chosen *because* the
+ablation showed attack/control inputs dominate:
+- **Per-square SEE** (2): resolved static-exchange outcome for each side
+  initiating a capture on the square (pawns / 9, signed). Supersedes binary
+  `hanging` with the actual attacker/defender-value arithmetic.
+- **X-ray attackers** (4): per-side count + material of sliders attacking the
+  square through exactly one piece — batteries, pins/skewers, discovered
+  attacks. Motivating case: the Sicilian-probe b3 square, where Rb1's cover
+  through Qb2 was invisible to the direct-attack channels.
+
+Net: 65 → 142 channels per square.
 
 ## Takeaways for future feature work
 
