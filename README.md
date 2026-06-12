@@ -13,11 +13,18 @@ We benchmark on the **Allie test set** (Zhang et al., ICLR 2025): 884,049 positi
 | Allie-Adaptive-Search | 355M | 55.9% |
 | Allie-Policy | 355M | 55.7% |
 | Maia-3-5M | 5M | 55.4% |
-| **Oxi (mid-training checkpoint)** | **~30M** | **52.3%** |
+| **Oxi** | **~30M** | **54.8%** |
+| GPT-3.5 | 175B | 53.7% |
 | Maia-2 | 23M | 52.0% |
 | Maia⋆ (original Maia ensemble) | 92M | 51.6% |
 
-The Oxi number is a snapshot from ~1/4 of the way through the current H100 training run (before LR decay), trained on two months of Lichess data with players under 1000 filtered out — the sub-1000 test buckets (12% of the test set) score in the 40s as a result. We'll update when the run completes. No test-set leakage: the run trains on 2023/2026 archives; the test set is 2022 games.
+Oxi's 54.8% comes from a ~12-hour single-H100 run (8h constant-LR + 3.6h
+linear decay, WSD schedule), trained on two months of Lichess data with
+players under 1000 Elo filtered out — the sub-1000 test buckets (12% of the
+test set) score in the 40s as a result; on the ≥1000 subset Oxi scores
+**55.9%**, and 58–59% in the 2200–2500 bands. Special moves: castling 73.8%,
+en passant 75.7%, promotion 88.6%. No test-set leakage: training uses
+2023/2026 archives; the test set is 2022 games.
 
 ## Architecture
 
