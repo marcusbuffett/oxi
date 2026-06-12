@@ -3193,16 +3193,15 @@ where
                                     value: NumericEntry::Value(value),
                                 });
                             }
+                            // No println here: the TUI owns the terminal during
+                            // training and raw stdout corrupts it. The numbers
+                            // land in the TUI chart, metrics_logs, and train.log.
                             tracing::info!(
                                 "checkpoint_eval: iter={} live_top1={:.2}% ema_top1={:.2}% ({:?})",
                                 iteration,
                                 live,
                                 ema,
                                 t_eval.elapsed()
-                            );
-                            println!(
-                                "Checkpoint eval @ {}: live {:.2}% | EMA {:.2}%",
-                                iteration, live, ema
                             );
                         }
                         (live, ema) => {
