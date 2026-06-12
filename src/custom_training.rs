@@ -3184,6 +3184,15 @@ where
                         (Ok(live), Ok(ema)) => {
                             metric_logger.log("allie_top1_live", iteration, live);
                             metric_logger.log("allie_top1_ema", iteration, ema);
+                            // `Base|series` names land both curves in one TUI chart.
+                            for (series, value) in [("live", live), ("ema", ema)] {
+                                let formatted = format!("{value:.2}%");
+                                renderer.update_train(MetricState::Numeric {
+                                    name: format!("Allie Top-1|{series}"),
+                                    entry: SerializedEntry::new(formatted.clone(), formatted),
+                                    value: NumericEntry::Value(value),
+                                });
+                            }
                             tracing::info!(
                                 "checkpoint_eval: iter={} live_top1={:.2}% ema_top1={:.2}% ({:?})",
                                 iteration,
