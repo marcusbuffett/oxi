@@ -706,6 +706,45 @@ mod tests {
     use shakmaty::fen::Fen;
     use std::str::FromStr;
 
+    /// Square control across every square of complex positions, snapshotted so
+    /// performance work on the feature can't silently change its semantics.
+    #[test]
+    fn test_square_control_snapshots() {
+        let positions = [
+            (
+                // Complex Sicilian Probe: queen+rook battery, loose pieces
+                "complex_sicilian",
+                "6k1/5p1p/1q2p1p1/p3P3/1p3P2/r3b2P/1Q2N1P1/1R3K2 b - - 1 33",
+            ),
+            (
+                // Sharp Najdorf middlegame: many contested central squares
+                "najdorf_middlegame",
+                "r1b1k2r/1pq1bppp/p1nppn2/8/3NPP2/2N1B3/PPPQ2PP/2KR1B1R w kq - 3 10",
+            ),
+            (
+                // Rook endgame: open files, king activity
+                "rook_endgame",
+                "8/5pk1/6p1/1R5p/2r4P/6P1/5PK1/8 w - - 0 40",
+            ),
+        ];
+        for (name, fen) in positions {
+            let pos: Chess = fen
+                .parse::<Fen>()
+                .expect("valid FEN")
+                .into_position(shakmaty::CastlingMode::Standard)
+                .expect("valid position");
+            let mut output = format!("{fen}\n");
+            for rank in (0..8).rev() {
+                for file in 0..8 {
+                    let square = Square::new(rank * 8 + file);
+                    output.push_str(&format!("{:.4} ", calculate_square_control(&pos, square)));
+                }
+                output.push('\n');
+            }
+            insta::assert_snapshot!(format!("square_control_{name}"), output);
+        }
+    }
+
     #[test]
     fn test_square_control_f6_and_d4() {
         // Test position: r1bq1rk1/pp2ppbp/3p2p1/3N2B1/8/1P1Q4/1P3PPP/R4RK1 b - - 1 15
