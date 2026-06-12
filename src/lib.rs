@@ -6,6 +6,7 @@ pub mod distribution_utils;
 pub mod encoding;
 pub mod eval_dataset;
 pub mod factorized_policy;
+pub mod feature_ablation;
 pub mod inference;
 pub mod model;
 pub mod move_encoding;

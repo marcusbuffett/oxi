@@ -65,15 +65,44 @@ pub struct AllieEvalParams {
 }
 
 /// One scoreable position, paired with everything needed to attribute the result.
-struct EvalItem {
-    batch_item: BatchItem,
-    target_uci: String,
-    mover_elo: i32,
-    is_castling: bool,
-    is_en_passant: bool,
-    is_promotion: bool,
-    game_id: String,
-    ply: usize,
+pub struct EvalItem {
+    pub batch_item: BatchItem,
+    pub target_uci: String,
+    pub mover_elo: i32,
+    pub is_castling: bool,
+    pub is_en_passant: bool,
+    pub is_promotion: bool,
+    pub game_id: String,
+    pub ply: usize,
+}
+
+/// Load scoreable positions from the Allie test set without running
+/// inference — shared by the move-matching eval and feature-ablation tooling.
+pub fn load_eval_items(params: &AllieEvalParams) -> Result<Vec<EvalItem>> {
+    let file = File::open(&params.dataset)
+        .with_context(|| format!("opening dataset {:?}", params.dataset))?;
+    let reader = BufReader::new(file);
+    let mut stats = EvalStats::default();
+    let mut items = Vec::new();
+    for line in reader.lines() {
+        if let Some(limit) = params.limit {
+            if stats.games >= limit {
+                break;
+            }
+        }
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(game) = serde_json::from_str::<AllieGame>(&line) else {
+            continue;
+        };
+        if let Some(game_items) = build_game_items(&game, params, &mut stats) {
+            stats.games += 1;
+            items.extend(game_items);
+        }
+    }
+    Ok(items)
 }
 
 #[derive(Default)]

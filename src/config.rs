@@ -43,7 +43,9 @@ pub const MIN_ELO: i32 = 1000;
 pub const MIN_PLY: usize = 0;
 pub const MAX_ELO: i32 = 3000;
 pub const MAX_ELO_DIFF: i32 = 200;
-pub const MIN_TIME_CONTROL: u32 = 61;
+/// Games qualify only with base time above this (seconds). Excludes bullet
+/// and short blitz like 2+1, whose time-scramble moves aren't worth modeling.
+pub const MIN_TIME_CONTROL: u32 = 121;
 
 /// Minimum clock time (in seconds) to include moves
 pub const MIN_CLOCK_TIME: u32 = 30;
