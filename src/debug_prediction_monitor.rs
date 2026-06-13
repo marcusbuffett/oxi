@@ -15,7 +15,6 @@ use crate::inference::compute_material_imbalance;
 use crate::metrics_renderer::{MetricState, MetricsRenderer, PredictionEntry, PredictionMetric};
 use crate::model::OXIModel;
 use crate::move_encoding::decode_move;
-use crate::moves::{mirror_fen, mirror_move};
 const MAX_DEBUG_SLOTS: usize = 10;
 
 #[derive(Debug, Clone)]
@@ -37,9 +36,6 @@ struct DebugPosition {
     name: String,
     item: ChessItem,
     reference_pos: Chess,
-    /// True when the example was mirrored into model frame (black to move);
-    /// decoded moves must be mirrored back before display.
-    mirrored: bool,
     display_slots: usize,
     query_top: usize,
 }
@@ -122,7 +118,6 @@ where
                 legal_slice,
                 position.query_top,
                 &position.reference_pos,
-                position.mirrored,
             );
             let select_time = t_select.elapsed();
 
@@ -171,7 +166,6 @@ fn select_top_moves(
     legal_mask: &[f32],
     top_n: usize,
     reference_pos: &Chess,
-    mirrored: bool,
 ) -> Vec<(String, f32)> {
     let mut indexed = probabilities
         .iter()
@@ -191,13 +185,7 @@ fn select_top_moves(
             }
             let from = (idx / 76) as u8;
             let to = (idx % 76) as u8;
-            // decode_move yields the move in model frame; for black-to-move
-            // positions the item was mirrored, so mirror back before
-            // rendering SAN against the real board.
-            let mut uci_move = decode_move(from, to)?;
-            if mirrored {
-                uci_move = mirror_move(&uci_move.to_string()).parse().ok()?;
-            }
+            let uci_move = decode_move(from, to)?;
             let san = uci_move
                 .to_move(reference_pos)
                 .ok()
@@ -239,42 +227,37 @@ fn build_debug_position(dataset: &OXIDataset, spec: &DebugPositionSpec) -> Resul
         .cloned()
         .context("no final position computed")?;
     let turn = final_pos.turn();
-    // ChessExample is by convention in MODEL frame: pgn_processor mirrors the
-    // board, move, and history whenever black is to move, so the model only
-    // ever sees side-to-move-as-white. Feeding an unmirrored black-to-move
-    // position here is out-of-distribution input and yields nonsense
-    // predictions (this exact bug shipped: the probe showed random legal
-    // moves for black while the production inference path was fine).
-    let needs_mirror = turn == Color::Black;
 
     let mut previous_moves = Vec::new();
     let mut previous_fens = Vec::new();
     let mut material_history = Vec::new();
 
     let total_moves = uci_history.len();
-    for i in 0..PREVIOUS_POSITIONS.min(total_moves) {
+    for i in 0..PREVIOUS_POSITIONS {
+        if i >= total_moves {
+            break;
+        }
         let move_idx = total_moves - 1 - i;
-        // positions[move_idx] is the position uci_history[move_idx] was played
-        // from — the same snapshot pgn_processor stores per ply.
-        let snapshot = &positions[move_idx];
-        let fen = Fen::from_position(snapshot, EnPassantMode::Legal).to_string();
-        if needs_mirror {
-            previous_moves.push(mirror_move(&uci_history[move_idx]));
-            previous_fens.push(mirror_fen(&fen));
-        } else {
-            previous_moves.push(uci_history[move_idx].clone());
+        previous_moves.push(uci_history[move_idx].clone());
+
+        let snapshot_idx = positions.len().saturating_sub(2 + i);
+        if snapshot_idx < positions.len().saturating_sub(1) {
+            let snapshot = &positions[snapshot_idx];
+            let fen = Fen::from_position(snapshot, EnPassantMode::Legal).to_string();
             previous_fens.push(fen);
         }
     }
 
-    // Raw (white minus black) imbalance of the before-move snapshots, most
-    // recent first — matching pgn_processor's previous_material_imbalances.
-    let before_move_positions = &positions[..positions.len().saturating_sub(1)];
-    for snapshot in before_move_positions.iter().rev().take(PREVIOUS_POSITIONS) {
-        material_history.push(compute_material_imbalance(snapshot));
+    let mut material_values = positions
+        .iter()
+        .skip(1)
+        .map(compute_material_imbalance)
+        .collect::<Vec<_>>();
+    if material_values.is_empty() {
+        material_values.push(compute_material_imbalance(&final_pos));
     }
-    if material_history.is_empty() {
-        material_history.push(compute_material_imbalance(&final_pos));
+    for value in material_values.iter().rev().take(PREVIOUS_POSITIONS) {
+        material_history.push(*value);
     }
 
     let (time_self_ms, time_oppo_ms) = match turn {
@@ -296,16 +279,9 @@ fn build_debug_position(dataset: &OXIDataset, spec: &DebugPositionSpec) -> Resul
         .to_uci(CastlingMode::Standard)
         .to_string();
 
-    let raw_fen = Fen::from_position(&final_pos, EnPassantMode::Legal).to_string();
-    let (fen, move_uci) = if needs_mirror {
-        (mirror_fen(&raw_fen), mirror_move(&default_move))
-    } else {
-        (raw_fen, default_move)
-    };
-
     let example = ChessExample {
-        fen,
-        move_uci,
+        fen: Fen::from_position(&final_pos, EnPassantMode::Legal).to_string(),
+        move_uci: default_move,
         elo_self: spec.bot_elo,
         elo_oppo: spec.bot_elo,
         outcome: 0.5,
@@ -332,7 +308,6 @@ fn build_debug_position(dataset: &OXIDataset, spec: &DebugPositionSpec) -> Resul
         name: spec.name.to_string(),
         item,
         reference_pos: final_pos,
-        mirrored: needs_mirror,
         display_slots,
         query_top,
     })

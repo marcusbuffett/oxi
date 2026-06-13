@@ -554,7 +554,7 @@ impl Visitor for PgnVisitor {
         self.previous_material_imbalances
             .push_front(material_imbalance);
 
-        if self.previous_fens.len() > PREVIOUS_POSITIONS {
+        if self.previous_fens.len() > 5 {
             self.previous_fens.pop_back();
             self.previous_moves_uci.pop_back();
             self.previous_material_imbalances.pop_back();

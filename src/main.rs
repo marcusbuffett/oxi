@@ -123,11 +123,6 @@ enum Commands {
     /// directly comparable to the paper's Allie/Maia numbers
     EvaluateAllie(AllieEvalCli),
 
-    /// Measure how much a trained checkpoint relies on each hand-crafted
-    /// input feature by zeroing channel groups at inference time (no
-    /// retraining) and scoring degradation on Allie test-set positions
-    FeatureAblation(FeatureAblationCli),
-
     /// Download TCEC (Top Chess Engine Championship) games for pretraining
     DownloadTcec {
         #[arg(long)]
@@ -377,29 +372,6 @@ struct AllieEvalCli {
     dump: Option<PathBuf>,
 }
 
-#[derive(Parser, Debug)]
-struct FeatureAblationCli {
-    /// Model directory (containing model.mpk and params.json)
-    #[arg(long)]
-    model_dir: PathBuf,
-
-    /// Path to the Allie test set JSONL (positions to score on)
-    #[arg(long)]
-    dataset: PathBuf,
-
-    /// Games to load (~50 positions each; 400 games ≈ 20k positions)
-    #[arg(long, default_value = "400")]
-    limit: usize,
-
-    /// Inference batch size
-    #[arg(long, default_value = "512")]
-    batch_size: usize,
-
-    /// Device: cpu, mps, or cuda
-    #[arg(long)]
-    device: Option<String>,
-}
-
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 struct CreateCalibrationDbCli {
     /// Directory containing PGN files to sample from
@@ -566,44 +538,12 @@ fn evaluate_allie_command(_cli: &AllieEvalCli) -> Result<()> {
     anyhow::bail!("evaluate-allie requires the backend-tch feature")
 }
 
-#[cfg(not(feature = "backend-tch"))]
-fn feature_ablation_command(_cli: &FeatureAblationCli) -> Result<()> {
-    anyhow::bail!("feature-ablation requires the backend-tch feature")
-}
-
 #[cfg(feature = "backend-tch")]
-fn feature_ablation_command(cli: &FeatureAblationCli) -> Result<()> {
-    use oxi::allie_eval::AllieEvalParams;
-    use oxi::feature_ablation::run_feature_ablation;
+fn evaluate_allie_command(cli: &AllieEvalCli) -> Result<()> {
+    use oxi::allie_eval::{run_allie_eval, AllieEvalParams};
 
     type EvalBackend = burn::backend::LibTorch<f32>;
-    let device = resolve_tch_device(cli.device.as_deref())?;
-
-    let config = load_config_from_model_dir(&cli.model_dir)?;
-    let _ = set_global_config(config.clone());
-    let engine = InferenceEngine::<EvalBackend>::from_checkpoint(
-        &cli.model_dir.join("model"),
-        config,
-        device,
-    )?;
-
-    run_feature_ablation(
-        &engine,
-        &AllieEvalParams {
-            dataset: cli.dataset.clone(),
-            batch_size: cli.batch_size,
-            skip_plies: 10,
-            min_clock: 30,
-            limit: Some(cli.limit),
-            dump: None,
-        },
-        cli.batch_size,
-    )
-}
-
-#[cfg(feature = "backend-tch")]
-fn resolve_tch_device(device: Option<&str>) -> Result<burn_tch::LibTorchDevice> {
-    Ok(match device {
+    let device = match cli.device.as_deref() {
         Some("cpu") => burn_tch::LibTorchDevice::Cpu,
         Some("mps") => burn_tch::LibTorchDevice::Mps,
         Some("cuda") => burn_tch::LibTorchDevice::Cuda(0),
@@ -615,15 +555,7 @@ fn resolve_tch_device(device: Option<&str>) -> Result<burn_tch::LibTorchDevice> 
                 burn_tch::LibTorchDevice::Cuda(0)
             }
         }
-    })
-}
-
-#[cfg(feature = "backend-tch")]
-fn evaluate_allie_command(cli: &AllieEvalCli) -> Result<()> {
-    use oxi::allie_eval::{run_allie_eval, AllieEvalParams};
-
-    type EvalBackend = burn::backend::LibTorch<f32>;
-    let device = resolve_tch_device(cli.device.as_deref())?;
+    };
 
     let config = load_config_from_model_dir(&cli.model_dir)?;
     let _ = set_global_config(config.clone());
@@ -1329,7 +1261,6 @@ async fn main() -> Result<()> {
 
         Commands::ComputeWhitening(config) => compute_whitening_command(&config),
         Commands::EvaluateAllie(config) => evaluate_allie_command(&config),
-        Commands::FeatureAblation(config) => feature_ablation_command(&config),
         Commands::CreateCalibrationDb(config) => {
             println!("Creating calibration DB...");
             println!("  PGN path: {}", config.pgn_dir.display());

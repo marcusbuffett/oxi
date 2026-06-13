@@ -249,83 +249,173 @@ fn format_square_encoding(square_idx: usize, encoded_board: &[f32]) -> String {
     ));
     idx += PIECE_IDENTITY_FEATURES;
 
-    let fmt_slice = |slice: &[f32], precision: usize| -> String {
-        slice
-            .iter()
-            .map(|f| format!("{f:.precision$}"))
-            .collect::<Vec<String>>()
-            .join(", ")
-    };
-
-    // Tactical group: attackers (8 white, 8 black), hanging, control
+    // Tactical group
     let tactical_features = &square_features[idx..idx + TACTICAL_FEATURES];
     idx += TACTICAL_FEATURES;
+    let mut t_idx = 0;
+    let white_attackers = &tactical_features[t_idx..t_idx + 8];
     output.push_str(&format!(
         "\t\tWhite attackers: {}\n",
-        fmt_slice(&tactical_features[0..8], 3)
+        white_attackers
+            .iter()
+            .map(|f| format!("{f:.3}"))
+            .collect::<Vec<String>>()
+            .join(", ")
     ));
+    t_idx += 8;
+    let black_attackers = &tactical_features[t_idx..t_idx + 8];
     output.push_str(&format!(
         "\t\tBlack attackers: {}\n",
-        fmt_slice(&tactical_features[8..16], 3)
+        black_attackers
+            .iter()
+            .map(|f| format!("{f:.3}"))
+            .collect::<Vec<String>>()
+            .join(", ")
     ));
-    output.push_str(&format!("\t\tHanging flag: {:.0}\n", tactical_features[16]));
+    t_idx += 8;
+    let pin_feature = tactical_features[t_idx];
+    t_idx += 1;
+    let absolute_pin_feature = tactical_features[t_idx];
+    t_idx += 1;
+    let pin_target_feature = tactical_features[t_idx];
+    t_idx += 1;
+    output.push_str(&format!(
+        "\t\tPins (relative, absolute): {:.0}, {:.0}\n",
+        pin_feature, absolute_pin_feature
+    ));
+    output.push_str(&format!("\t\tPin target: {:.0}\n", pin_target_feature));
+    let hanging_feature = tactical_features[t_idx];
+    t_idx += 1;
+
+    const DIRECTION_LABELS: [&str; 8] = ["N", "S", "E", "W", "NE", "NW", "SE", "SW"];
+    const GROUP_LABELS: [&str; 4] = ["minors", "majors", "pawns", "kings"];
+    let format_group_counts = |counts: &[f32]| -> String {
+        GROUP_LABELS
+            .iter()
+            .zip(counts.iter())
+            .map(|(label, value)| format!("{label}:{value:.1}"))
+            .collect::<Vec<String>>()
+            .join(" ")
+    };
+
+    output.push_str("\t\tRay piece weights by direction (white | black):\n");
+    for dir_name in DIRECTION_LABELS.iter() {
+        let counts = &tactical_features[t_idx..t_idx + 8];
+        let white_counts = &counts[..4];
+        let black_counts = &counts[4..];
+        output.push_str(&format!(
+            "\t\t\t{}: {} | {}\n",
+            dir_name,
+            format_group_counts(white_counts),
+            format_group_counts(black_counts)
+        ));
+        t_idx += 8;
+    }
+
+    let origin_color_label = if piece_features[..6].iter().any(|&f| f > 0.5) {
+        "white"
+    } else if piece_features[6..].iter().any(|&f| f > 0.5) {
+        "black"
+    } else {
+        "none"
+    };
+
+    let ray_pin_flag = tactical_features[t_idx];
+    t_idx += 1;
+    let square_control_feature = tactical_features[t_idx];
+    t_idx += 1;
+
+    output.push_str(&format!(
+        "\t\tRay pin flag (origin color: {}): {:.0}\n",
+        origin_color_label, ray_pin_flag
+    ));
     output.push_str(&format!(
         "\t\tSquare control: {:.2}\n",
-        tactical_features[17]
+        square_control_feature
     ));
-    output.push_str(&format!(
-        "\t\tSEE (white initiates, black initiates): {:.2}, {:.2}\n",
-        tactical_features[18], tactical_features[19]
-    ));
-    output.push_str(&format!(
-        "\t\tX-ray white (count, material): {:.2}, {:.2}\n",
-        tactical_features[20], tactical_features[21]
-    ));
-    output.push_str(&format!(
-        "\t\tX-ray black (count, material): {:.2}, {:.2}\n",
-        tactical_features[22], tactical_features[23]
-    ));
-    debug_assert_eq!(TACTICAL_FEATURES, 24);
+    output.push_str(&format!("\t\tHanging flag: {:.0}\n", hanging_feature));
+    debug_assert_eq!(t_idx, TACTICAL_FEATURES);
 
-    // Positional group: mobility, rank one-hot, file one-hot
+    // Positional group
     let positional_features = &square_features[idx..idx + POSITIONAL_FEATURES];
     idx += POSITIONAL_FEATURES;
-    output.push_str(&format!("\t\tLegal moves: {:.2}\n", positional_features[0]));
+    let mut p_idx = 0;
+    let legal_moves_feature = positional_features[p_idx];
+    p_idx += 1;
+    output.push_str(&format!("\t\tLegal moves: {:.2}\n", legal_moves_feature));
+    let pawn_structure = &positional_features[p_idx..p_idx + 3];
+    output.push_str(&format!(
+        "\t\tPawn structure: {}\n",
+        pawn_structure
+            .iter()
+            .map(|f| format!("{f:.0}"))
+            .collect::<Vec<String>>()
+            .join(", ")
+    ));
+    p_idx += 3;
+    let weak_squares = &positional_features[p_idx..p_idx + 2];
+    output.push_str(&format!(
+        "\t\tWeak squares: {}\n",
+        weak_squares
+            .iter()
+            .map(|f| format!("{f:.0}"))
+            .collect::<Vec<String>>()
+            .join(", ")
+    ));
+    p_idx += 2;
+    let open_file_feature = positional_features[p_idx];
+    p_idx += 1;
+    output.push_str(&format!("\t\tOpen file: {:.0}\n", open_file_feature));
+    let passed_pawn_feature = positional_features[p_idx];
+    p_idx += 1;
+    output.push_str(&format!(
+        "\t\tPassed pawn flag: {:.0}\n",
+        passed_pawn_feature
+    ));
+    let dark_square_flag = positional_features[p_idx];
+    p_idx += 1;
+    output.push_str(&format!("\t\tDark square flag: {:.0}\n", dark_square_flag));
+    let rank_one_hot = &positional_features[p_idx..p_idx + 8];
     output.push_str(&format!(
         "\t\tRank one-hot: {}\n",
-        fmt_slice(&positional_features[1..9], 0)
+        rank_one_hot
+            .iter()
+            .map(|f| format!("{f:.0}"))
+            .collect::<Vec<String>>()
+            .join(", ")
     ));
+    p_idx += 8;
+    let file_one_hot = &positional_features[p_idx..p_idx + 8];
     output.push_str(&format!(
         "\t\tFile one-hot: {}\n",
-        fmt_slice(&positional_features[9..17], 0)
+        file_one_hot
+            .iter()
+            .map(|f| format!("{f:.0}"))
+            .collect::<Vec<String>>()
+            .join(", ")
     ));
-    debug_assert_eq!(POSITIONAL_FEATURES, 17);
+    p_idx += 8;
+    debug_assert_eq!(p_idx, POSITIONAL_FEATURES);
 
-    // Misc group: castling right
+    // Misc group
     let misc_features = &square_features[idx..idx + MISC_FEATURES];
     idx += MISC_FEATURES;
-    output.push_str(&format!("\t\tCastling rights: {:.0}\n", misc_features[0]));
+    let ep_feature = misc_features[0];
+    let castling_feature = misc_features[1];
+    output.push_str(&format!("\t\tEn passant: {:.0}\n", ep_feature));
+    output.push_str(&format!("\t\tCastling rights: {:.0}\n", castling_feature));
 
     // Recency channels
     let recency_features = &square_features[idx..idx + RECENCY_FEATURES];
     output.push_str(&format!(
         "\t\tRecency (white_from, white_to, black_from, black_to): {}\n",
-        fmt_slice(recency_features, 3)
+        recency_features
+            .iter()
+            .map(|f| format!("{f:.3}"))
+            .collect::<Vec<String>>()
+            .join(", ")
     ));
     idx += RECENCY_FEATURES;
-
-    // History occupancy planes: 12 piece one-hots per past position
-    for h in 0..PREVIOUS_POSITIONS {
-        let planes = &square_features[idx..idx + PIECE_IDENTITY_FEATURES];
-        idx += PIECE_IDENTITY_FEATURES;
-        if planes.iter().any(|&f| f > 0.0) {
-            output.push_str(&format!(
-                "\t\tHistory t-{}: {}\n",
-                h + 1,
-                fmt_slice(planes, 0)
-            ));
-        }
-    }
 
     debug_assert_eq!(idx, FEATURES_PER_TOKEN);
 
