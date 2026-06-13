@@ -26,6 +26,16 @@ test set) score in the 40s as a result; on the ≥1000 subset Oxi scores
 en passant 75.7%, promotion 88.6%. No test-set leakage: training uses
 2023/2026 archives; the test set is 2022 games.
 
+Note that we report Allie scores but do not optimize for them: the test set
+spreads mass roughly uniformly across skill bins from 600 up, while our
+training sampler is deliberately tuned for strong bot play — it weights games
+toward Elo 2150+, drops everything under 1000, caps rating gaps at 200, and
+includes rapid/classical alongside blitz. An Allie-targeted run would
+bin-flatten the Elo distribution down to 600 and train blitz-only; we accept
+the lower headline number because the bot's target audience is the
+distribution we sample. Maia-3 also trains on ~5× more samples (1M steps ×
+batch 512) than a 24h single-GPU run sees.
+
 ## Architecture
 
 A 320-dim, 16-layer, 10-head transformer over the 64 squares of the board (~scaled up from the previous production model's 192/8/6).
