@@ -7,32 +7,33 @@ use std::sync::OnceLock;
 
 pub const NUM_GLOBALS: usize = 11;
 pub const LEGAL_MOVES: usize = 64 * 76;
-// Per-square features (current position only):
-// - 12 piece one-hots (white/black 6 each)
-// - 1 en passant
-// - 1 castling right at this square
-// - 6 attackers (white, one-hots by role)
-// - 1 total attacker material (white), normalized by 24
-// - 1 number of attackers (white), normalized by 6
-// - 6 attackers (black, one-hots by role)
-// - 1 total attacker material (black), normalized by 24
-// - 1 number of attackers (black), normalized by 6
-// Feature grouping per square (current position only, excluding recency channels):
+// Per-square feature layout. Pruned aggressively after the 2026-06 channel
+// ablation study (see docs/feature_ablation_2026_06.md): pins, pinned
+// defender, pawn structure flags, weak squares, open file, passed pawn,
+// dark square, and en passant were all measured near zero reliance on the
+// trained model and removed.
 // - Piece identity group (12): white/black one-hots for all roles
-// - Tactical group (22): attackers, pins, pin target, hanging flag, has_pinned_defender, square control
-// - Positional group (25): legal moves, pawn structure, weak squares, open file, passed pawn, dark-square flag, rank/file one-hots
-// - Misc group (2): en passant target, local castling right
+// - Tactical group (24): attackers by role + material + count for both
+//   colors (8 each), hanging flag, square control, per-side SEE capture
+//   outcomes (2), per-side x-ray attacker count + material (4)
+// - Positional group (17): legal-move count, rank one-hot, file one-hot
+// - Misc group (1): local castling right
+// - Recency channels (4): white/black from/to of recent moves, decayed
+// - History occupancy (7x12): piece one-hots of the past 7 positions,
+//   most recent first (Maia-3-style board history)
 pub const PIECE_IDENTITY_FEATURES: usize = 12;
-pub const TACTICAL_FEATURES: usize = 22;
-pub const POSITIONAL_FEATURES: usize = 25;
-pub const MISC_FEATURES: usize = 2;
+pub const TACTICAL_FEATURES: usize = 24;
+pub const POSITIONAL_FEATURES: usize = 17;
+pub const MISC_FEATURES: usize = 1;
 pub const RECENCY_FEATURES: usize = 4; // white_from, white_to, black_from, black_to
+pub const PREVIOUS_POSITIONS: usize = 7; // history horizon (occupancy planes + recency decay)
+pub const HISTORY_OCCUPANCY_FEATURES: usize = PREVIOUS_POSITIONS * PIECE_IDENTITY_FEATURES;
 
 pub const BOARD_FEATURES_PER_TOKEN: usize =
     PIECE_IDENTITY_FEATURES + TACTICAL_FEATURES + POSITIONAL_FEATURES + MISC_FEATURES;
 pub const FEATURES_PER_SQUARE_POSITION: usize = BOARD_FEATURES_PER_TOKEN;
-pub const FEATURES_PER_TOKEN: usize = BOARD_FEATURES_PER_TOKEN + RECENCY_FEATURES;
-pub const PREVIOUS_POSITIONS: usize = 5; // Used for decay horizon only
+pub const FEATURES_PER_TOKEN: usize =
+    BOARD_FEATURES_PER_TOKEN + RECENCY_FEATURES + HISTORY_OCCUPANCY_FEATURES;
 pub const HISTORY_DECAY: f32 = 0.8; // Exponential decay factor for historical positions
 
 // Global config storage
@@ -43,7 +44,9 @@ pub const MIN_ELO: i32 = 1000;
 pub const MIN_PLY: usize = 0;
 pub const MAX_ELO: i32 = 3000;
 pub const MAX_ELO_DIFF: i32 = 200;
-pub const MIN_TIME_CONTROL: u32 = 61;
+/// Games qualify only with base time above this (seconds). Excludes bullet
+/// and short blitz like 2+1, whose time-scramble moves aren't worth modeling.
+pub const MIN_TIME_CONTROL: u32 = 121;
 
 /// Minimum clock time (in seconds) to include moves
 pub const MIN_CLOCK_TIME: u32 = 30;
@@ -226,6 +229,21 @@ pub struct Config {
     /// Number of iterations between checkpoints
     pub checkpoint_interval: usize,
 
+    /// Decay factor for the EMA copy of the weights kept as training
+    /// instrumentation (and saved as model_ema.mpk at each checkpoint).
+    #[serde(default = "default_ema_beta")]
+    pub ema_beta: f64,
+
+    /// Allie test set JSONL evaluated at every checkpoint with both the live
+    /// and EMA weights (metrics: allie_top1_live / allie_top1_ema). The EMA
+    /// curve shows real progress through the constant-LR noise floor.
+    #[serde(default)]
+    pub ema_eval_dataset: Option<std::path::PathBuf>,
+
+    /// Number of games loaded from the eval dataset (~50 positions each)
+    #[serde(default = "default_ema_eval_games")]
+    pub ema_eval_games: usize,
+
     /// Number of TCEC (computer engine) samples to use for pretraining (0 to disable)
     pub pretrain_samples: usize,
 
@@ -386,6 +404,12 @@ fn default_whitening_batch_size() -> usize {
 }
 fn default_wsd_decay_fraction() -> f64 {
     0.15
+}
+fn default_ema_beta() -> f64 {
+    0.999
+}
+fn default_ema_eval_games() -> usize {
+    200
 }
 fn default_aux_loss_weight() -> f32 {
     0.06 // Was 0.04; increased to strengthen trunk-level auxiliary supervision signal
@@ -612,6 +636,18 @@ pub struct ConfigOverrides {
     /// Number of iterations between checkpoints
     #[arg(long)]
     pub checkpoint_interval: Option<usize>,
+
+    /// EMA decay factor for the instrumentation copy of the weights
+    #[arg(long)]
+    pub ema_beta: Option<f64>,
+
+    /// Allie test set JSONL for checkpoint-cadence live/EMA eval
+    #[arg(long)]
+    pub ema_eval_dataset: Option<std::path::PathBuf>,
+
+    /// Number of games loaded from the EMA eval dataset
+    #[arg(long)]
+    pub ema_eval_games: Option<usize>,
 
     /// Number of TCEC samples to use for pretraining
     #[arg(long)]
@@ -867,6 +903,15 @@ impl Config {
         if let Some(v) = overrides.checkpoint_interval {
             config.checkpoint_interval = v;
         }
+        if let Some(v) = overrides.ema_beta {
+            config.ema_beta = v;
+        }
+        if let Some(v) = overrides.ema_eval_dataset.clone() {
+            config.ema_eval_dataset = Some(v);
+        }
+        if let Some(v) = overrides.ema_eval_games {
+            config.ema_eval_games = v;
+        }
         if let Some(v) = overrides.pretrain_samples {
             config.pretrain_samples = v;
         }
@@ -952,9 +997,14 @@ impl Config {
 impl Config {
     /// Create new config with explicit parameters for testing
     pub fn new(embed_dim: usize, num_layers: usize) -> Self {
+        // Keep head_dim at 32 regardless of width so test/bench configs with
+        // non-default embed_dim don't trip the divisibility assert in
+        // `num_heads()` (the default num_heads only matches the default width).
+        let num_heads = (embed_dim / 32).max(1);
         Self {
             embed_dim,
             num_layers,
+            num_heads,
             ..Default::default()
         }
     }
@@ -1171,6 +1221,9 @@ impl Default for Config {
             max_ply: None,
             enable_elo_sampling: Some(true),
             checkpoint_interval: 100,
+            ema_beta: default_ema_beta(),
+            ema_eval_dataset: None,
+            ema_eval_games: default_ema_eval_games(),
             pretrain_samples: 0,
             shuffle_buffer_size: 100000,
             disable_training_shuffle: Some(false),

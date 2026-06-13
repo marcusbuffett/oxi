@@ -720,12 +720,41 @@ where
     where
         B::FloatElem: From<f32>,
     {
+        self.predict_batch_with_channel_mask(items, None)
+    }
+
+    /// `predict_batch` with an optional per-channel input mask, used for
+    /// feature-ablation studies: each of the `FEATURES_PER_TOKEN` board
+    /// channels is multiplied by the corresponding mask entry after encoding
+    /// (0.0 = channel zeroed, 1.0 = untouched). Globals are unaffected.
+    pub fn predict_batch_with_channel_mask(
+        &self,
+        items: &[BatchItem],
+        channel_mask: Option<&[f32]>,
+    ) -> anyhow::Result<Vec<OxiPrediction>>
+    where
+        B::FloatElem: From<f32>,
+    {
         if items.is_empty() {
             return Ok(Vec::new());
         }
 
         let (batched_board, batched_globals, flipped_currents, is_black_to_move_flags, n) =
             self.build_batched_inputs(items)?;
+
+        let batched_board = if let Some(mask) = channel_mask {
+            anyhow::ensure!(
+                mask.len() == crate::config::FEATURES_PER_TOKEN,
+                "channel mask has {} entries, expected {}",
+                mask.len(),
+                crate::config::FEATURES_PER_TOKEN
+            );
+            let mask_tensor =
+                Tensor::<B, 1>::from_floats(mask, &self.device).reshape([1, 1, mask.len()]);
+            batched_board * mask_tensor
+        } else {
+            batched_board
+        };
 
         let (policy_logits, value_logits, _side_info_logits, time_usage_logits) =
             self.model.forward(batched_board, batched_globals);
@@ -1463,7 +1492,11 @@ mod tests {
             );
 
             // Attention layer count and shape sanity.
-            assert_eq!(b_attn.len(), 8, "expected 8 encoder layers");
+            assert_eq!(
+                b_attn.len(),
+                crate::config::get_global_config().num_layers(),
+                "attention layers should match encoder depth"
+            );
             for (layer_idx, bl) in b_attn.iter().enumerate() {
                 assert_eq!(
                     bl.data.len(),

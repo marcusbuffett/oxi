@@ -4,11 +4,27 @@ Oxi predicts the move a *human* would play — conditioned on their rating, thei
 
 ## Current accuracy
 
-A full-scale training run is in progress on an H100 (policy cross-entropy only). Mid-run numbers as of step ~17.7k:
+We benchmark on the **Allie test set** (Zhang et al., ICLR 2025): 884,049 positions from 18,239 Lichess 2022 blitz games, downsampled to roughly uniform skill bins, with the first 10 plies and post-time-pressure positions excluded. Our `evaluate-allie` command reproduces the protocol exactly (same 884,049-position denominator), so these numbers are directly comparable:
 
-- **Top-1 accuracy: 54.7%** — predicting the exact move played by humans rated 1000–3000, across all game phases — and still climbing.
+| Model | Params | Top-1 accuracy |
+|-------|--------|----------------|
+| Maia-3-79M (ICLR 2026) | 79M | 57.1% |
+| Maia-3-23M | 23M | 56.6% |
+| Allie-Adaptive-Search | 355M | 55.9% |
+| Allie-Policy | 355M | 55.7% |
+| Maia-3-5M | 5M | 55.4% |
+| **Oxi** | **~30M** | **54.8%** |
+| GPT-3.5 | 175B | 53.7% |
+| Maia-2 | 23M | 52.0% |
+| Maia⋆ (original Maia ensemble) | 92M | 51.6% |
 
-We'll update this with final held-out numbers when the run completes.
+Oxi's 54.8% comes from a ~12-hour single-H100 run (8h constant-LR + 3.6h
+linear decay, WSD schedule), trained on two months of Lichess data with
+players under 1000 Elo filtered out — the sub-1000 test buckets (12% of the
+test set) score in the 40s as a result; on the ≥1000 subset Oxi scores
+**55.9%**, and 58–59% in the 2200–2500 bands. Special moves: castling 73.8%,
+en passant 75.7%, promotion 88.6%. No test-set leakage: training uses
+2023/2026 archives; the test set is 2022 games.
 
 ## Architecture
 

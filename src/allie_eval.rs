@@ -15,7 +15,10 @@
 //! Clocks are reconstructed from `moves-seconds` (per-move think time derived
 //! from Lichess `%clk` annotations): a player's remaining time before their
 //! k-th move is `base - sum(their prior think times) + increment * (k - 1)`,
-//! mirroring how the training pipeline reads `%clk` directly.
+//! mirroring how the training pipeline reads `%clk` directly. The sub-30s
+//! rule is a truncation, not a per-move filter: the first time the side to
+//! move is under 30 seconds, the rest of the game is dropped. With this rule
+//! the position count matches the paper's 884,049 exactly.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -62,15 +65,44 @@ pub struct AllieEvalParams {
 }
 
 /// One scoreable position, paired with everything needed to attribute the result.
-struct EvalItem {
-    batch_item: BatchItem,
-    target_uci: String,
-    mover_elo: i32,
-    is_castling: bool,
-    is_en_passant: bool,
-    is_promotion: bool,
-    game_id: String,
-    ply: usize,
+pub struct EvalItem {
+    pub batch_item: BatchItem,
+    pub target_uci: String,
+    pub mover_elo: i32,
+    pub is_castling: bool,
+    pub is_en_passant: bool,
+    pub is_promotion: bool,
+    pub game_id: String,
+    pub ply: usize,
+}
+
+/// Load scoreable positions from the Allie test set without running
+/// inference — shared by the move-matching eval and feature-ablation tooling.
+pub fn load_eval_items(params: &AllieEvalParams) -> Result<Vec<EvalItem>> {
+    let file = File::open(&params.dataset)
+        .with_context(|| format!("opening dataset {:?}", params.dataset))?;
+    let reader = BufReader::new(file);
+    let mut stats = EvalStats::default();
+    let mut items = Vec::new();
+    for line in reader.lines() {
+        if let Some(limit) = params.limit {
+            if stats.games >= limit {
+                break;
+            }
+        }
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(game) = serde_json::from_str::<AllieGame>(&line) else {
+            continue;
+        };
+        if let Some(game_items) = build_game_items(&game, params, &mut stats) {
+            stats.games += 1;
+            items.extend(game_items);
+        }
+    }
+    Ok(items)
 }
 
 #[derive(Default)]
@@ -129,9 +161,9 @@ fn build_game_items(
     let mut uci_moves: Vec<String> = Vec::new();
     // Remaining clock for each side before their next move.
     let mut clocks = [base_time, base_time];
+    stats.plies_total += moves.len();
 
     for (ply, (&mv_str, &seconds)) in moves.iter().zip(&game.moves_seconds).enumerate() {
-        stats.plies_total += 1;
         let pos = positions.last().unwrap().clone();
         let side = ply % 2; // 0 = white
         let mover_clock = clocks[side];
@@ -140,11 +172,16 @@ fn build_game_items(
         let uci: UciMove = mv_str.parse().ok()?;
         let chess_move = uci.to_move(&pos).ok()?;
 
+        // The test set truncates each game the first time the side to move
+        // has under `min_clock` seconds — everything after is excluded, even
+        // if increments bring the clock back up. This (with skip_plies = 10)
+        // reproduces the paper's 884,049 positions exactly.
+        if mover_clock < params.min_clock {
+            stats.excluded_clock += moves.len() - ply;
+            break;
+        }
         let included = if ply < params.skip_plies {
             stats.excluded_opening += 1;
-            false
-        } else if mover_clock < params.min_clock {
-            stats.excluded_clock += 1;
             false
         } else {
             true

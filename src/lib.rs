@@ -6,6 +6,7 @@ pub mod distribution_utils;
 pub mod encoding;
 pub mod eval_dataset;
 pub mod factorized_policy;
+pub mod feature_ablation;
 pub mod inference;
 pub mod model;
 pub mod move_encoding;
@@ -78,6 +79,8 @@ pub mod custom_training;
 pub mod dataset;
 #[cfg(feature = "train")]
 pub mod debug_prediction_monitor;
+#[cfg(feature = "train")]
+pub mod ema;
 #[cfg(feature = "train")]
 pub mod forward_timing;
 #[cfg(feature = "train")]
