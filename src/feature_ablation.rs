@@ -29,34 +29,33 @@ const PROB_FLOOR: f32 = 1e-9;
 /// Named channel ranges within the per-square feature vector. Must stay in
 /// sync with `encoding::encode_position`.
 pub const CHANNEL_GROUPS: &[(&str, std::ops::Range<usize>)] = &[
-    // Coarse groups
+    // Coarse groups (post-2026-06 pruning layout + SEE/x-ray)
     ("piece_identity (ALL)", 0..12),
-    ("tactical (ALL)", 12..34),
-    ("positional (ALL)", 34..59),
-    ("misc (ALL)", 59..61),
-    ("recency (ALL)", 61..65),
+    ("tactical (ALL)", 12..36),
+    ("positional (ALL)", 36..53),
+    ("recency (ALL)", 54..58),
+    ("history_occupancy (ALL)", 58..142),
     // Tactical subgroups
     ("attackers_white", 12..20),
     ("attackers_black", 20..28),
-    ("pins (pinned/abs_pin/pin_target)", 28..31),
-    ("hanging", 31..32),
-    ("pinned_defender", 32..33),
-    ("square_control", 33..34),
+    ("hanging", 28..29),
+    ("square_control", 29..30),
+    ("see (both sides)", 30..32),
+    ("xray_white (count/material)", 32..34),
+    ("xray_black (count/material)", 34..36),
     // Positional subgroups
-    ("mobility (legal_moves_norm)", 34..35),
-    ("pawn_structure (iso/back/doubled)", 35..38),
-    ("weak_squares", 38..40),
-    ("open_file", 40..41),
-    ("passed_pawn", 41..42),
-    ("dark_square", 42..43),
-    ("rank_onehot", 43..51),
-    ("file_onehot", 51..59),
-    // Misc subgroups
-    ("en_passant", 59..60),
-    ("castling_right", 60..61),
+    ("mobility (legal_moves_norm)", 36..37),
+    ("rank_onehot", 37..45),
+    ("file_onehot", 45..53),
+    // Misc
+    ("castling_right", 53..54),
     // Recency subgroups
-    ("recency_white (from/to)", 61..63),
-    ("recency_black (from/to)", 63..65),
+    ("recency_white (from/to)", 54..56),
+    ("recency_black (from/to)", 56..58),
+    // History occupancy by age (12 channels per past position)
+    ("history_t-1", 58..70),
+    ("history_t-2", 70..82),
+    ("history_t-3..7", 82..142),
 ];
 
 struct SweepResult {

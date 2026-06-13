@@ -1492,7 +1492,11 @@ mod tests {
             );
 
             // Attention layer count and shape sanity.
-            assert_eq!(b_attn.len(), 8, "expected 8 encoder layers");
+            assert_eq!(
+                b_attn.len(),
+                crate::config::get_global_config().num_layers(),
+                "attention layers should match encoder depth"
+            );
             for (layer_idx, bl) in b_attn.iter().enumerate() {
                 assert_eq!(
                     bl.data.len(),

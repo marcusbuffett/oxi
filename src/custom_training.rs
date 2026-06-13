@@ -250,6 +250,35 @@ where
     Ok(optimizer.load_record(record))
 }
 
+/// Top-1 move-matching accuracy of an inner-backend model over a fixed set of
+/// Allie eval positions. Used at checkpoint cadence for both the live and EMA
+/// weights so plateau-vs-hidden-progress is visible from metrics_logs.
+fn checkpoint_allie_top1<B: Backend>(
+    model: OXIModel<B>,
+    config: &Config,
+    device: &B::Device,
+    items: &[crate::allie_eval::EvalItem],
+) -> anyhow::Result<f64>
+where
+    B::FloatElem: From<f32>,
+    B::IntElem: From<i32>,
+{
+    let engine = crate::inference::InferenceEngine::new(model, config.clone(), device.clone());
+    let mut matched = 0usize;
+    for chunk in items.chunks(512) {
+        let batch: Vec<_> = chunk.iter().map(|it| it.batch_item.clone()).collect();
+        let predictions = engine.predict_batch(&batch)?;
+        for (item, prediction) in chunk.iter().zip(&predictions) {
+            if let Some(top) = prediction.moves.first() {
+                if top.uci_move == item.target_uci {
+                    matched += 1;
+                }
+            }
+        }
+    }
+    Ok(100.0 * matched as f64 / items.len().max(1) as f64)
+}
+
 fn save_training_state<B, OM, O1, O2, O3, O4>(
     model: &OXIModel<B>,
     config: &Config,
@@ -2179,6 +2208,31 @@ where
     // Create checkpoints directory
     std::fs::create_dir_all("checkpoints")?;
 
+    // EMA copy of the weights, updated each optimizer step. Saved at every
+    // checkpoint as model_ema.mpk and (when --ema-eval-dataset is set)
+    // evaluated alongside the live weights: at constant LR the live metrics
+    // sit on a noise floor while the EMA curve shows the true slow progress.
+    let mut ema_weights = crate::ema::EmaWeights::<B::InnerBackend>::new(config.ema_beta);
+    let ema_eval_items: Option<Vec<crate::allie_eval::EvalItem>> = match &config.ema_eval_dataset {
+        Some(path) => {
+            let items = crate::allie_eval::load_eval_items(&crate::allie_eval::AllieEvalParams {
+                dataset: path.clone(),
+                batch_size: 512,
+                skip_plies: 10,
+                min_clock: 30,
+                limit: Some(config.ema_eval_games),
+                dump: None,
+            })?;
+            println!(
+                "Checkpoint eval: {} positions from {:?} (live + EMA top-1 every checkpoint)",
+                items.len(),
+                path
+            );
+            Some(items)
+        }
+        None => None,
+    };
+
     // Process examples into ChessItems and chunk into batches
     // Only need config for process_example, not the examples themselves
     let dataset_for_processing = OXIDataset::new(Vec::new(), config.clone());
@@ -2533,6 +2587,8 @@ where
             optim_step_time = t_optim_step.elapsed();
 
             device_workers.broadcast_model(&model);
+
+            ema_weights.update(&model);
 
             accumulation_count = 0;
             optimizer_step += 1;
@@ -3108,6 +3164,52 @@ where
                 &optim_no_decay_high,
                 &checkpoint_dir,
             )?;
+
+            if ema_weights.updates() > 0 {
+                let ema_model = ema_weights.apply(model.valid());
+                let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+                if let Err(e) = ema_model
+                    .clone()
+                    .save_file(checkpoint_dir.join("model_ema"), &recorder)
+                {
+                    tracing::warn!("Failed to save EMA checkpoint: {e}");
+                }
+
+                if let Some(items) = &ema_eval_items {
+                    let t_eval = Instant::now();
+                    let live_top1 =
+                        checkpoint_allie_top1(model.valid(), &config, &main_device, items);
+                    let ema_top1 = checkpoint_allie_top1(ema_model, &config, &main_device, items);
+                    match (live_top1, ema_top1) {
+                        (Ok(live), Ok(ema)) => {
+                            metric_logger.log("allie_top1_live", iteration, live);
+                            metric_logger.log("allie_top1_ema", iteration, ema);
+                            // `Base|series` names land both curves in one TUI chart.
+                            for (series, value) in [("live", live), ("ema", ema)] {
+                                let formatted = format!("{value:.2}%");
+                                renderer.update_train(MetricState::Numeric {
+                                    name: format!("Allie Top-1|{series}"),
+                                    entry: SerializedEntry::new(formatted.clone(), formatted),
+                                    value: NumericEntry::Value(value),
+                                });
+                            }
+                            // No println here: the TUI owns the terminal during
+                            // training and raw stdout corrupts it. The numbers
+                            // land in the TUI chart, metrics_logs, and train.log.
+                            tracing::info!(
+                                "checkpoint_eval: iter={} live_top1={:.2}% ema_top1={:.2}% ({:?})",
+                                iteration,
+                                live,
+                                ema,
+                                t_eval.elapsed()
+                            );
+                        }
+                        (live, ema) => {
+                            tracing::warn!("checkpoint eval failed: live={live:?} ema={ema:?}");
+                        }
+                    }
+                }
+            }
         }
 
         let post_main_loop_time = t_post_main_loop.elapsed();
