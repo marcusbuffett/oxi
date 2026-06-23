@@ -205,25 +205,8 @@ pub fn encode_position(
         feature_idx += 1;
         debug_assert_eq!(RECENCY_FEATURES, 4);
 
-        // History occupancy planes (Maia-3 style): 12 piece one-hots for each
-        // of the past PREVIOUS_POSITIONS positions, most recent first.
-        // Positions are in the same (possibly mirrored) frame as the current
-        // board. Plies before the game start are all-zero.
-        for h in 0..PREVIOUS_POSITIONS {
-            let base = square_idx + feature_idx + h * PIECE_IDENTITY_FEATURES;
-            if let Some(prev) = previous_positions.get(h) {
-                if let Some(prev_piece) = prev.board().piece_at(square) {
-                    let piece_offset = prev_piece.role as usize - 1;
-                    let color_offset = match prev_piece.color {
-                        Color::White => 0,
-                        Color::Black => 6,
-                    };
-                    tokens[base + color_offset + piece_offset] = 1.0;
-                }
-            }
-        }
-        feature_idx += crate::config::HISTORY_OCCUPANCY_FEATURES;
-
+        // History is carried by the decayed recency channels above — no
+        // per-position occupancy one-hots (decayed schema, not Maia-3 style).
         if feature_idx != FEATURES_PER_TOKEN {
             assert!(
                 feature_idx == FEATURES_PER_TOKEN,

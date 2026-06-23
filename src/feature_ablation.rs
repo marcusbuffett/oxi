@@ -34,7 +34,6 @@ pub const CHANNEL_GROUPS: &[(&str, std::ops::Range<usize>)] = &[
     ("tactical (ALL)", 12..36),
     ("positional (ALL)", 36..53),
     ("recency (ALL)", 54..58),
-    ("history_occupancy (ALL)", 58..142),
     // Tactical subgroups
     ("attackers_white", 12..20),
     ("attackers_black", 20..28),
@@ -52,10 +51,6 @@ pub const CHANNEL_GROUPS: &[(&str, std::ops::Range<usize>)] = &[
     // Recency subgroups
     ("recency_white (from/to)", 54..56),
     ("recency_black (from/to)", 56..58),
-    // History occupancy by age (12 channels per past position)
-    ("history_t-1", 58..70),
-    ("history_t-2", 70..82),
-    ("history_t-3..7", 82..142),
 ];
 
 struct SweepResult {

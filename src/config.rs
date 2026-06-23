@@ -18,22 +18,20 @@ pub const LEGAL_MOVES: usize = 64 * 76;
 //   outcomes (2), per-side x-ray attacker count + material (4)
 // - Positional group (17): legal-move count, rank one-hot, file one-hot
 // - Misc group (1): local castling right
-// - Recency channels (4): white/black from/to of recent moves, decayed
-// - History occupancy (7x12): piece one-hots of the past 7 positions,
-//   most recent first (Maia-3-style board history)
+// - Recency channels (4): white/black from/to of recent moves, decayed over
+//   the past PREVIOUS_POSITIONS positions (the decayed history signal — no
+//   per-position occupancy one-hots)
 pub const PIECE_IDENTITY_FEATURES: usize = 12;
 pub const TACTICAL_FEATURES: usize = 24;
 pub const POSITIONAL_FEATURES: usize = 17;
 pub const MISC_FEATURES: usize = 1;
 pub const RECENCY_FEATURES: usize = 4; // white_from, white_to, black_from, black_to
-pub const PREVIOUS_POSITIONS: usize = 7; // history horizon (occupancy planes + recency decay)
-pub const HISTORY_OCCUPANCY_FEATURES: usize = PREVIOUS_POSITIONS * PIECE_IDENTITY_FEATURES;
+pub const PREVIOUS_POSITIONS: usize = 7; // history horizon (recency decay only)
 
 pub const BOARD_FEATURES_PER_TOKEN: usize =
     PIECE_IDENTITY_FEATURES + TACTICAL_FEATURES + POSITIONAL_FEATURES + MISC_FEATURES;
 pub const FEATURES_PER_SQUARE_POSITION: usize = BOARD_FEATURES_PER_TOKEN;
-pub const FEATURES_PER_TOKEN: usize =
-    BOARD_FEATURES_PER_TOKEN + RECENCY_FEATURES + HISTORY_OCCUPANCY_FEATURES;
+pub const FEATURES_PER_TOKEN: usize = BOARD_FEATURES_PER_TOKEN + RECENCY_FEATURES;
 pub const HISTORY_DECAY: f32 = 0.8; // Exponential decay factor for historical positions
 
 // Global config storage
