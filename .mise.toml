@@ -1,3 +1,5 @@
 [env]
 LIBTORCH = "/opt/homebrew/opt/pytorch"
 DYLD_LIBRARY_PATH = "/opt/homebrew/opt/pytorch/lib"
+# Remote GPU training box (used by AGENTS.md workflows + deploy.sh)
+REMOTE_IP = "192.222.54.133"

@@ -1,6 +1,6 @@
-use clap::Args;
+use clap::{Args, ValueEnum};
 use once_cell::sync::Lazy;
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
@@ -51,10 +51,23 @@ pub const MIN_TIME_CONTROL: u32 = 121;
 /// Minimum clock time (in seconds) to include moves
 pub const MIN_CLOCK_TIME: u32 = 30;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSize {
+    #[default]
+    Full,
+    Mini,
+}
+
 /// Unified configuration for OXI chess engine training and inference.
 /// Defaults are defined in the `Default` impl. Use `ConfigOverrides` for CLI parsing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Named model-size preset used to create this config. Saved into
+    /// params.json so serving/deploy tooling can distinguish full vs mini.
+    #[serde(default)]
+    pub model_size: ModelSize,
+
     // === DATA AND RUNTIME ===
     /// Path to data (PGN directory, PGN file, or CSV file)
     pub data_path: Option<std::path::PathBuf>,
@@ -429,6 +442,11 @@ fn default_policy_regret_ref_cp() -> f32 {
 /// Use `Config::with_overrides()` to merge with defaults.
 #[derive(Debug, Clone, Args, Default)]
 pub struct ConfigOverrides {
+    /// Named model-size preset to start from before applying explicit
+    /// overrides. `mini` is sized for low-latency embedding/policy inference.
+    #[arg(long, value_enum)]
+    pub model_size: Option<ModelSize>,
+
     /// Path to data (PGN directory, PGN file, or CSV file)
     #[arg(long)]
     pub data_path: Option<std::path::PathBuf>,
@@ -751,6 +769,9 @@ impl Config {
     /// Create a Config from defaults, applying any overrides that are Some
     pub fn with_overrides(overrides: ConfigOverrides) -> Self {
         let mut config = Config::default();
+        if let Some(model_size) = overrides.model_size {
+            config.apply_model_size_preset(model_size);
+        }
 
         if let Some(v) = overrides.data_path {
             config.data_path = Some(v);
@@ -995,6 +1016,49 @@ impl Config {
 }
 
 impl Config {
+    pub fn mini() -> Self {
+        let mut config = Self::default();
+        config.apply_model_size_preset(ModelSize::Mini);
+        config
+    }
+
+    pub fn apply_model_size_preset(&mut self, model_size: ModelSize) {
+        self.model_size = model_size;
+        match model_size {
+            ModelSize::Full => {}
+            ModelSize::Mini => {
+                // Target roughly 1/10th of the full model's parameter count.
+                // The measured policy-forward tradeoff is best with fewer
+                // layers; use the aggressive 128d/3L preset unless quality
+                // says we need to buy back width.
+                self.embed_dim = 128;
+                self.num_layers = 3;
+                self.num_heads = 4;
+                self.smolgen_hidden = 12;
+                self.smolgen_global_dim = 80;
+                self.smolgen_gen_size = 80;
+
+                // Mini is intended for fast policy + embedding serving. Keep
+                // auxiliary/value heads out of the initial local run unless
+                // explicitly re-enabled by overrides.
+                self.policy_loss_weight = 1.0;
+                self.value_loss_weight = 0.0;
+                self.value_entropy_weight = 0.0;
+                self.time_usage_loss_weight = 0.0;
+                self.aux_loss_weight = 0.0;
+                self.calibration_loss_weight = 0.0;
+                self.policy_regret_loss_weight = 0.0;
+
+                self.physical_batch_size = 8192;
+                self.full_metrics_interval = 100;
+                self.checkpoint_interval = 200;
+                self.whiten_after_training = Some(true);
+                self.whitening_positions = 20000;
+                self.whitening_batch_size = 512;
+            }
+        }
+    }
+
     /// Create new config with explicit parameters for testing
     pub fn new(embed_dim: usize, num_layers: usize) -> Self {
         // Keep head_dim at 32 regardless of width so test/bench configs with
@@ -1166,6 +1230,7 @@ pub fn global_config() -> Option<&'static Config> {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            model_size: ModelSize::Full,
             data_path: Some(std::path::PathBuf::from("/lambda/nfs/chessbook")),
             log_dir: None,
             train_ratio: 1.0,
@@ -1479,5 +1544,45 @@ mod warmup_tests {
         };
         let config = Config::with_overrides(overrides);
         assert_eq!(config.warmup_fraction_clamped(), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod model_size_tests {
+    use super::*;
+
+    #[test]
+    fn mini_preset_sets_latency_focused_architecture() {
+        let config = Config::with_overrides(ConfigOverrides {
+            model_size: Some(ModelSize::Mini),
+            ..Default::default()
+        });
+
+        assert_eq!(config.model_size, ModelSize::Mini);
+        assert_eq!(config.embed_dim, 128);
+        assert_eq!(config.num_layers, 3);
+        assert_eq!(config.num_heads, 4);
+        assert_eq!(config.head_dim(), 32);
+        assert_eq!(config.policy_loss_weight, 1.0);
+        assert_eq!(config.value_loss_weight, 0.0);
+        assert_eq!(config.aux_loss_weight, 0.0);
+        assert!(config.whiten_after_training());
+    }
+
+    #[test]
+    fn explicit_architecture_overrides_win_after_mini_preset() {
+        let config = Config::with_overrides(ConfigOverrides {
+            model_size: Some(ModelSize::Mini),
+            embed_dim: Some(192),
+            num_layers: Some(4),
+            num_heads: Some(6),
+            ..Default::default()
+        });
+
+        assert_eq!(config.model_size, ModelSize::Mini);
+        assert_eq!(config.embed_dim, 192);
+        assert_eq!(config.num_layers, 4);
+        assert_eq!(config.num_heads, 6);
+        assert_eq!(config.head_dim(), 32);
     }
 }

@@ -253,6 +253,139 @@ impl<B: Backend> OXIModel<B> {
         (policy, value, side_info, time_usage)
     }
 
+    pub fn forward_policy(
+        &self,
+        board: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> Tensor<B, 3> {
+        let (policy, _trunk, _policy_tokens) = self.forward_policy_with_trunk(board, globals);
+        policy
+    }
+
+    pub fn forward_trunk(&self, board: Tensor<B, 3>, globals: Tensor<B, 2, Float>) -> Tensor<B, 3> {
+        start_forward_pass();
+        let device = board.device();
+        let total_timing = TimingScope::new_with_sync::<B>("forward_trunk_total", &device);
+        let _norm_scope = NormDebugScope::start("OXIModel::forward_trunk");
+        let _root_stream = StreamScope::enter("root");
+
+        log_tensor_stats("input.board_raw", &board);
+        log_tensor_stats("input.globals_raw", &globals);
+
+        let board_features = board.clone();
+        log_tensor_stats("input.board_features", &board_features);
+
+        let token_embeds = {
+            let _t = TimingScope::new_with_sync::<B>("token_embed", &device);
+            let hidden = silu(self.embed_proj1.forward(board_features));
+            let embeds = self.embed_proj2.forward(hidden);
+            embeds + self.square_embed.val().unsqueeze_dim::<3>(0)
+        };
+        log_tensor_stats("embed.token_embeds", &token_embeds);
+        debug_assert_eq!(
+            token_embeds.dims()[1],
+            64,
+            "Sequence length must be 64 for 8x8 board"
+        );
+
+        let mut x = self.token_norm.forward(token_embeds);
+        log_tensor_stats("encoder.input_tokens", &x);
+
+        {
+            let _encoder_stream = StreamScope::enter("encoder");
+            let _encoder_timing = TimingScope::new_with_sync::<B>("encoder_blocks", &device);
+            for (layer_idx, block) in self.blocks.iter().enumerate() {
+                let _layer_scope = LayerScope::enter(layer_idx);
+                let _block_timing = TimingScope::new_with_sync::<B>("encoder_block", &device);
+                log_tensor_stats("encoder.pre_block", &x);
+
+                x = block.forward_with_film(x, &self.smolgen_weight_gen, globals.clone());
+                log_tensor_stats("encoder.post_block", &x);
+            }
+        }
+
+        x = self.norm.forward(x);
+        log_tensor_stats("encoder.post_norm", &x);
+
+        drop(total_timing);
+        finish_and_log_forward_pass();
+        x
+    }
+
+    pub fn forward_policy_with_trunk(
+        &self,
+        board: Tensor<B, 3>,
+        globals: Tensor<B, 2, Float>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>) {
+        start_forward_pass();
+        let device = board.device();
+        let total_timing = TimingScope::new_with_sync::<B>("forward_policy_total", &device);
+        let _norm_scope = NormDebugScope::start("OXIModel::forward_policy");
+        let _root_stream = StreamScope::enter("root");
+
+        log_tensor_stats("input.board_raw", &board);
+        log_tensor_stats("input.globals_raw", &globals);
+
+        let board_features = board.clone();
+        log_tensor_stats("input.board_features", &board_features);
+
+        let token_embeds = {
+            let _t = TimingScope::new_with_sync::<B>("token_embed", &device);
+            let hidden = silu(self.embed_proj1.forward(board_features));
+            let embeds = self.embed_proj2.forward(hidden);
+            embeds + self.square_embed.val().unsqueeze_dim::<3>(0)
+        };
+        log_tensor_stats("embed.token_embeds", &token_embeds);
+        debug_assert_eq!(
+            token_embeds.dims()[1],
+            64,
+            "Sequence length must be 64 for 8x8 board"
+        );
+
+        let mut x = self.token_norm.forward(token_embeds);
+        log_tensor_stats("encoder.input_tokens", &x);
+
+        {
+            let _encoder_stream = StreamScope::enter("encoder");
+            let _encoder_timing = TimingScope::new_with_sync::<B>("encoder_blocks", &device);
+            for (layer_idx, block) in self.blocks.iter().enumerate() {
+                let _layer_scope = LayerScope::enter(layer_idx);
+                let _block_timing = TimingScope::new_with_sync::<B>("encoder_block", &device);
+                log_tensor_stats("encoder.pre_block", &x);
+
+                x = block.forward_with_film(x, &self.smolgen_weight_gen, globals.clone());
+                log_tensor_stats("encoder.post_block", &x);
+            }
+        }
+
+        x = self.norm.forward(x);
+        log_tensor_stats("encoder.post_norm", &x);
+
+        let (policy_logits, policy_tokens) = {
+            let _stream = StreamScope::enter("policy");
+            let _timing = TimingScope::new_with_sync::<B>("policy_head", &device);
+            let tokens = {
+                let _t = TimingScope::new_with_sync::<B>("policy_block", &device);
+                self.policy_block.forward_with_film(
+                    x.clone(),
+                    &self.smolgen_weight_gen,
+                    globals.clone(),
+                )
+            };
+            log_tensor_stats("policy.tokens", &tokens);
+            let logits = {
+                let _t = TimingScope::new_with_sync::<B>("factorized_policy", &device);
+                self.policy_head.forward(tokens.clone(), globals.clone())
+            };
+            log_tensor_stats("policy.logits", &logits);
+            (logits, tokens)
+        };
+
+        drop(total_timing);
+        finish_and_log_forward_pass();
+        (policy_logits, x, policy_tokens)
+    }
+
     /// Inference-only forward pass that returns the same four outputs as `forward`,
     /// AND a per-layer vector of post-softmax attention weights, AND the post-
     /// norm trunk tensor (the per-square embeddings fed into the policy/value
@@ -593,14 +726,38 @@ impl<B: Backend> OXIModel<B> {
         let config = get_global_config();
         let batch_size = batch.board_input.shape().dims::<3>()[0];
 
-        let (
-            policy_logits,
-            value_logits,
-            _side_info_logits,
-            time_usage_logits,
-            trunk_output,
-            policy_tokens,
-        ) = self.forward_with_trunk(batch.board_input, batch.global_features.clone());
+        let needs_value_head = config.value_loss_weight > 0.0;
+        let needs_time_head = config.time_usage_loss_weight > 0.0;
+
+        let (policy_logits, value_logits, time_usage_logits, trunk_output, policy_tokens) =
+            if needs_value_head || needs_time_head {
+                let (
+                    policy_logits,
+                    value_logits,
+                    _side_info_logits,
+                    time_usage_logits,
+                    trunk_output,
+                    policy_tokens,
+                ) = self.forward_with_trunk(batch.board_input, batch.global_features.clone());
+                (
+                    policy_logits,
+                    value_logits,
+                    time_usage_logits,
+                    trunk_output,
+                    policy_tokens,
+                )
+            } else {
+                let (policy_logits, trunk_output, policy_tokens) = self
+                    .forward_policy_with_trunk(batch.board_input, batch.global_features.clone());
+                let device = policy_logits.device();
+                (
+                    policy_logits,
+                    Tensor::zeros([batch_size, 3], &device),
+                    Tensor::zeros([batch_size, 2], &device),
+                    trunk_output,
+                    policy_tokens,
+                )
+            };
 
         let policy_logits_flat_original = policy_logits.reshape([batch_size, LEGAL_MOVES]);
 
@@ -658,32 +815,31 @@ impl<B: Backend> OXIModel<B> {
             ce_loss_per_sample.mean()
         };
 
-        // Value loss
-        let value_log_probs = log_softmax(value_logits.clone(), 1);
-        let value_probs = value_log_probs.clone().exp();
-        let ce_per_sample = (batch.values.clone() * value_log_probs.clone())
-            .sum_dim(1)
-            .neg();
-
-        let batch_range = 0..batch_size;
-        let loss_probs = value_probs.clone().slice([batch_range.clone(), 0..1]);
-        let win_probs = value_probs.clone().slice([batch_range, 2..3]);
-        let decisive_mass = loss_probs.clone() + win_probs.clone();
-        let denom = decisive_mass.clone().clamp_min(1e-8);
-        let loss_norm = loss_probs.clone() / denom.clone();
-        let win_norm = win_probs.clone() / denom;
-        let binary_entropy = (loss_norm.clone() * (loss_norm.clone().add_scalar(1e-8).log())
-            + win_norm.clone() * (win_norm.clone().add_scalar(1e-8).log()))
-        .neg();
-        let entropy_bonus = (binary_entropy * decisive_mass).sum_dim(1);
-        let value_weights = batch.value_weights.clone().reshape([batch_size, 1]);
-        let value_weight_sum = value_weights.clone().sum().clamp_min(1e-8);
-
         // Helper for creating zero tensors
         let zero_like = || Tensor::zeros([1], &policy_logits_flat_original.device());
 
         // Only compute value loss if weight is non-zero
         let (base_value_loss, value_term) = if config.value_loss_weight > 0.0 {
+            let value_log_probs = log_softmax(value_logits.clone(), 1);
+            let value_probs = value_log_probs.clone().exp();
+            let ce_per_sample = (batch.values.clone() * value_log_probs.clone())
+                .sum_dim(1)
+                .neg();
+
+            let batch_range = 0..batch_size;
+            let loss_probs = value_probs.clone().slice([batch_range.clone(), 0..1]);
+            let win_probs = value_probs.clone().slice([batch_range, 2..3]);
+            let decisive_mass = loss_probs.clone() + win_probs.clone();
+            let denom = decisive_mass.clone().clamp_min(1e-8);
+            let loss_norm = loss_probs.clone() / denom.clone();
+            let win_norm = win_probs.clone() / denom;
+            let binary_entropy = (loss_norm.clone() * (loss_norm.clone().add_scalar(1e-8).log())
+                + win_norm.clone() * (win_norm.clone().add_scalar(1e-8).log()))
+            .neg();
+            let entropy_bonus = (binary_entropy * decisive_mass).sum_dim(1);
+            let value_weights = batch.value_weights.clone().reshape([batch_size, 1]);
+            let value_weight_sum = value_weights.clone().sum().clamp_min(1e-8);
+
             let value_loss_per_sample = ce_per_sample - entropy_bonus * config.value_entropy_weight;
             let value_loss =
                 (value_loss_per_sample * value_weights.clone()).sum() / value_weight_sum.clone();

@@ -43,9 +43,14 @@ uv python install 3.12
 uv venv --python 3.12
 uv sync --frozen --python 3.12
 
-echo "==> Installing PyTorch with CUDA 12.8 wheels"
+echo "==> Installing PyTorch 2.9.0 with CUDA 12.8 wheels"
 UV_PYTHON="$REPO_ROOT/.venv/bin/python"
-uv pip install --python "$UV_PYTHON" --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Pin torch to the libtorch version oxi's `tch` crate (0.22.0) is built against:
+# 2.9.0. Leaving it unpinned (or --upgrade) pulls the newest torch (e.g. 2.11),
+# whose libtorch ABI is incompatible with tch at runtime — inference panics with
+# `Cannot access data pointer of Tensor that doesn't have storage`. Keep this in
+# lockstep with the `tch` version in Cargo.lock.
+uv pip install --python "$UV_PYTHON" torch==2.9.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 LIBTORCH_PATH="$("$UV_PYTHON" -c 'import torch; print(torch.__path__[0])')"
 if [ ! -d "$LIBTORCH_PATH" ]; then

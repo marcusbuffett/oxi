@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, task};
 
 use oxi::calibration::{label_sampled_position, CalibrationDb, RegretBin};
-use oxi::config::{set_global_config, Config, ConfigOverrides};
+use oxi::config::{set_global_config, Config, ConfigOverrides, ModelSize};
 use oxi::constants::{LICHESS_PUZZLE_URL, TCEC_DOWNLOAD_URL};
 #[cfg(feature = "train")]
 use oxi::custom_training::train_custom;
@@ -510,6 +510,8 @@ fn sample_training_positions_for_calibration(
 /// Only reads the fields needed to construct the model, ignoring training-only config.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ModelParams {
+    #[serde(default)]
+    pub model_size: ModelSize,
     pub embed_dim: usize,
     pub num_heads: usize,
     pub num_layers: usize,
@@ -544,6 +546,7 @@ fn load_config_from_model_dir(model_dir: &std::path::Path) -> Result<Config> {
     let params: ModelParams = serde_json::from_str(&params_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", params_path.display(), e))?;
     Ok(Config {
+        model_size: params.model_size,
         embed_dim: params.embed_dim,
         num_heads: params.num_heads,
         num_layers: params.num_layers,

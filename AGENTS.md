@@ -1,14 +1,30 @@
 # Agent Instructions for Oxi
 
+## Backend: always tch (LibTorch)
+
+**Use the `tch` (LibTorch) backend for everything — it is the only backend that
+works reliably.** It is now the default feature (`backend-tch`), and it covers
+every device we run on:
+- **CPU / Apple MPS** locally (macOS uses MPS automatically).
+- **CUDA** on Linux — install a CUDA-enabled libtorch (the PyTorch CUDA wheels
+  from `setup_ubuntu.sh` provide it) and tch uses the GPU automatically. No
+  separate CUDA toolkit / `backend-cuda` build is needed.
+
+Do **not** use `backend-cuda`, `backend-wgpu`, `backend-metal`, `backend-candle`,
+or `backend-ndarray` — they are unmaintained and don't build/run. Plain
+`cargo build` / `cargo run` now pulls in `backend-tch`; for training add
+`--features train` (so: `cargo run --release --features train -- train ...`).
+
 ## Local Compilation Check
 
 Before deploying, verify the code compiles with the training features:
 
 ```bash
-cargo check --features "train,backend-tch"
+cargo check --features train
 ```
 
-This catches errors that won't show up with default features (inference-only mode).
+This catches errors that won't show up otherwise (the default build is
+inference-only — no `train`/autodiff).
 
 ## Remote Access (GH200 GPU Server)
 
@@ -83,7 +99,7 @@ grep "perf_metrics_breakdown" train.log | tail -20
 
 ### Run Training on Remote
 ```bash
-ssh ubuntu@$(mise exec -- printenv REMOTE_IP) 'bash -l -c "cd /home/ubuntu/oxi && CUDA_PATH=/usr cargo run --release --no-default-features --features backend-cuda -- train \
+ssh ubuntu@$(mise exec -- printenv REMOTE_IP) 'bash -l -c "cd /home/ubuntu/oxi && cargo run --release --features train -- train \
   --physical-batch-size=2048 \
   --num-layers=8 \
   --embed-dim=256 \

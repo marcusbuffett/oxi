@@ -101,7 +101,7 @@ impl<B: Backend> FactorizedPolicyHead<B> {
         let source = source * source_gamma + source_beta;
         let target = target * target_gamma + target_beta;
 
-        source.matmul(target.transpose())
+        source.matmul(target.swap_dims(1, 2))
     }
 
     fn compute_promotion_logits(&self, tokens: Tensor<B, 3>) -> Tensor<B, 4> {

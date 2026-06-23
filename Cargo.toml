@@ -51,7 +51,11 @@ burn-autodiff = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 insta = "*"
 
 [features]
-default = []
+# tch (LibTorch) is the only backend that works reliably, and it covers both
+# CPU/MPS and CUDA (via a CUDA-enabled libtorch). Make it the default so plain
+# `cargo build` / `cargo run` and tooling (deploy.sh -b, ablation, eval) get a
+# working backend. The other backend-* features are unmaintained — see AGENTS.md.
+default = ["backend-tch"]
 train = ["burn/train", "burn/autodiff", "burn-train"]
 backend-ndarray = ["burn-ndarray"]
 backend-tch = ["burn-tch", "burn/tch"]

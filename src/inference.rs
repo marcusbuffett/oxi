@@ -1,7 +1,9 @@
 use burn::prelude::*;
 use burn::record::{DefaultRecorder, Recorder};
 use burn::tensor::activation::log_softmax;
+use rayon::prelude::*;
 use std::path::Path;
+use std::time::Instant;
 
 #[cfg(all(target_os = "linux", feature = "backend-cuda"))]
 use burn_cuda;
@@ -9,7 +11,7 @@ use burn_cuda;
 #[cfg(feature = "backend-candle")]
 use burn_candle;
 
-use crate::config::{Config, LEGAL_MOVES, NUM_GLOBALS, PREVIOUS_POSITIONS};
+use crate::config::{Config, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS, PREVIOUS_POSITIONS};
 use crate::encoding::encode_position;
 use crate::model::OXIModel;
 use crate::move_encoding::{decode_move, encode_move};
@@ -495,6 +497,88 @@ pub fn san_line_to_history<T: AsRef<str>>(san_moves: &[T]) -> anyhow::Result<Pos
     })
 }
 
+fn flip_chess_position(position: &Chess) -> anyhow::Result<Chess> {
+    let fen_string = Fen::from_position(position, EnPassantMode::Legal).to_string();
+    let mirrored_fen = mirror_fen(&fen_string);
+    let flipped_position: Chess = mirrored_fen
+        .parse::<Fen>()?
+        .into_position(shakmaty::CastlingMode::Standard)?;
+    Ok(flipped_position)
+}
+
+fn build_input_parts(
+    positions: &[Chess],
+    previous_moves: &[String],
+    global_features: &GlobalFeatures,
+) -> anyhow::Result<(Vec<f32>, Vec<f32>, Chess, Vec<i32>)> {
+    if positions.is_empty() {
+        return Err(anyhow::anyhow!("No positions provided"));
+    }
+
+    let max_positions = (PREVIOUS_POSITIONS + 1).min(positions.len());
+    let relevant_positions = &positions[..max_positions];
+    let moves_needed = max_positions.saturating_sub(1);
+    let moves_available = previous_moves.len().min(moves_needed);
+    let relevant_moves = &previous_moves[..moves_available];
+
+    let current_position = &relevant_positions[0];
+    let is_black_to_move = current_position.turn() == Color::Black;
+
+    let (flipped_current, mut flipped_previous, mut flipped_previous_moves) = if is_black_to_move {
+        let flipped_current = flip_chess_position(current_position)?;
+        let flipped_previous: Result<Vec<Chess>, anyhow::Error> = relevant_positions[1..]
+            .iter()
+            .map(flip_chess_position)
+            .collect();
+        let flipped_prev_moves = relevant_moves
+            .iter()
+            .map(|mv| mirror_move(mv))
+            .collect::<Vec<_>>();
+        (flipped_current, flipped_previous?, flipped_prev_moves)
+    } else {
+        let previous_positions: Vec<Chess> = relevant_positions[1..].to_vec();
+        let previous_moves_vec = relevant_moves.to_vec();
+        (
+            current_position.clone(),
+            previous_positions,
+            previous_moves_vec,
+        )
+    };
+
+    if moves_available < flipped_previous.len() {
+        flipped_previous.truncate(moves_available);
+    }
+
+    if moves_available < flipped_previous_moves.len() {
+        flipped_previous_moves.truncate(moves_available);
+    }
+
+    let board_encoded =
+        encode_position(&flipped_current, &flipped_previous, &flipped_previous_moves);
+
+    let material_imbalance = compute_material_imbalance(&flipped_current);
+    let material_imbalance_history: Vec<i32> = relevant_positions
+        .iter()
+        .skip(1)
+        .map(compute_material_imbalance)
+        .collect();
+
+    let global_features_internal =
+        global_features.to_internal(material_imbalance, material_imbalance_history.clone());
+    let global_features_normalized = global_features_internal.to_normalized();
+    tracing::debug!(
+        "Global features (normalized): {:?}",
+        global_features_normalized
+    );
+
+    Ok((
+        board_encoded,
+        global_features_internal.to_feature_vector(),
+        flipped_current,
+        material_imbalance_history,
+    ))
+}
+
 pub fn load_model<B: Backend>(
     path: &Path,
     config: &Config,
@@ -616,84 +700,13 @@ where
     where
         B::FloatElem: From<f32>,
     {
-        if positions.is_empty() {
-            return Err(anyhow::anyhow!("No positions provided"));
-        }
-
-        // Take up to PREVIOUS_POSITIONS + 1 positions (most recent first)
-        let max_positions = (PREVIOUS_POSITIONS + 1).min(positions.len());
-        let relevant_positions = &positions[..max_positions];
-        let moves_needed = max_positions.saturating_sub(1);
-        let moves_available = previous_moves.len().min(moves_needed);
-        let relevant_moves = &previous_moves[..moves_available];
-
-        // Current position is the first (most recent)
-        let current_position = &relevant_positions[0];
-
-        // Check if we need to flip the board (when it's Black to move)
-        let is_black_to_move = current_position.turn() == Color::Black;
-
-        // Apply board flipping if needed
-        let (flipped_current, mut flipped_previous, mut flipped_previous_moves) =
-            if is_black_to_move {
-                let flipped_current = self.flip_position(current_position)?;
-                let flipped_previous: Result<Vec<Chess>, anyhow::Error> = relevant_positions[1..]
-                    .iter()
-                    .map(|pos| self.flip_position(pos))
-                    .collect();
-                let flipped_prev_moves = relevant_moves
-                    .iter()
-                    .map(|mv| mirror_move(mv))
-                    .collect::<Vec<_>>();
-                (flipped_current, flipped_previous?, flipped_prev_moves)
-            } else {
-                let previous_positions: Vec<Chess> =
-                    relevant_positions[1..].iter().cloned().collect();
-                let previous_moves_vec = relevant_moves.to_vec();
-                (
-                    current_position.clone(),
-                    previous_positions,
-                    previous_moves_vec,
-                )
-            };
-
-        if moves_available < flipped_previous.len() {
-            flipped_previous.truncate(moves_available);
-        }
-
-        if moves_available < flipped_previous_moves.len() {
-            flipped_previous_moves.truncate(moves_available);
-        }
-
-        // Encode position with previous positions and moves for history features
-        let board_encoded =
-            encode_position(&flipped_current, &flipped_previous, &flipped_previous_moves);
+        let (board_encoded, global_feature_vector, flipped_current, material_imbalance_history) =
+            build_input_parts(positions, previous_moves, global_features)?;
 
         // Convert to tensor [batch=1, seq=64, features]
         let board_tensor = Tensor::<B, 1>::from_floats(board_encoded.as_slice(), &self.device)
             .reshape([1, 64, board_encoded.len() / 64]);
 
-        // Compute material imbalance from the current position and convert to internal representation
-        let material_imbalance = compute_material_imbalance(&flipped_current);
-
-        // Compute material imbalance history from previous positions
-        let material_imbalance_history: Vec<i32> = relevant_positions
-            .iter()
-            .skip(1)
-            .map(|pos| compute_material_imbalance(pos))
-            .collect();
-
-        let global_features_internal =
-            global_features.to_internal(material_imbalance, material_imbalance_history.clone());
-
-        // Compute global features from the internal representation
-        let global_features_normalized = global_features_internal.to_normalized();
-        tracing::info!(
-            "Global features (normalized): {:?}",
-            global_features_normalized
-        );
-
-        let global_feature_vector = global_features_internal.to_feature_vector();
         let global_features_tensor =
             Tensor::<B, 1>::from_floats(global_feature_vector.as_slice(), &self.device)
                 .reshape([1, NUM_GLOBALS]);
@@ -739,8 +752,11 @@ where
             return Ok(Vec::new());
         }
 
+        let total_start = Instant::now();
+        let build_start = Instant::now();
         let (batched_board, batched_globals, flipped_currents, is_black_to_move_flags, n) =
             self.build_batched_inputs(items)?;
+        let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
 
         let batched_board = if let Some(mask) = channel_mask {
             anyhow::ensure!(
@@ -756,18 +772,37 @@ where
             batched_board
         };
 
-        let (policy_logits, value_logits, _side_info_logits, time_usage_logits) =
-            self.model.forward(batched_board, batched_globals);
+        let forward_start = Instant::now();
+        let policy_logits = self.model.forward_policy(batched_board, batched_globals);
+        let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
-        self.finalize_batched_predictions(
+        let finalize_start = Instant::now();
+        let result = self.finalize_batched_predictions(
             items,
             n,
             &flipped_currents,
             &is_black_to_move_flags,
             policy_logits,
-            value_logits,
-            time_usage_logits,
-        )
+            None,
+            None,
+        );
+        let finalize_ms = finalize_start.elapsed().as_secs_f64() * 1000.0;
+
+        if std::env::var("OXI_INFERENCE_TIMING")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+            .unwrap_or(false)
+        {
+            tracing::info!(
+                batch = n,
+                build_ms = build_ms,
+                forward_call_ms = forward_ms,
+                finalize_ms = finalize_ms,
+                total_ms = total_start.elapsed().as_secs_f64() * 1000.0,
+                "predict_batch_timing"
+            );
+        }
+
+        result
     }
 
     /// Batched prediction that also captures per-layer post-softmax attention
@@ -830,8 +865,8 @@ where
             &flipped_currents,
             &is_black_to_move_flags,
             policy_logits,
-            value_logits,
-            time_usage_logits,
+            Some(value_logits),
+            Some(time_usage_logits),
         )?;
 
         // Combine predictions with per-item attention slices.
@@ -856,6 +891,103 @@ where
         Ok(out)
     }
 
+    /// Batched prediction that returns policy output plus trunk-mean
+    /// embeddings without materializing attention maps, value, or time heads.
+    pub fn predict_with_embedding_batch(
+        &self,
+        items: &[BatchItem],
+    ) -> anyhow::Result<Vec<(OxiPrediction, EmbeddingOutput)>>
+    where
+        B::FloatElem: From<f32>,
+    {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (batched_board, batched_globals, flipped_currents, is_black_to_move_flags, n) =
+            self.build_batched_inputs(items)?;
+
+        let (policy_logits, trunk, _policy_tokens) =
+            self.model
+                .forward_policy_with_trunk(batched_board, batched_globals);
+
+        let trunk_dims = trunk.dims();
+        debug_assert_eq!(trunk_dims[0], n);
+        debug_assert_eq!(trunk_dims[1], 64);
+        let embed_dim = trunk_dims[2];
+        let trunk_flat = trunk
+            .to_data()
+            .to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("Failed to convert trunk tensor to f32: {:?}", e))?;
+        debug_assert_eq!(trunk_flat.len(), n * 64 * embed_dim);
+
+        let predictions = self.finalize_batched_predictions(
+            items,
+            n,
+            &flipped_currents,
+            &is_black_to_move_flags,
+            policy_logits,
+            None,
+            None,
+        )?;
+
+        let mut out = Vec::with_capacity(n);
+        for (i, prediction) in predictions.into_iter().enumerate() {
+            let row_start = i * 64 * embed_dim;
+            let model_frame = &trunk_flat[row_start..row_start + 64 * embed_dim];
+            let is_black = is_black_to_move_flags[i];
+            let mut per_square = vec![0.0f32; 64 * embed_dim];
+            if is_black {
+                for model_sq in 0..64usize {
+                    let absolute_sq = model_sq ^ 56;
+                    let src = model_sq * embed_dim;
+                    let dst = absolute_sq * embed_dim;
+                    per_square[dst..dst + embed_dim]
+                        .copy_from_slice(&model_frame[src..src + embed_dim]);
+                }
+            } else {
+                per_square.copy_from_slice(model_frame);
+            }
+
+            let embedding = {
+                let mut pooled = vec![0.0f32; embed_dim];
+                for sq in 0..64usize {
+                    let src = sq * embed_dim;
+                    for dim in 0..embed_dim {
+                        pooled[dim] += model_frame[src + dim];
+                    }
+                }
+                for value in &mut pooled {
+                    *value /= 64.0;
+                }
+                let norm = pooled
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-6);
+                for value in &mut pooled {
+                    *value /= norm;
+                }
+                match &self.whitening {
+                    Some(whitening) => whitening.apply(&pooled),
+                    None => pooled,
+                }
+            };
+
+            out.push((
+                prediction,
+                EmbeddingOutput {
+                    embedding,
+                    per_square,
+                    embed_dim,
+                },
+            ));
+        }
+
+        Ok(out)
+    }
+
     /// Raw L2-normalized trunk-mean embeddings for a batch, with NO whitening
     /// applied regardless of the configured embedding source. Used by offline
     /// tooling (`compute-whitening`) that estimates whitening statistics.
@@ -873,9 +1005,7 @@ where
         }
         let (batched_board, batched_globals, _flipped_currents, _is_black_to_move_flags, n) =
             self.build_batched_inputs(items)?;
-        let (_policy, _value, _side_info, _time_usage, trunk, _policy_tokens) = self
-            .model
-            .forward_with_trunk(batched_board, batched_globals);
+        let trunk = self.model.forward_trunk(batched_board, batched_globals);
 
         let trunk_dims = trunk.dims();
         debug_assert_eq!(trunk_dims[0], n);
@@ -974,8 +1104,8 @@ where
             &flipped_currents,
             &is_black_to_move_flags,
             policy_logits,
-            value_logits,
-            time_usage_logits,
+            Some(value_logits),
+            Some(time_usage_logits),
         )?;
 
         let mut out: Vec<(OxiPrediction, Vec<AttentionLayer>, EmbeddingOutput)> =
@@ -1063,31 +1193,37 @@ where
         B::FloatElem: From<f32>,
     {
         let n = items.len();
-        let mut board_tensors: Vec<Tensor<B, 3>> = Vec::with_capacity(n);
-        let mut global_tensors: Vec<Tensor<B, 2>> = Vec::with_capacity(n);
+        let built = items
+            .par_iter()
+            .map(|item| {
+                if item.positions.is_empty() {
+                    return Err(anyhow::anyhow!("BatchItem has an empty positions vec"));
+                }
+                let is_black_to_move = item.positions[0].turn() == Color::Black;
+                let (board, globals, flipped_current, _imbalance_history) =
+                    build_input_parts(&item.positions, &item.previous_moves, &item.globals)?;
+                Ok((board, globals, flipped_current, is_black_to_move))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut board_data: Vec<f32> = Vec::with_capacity(n * 64 * FEATURES_PER_TOKEN);
+        let mut global_data: Vec<f32> = Vec::with_capacity(n * NUM_GLOBALS);
         let mut flipped_currents: Vec<Chess> = Vec::with_capacity(n);
         let mut is_black_to_move_flags: Vec<bool> = Vec::with_capacity(n);
 
-        for item in items.iter() {
-            if item.positions.is_empty() {
-                return Err(anyhow::anyhow!("BatchItem has an empty positions vec"));
-            }
-            let (board_tensor, global_tensor, flipped_current, _imbalance_history) =
-                self.create_input_tensors(&item.positions, &item.previous_moves, &item.globals)?;
-
-            let is_black_to_move = item.positions[0].turn() == Color::Black;
-
-            board_tensors.push(board_tensor);
-            global_tensors.push(global_tensor);
+        for (board, globals, flipped_current, is_black_to_move) in built {
+            debug_assert_eq!(board.len(), 64 * FEATURES_PER_TOKEN);
+            debug_assert_eq!(globals.len(), NUM_GLOBALS);
+            board_data.extend_from_slice(&board);
+            global_data.extend_from_slice(&globals);
             flipped_currents.push(flipped_current);
             is_black_to_move_flags.push(is_black_to_move);
         }
 
-        // Stack along batch axis. Each tensor is already [1, 64, F] / [1, G],
-        // so `cat(..., 0)` produces [N, 64, F] / [N, G] without needing an
-        // extra unsqueeze.
-        let batched_board = Tensor::cat(board_tensors, 0);
-        let batched_globals = Tensor::cat(global_tensors, 0);
+        let batched_board = Tensor::<B, 1>::from_floats(board_data.as_slice(), &self.device)
+            .reshape([n, 64, FEATURES_PER_TOKEN]);
+        let batched_globals = Tensor::<B, 1>::from_floats(global_data.as_slice(), &self.device)
+            .reshape([n, NUM_GLOBALS]);
 
         Ok((
             batched_board,
@@ -1109,8 +1245,8 @@ where
         flipped_currents: &[Chess],
         is_black_to_move_flags: &[bool],
         policy_logits: Tensor<B, 3>,
-        value_logits: Tensor<B, 2>,
-        time_usage_logits: Tensor<B, 2>,
+        value_logits: Option<Tensor<B, 2>>,
+        time_usage_logits: Option<Tensor<B, 2>>,
     ) -> anyhow::Result<Vec<OxiPrediction>>
     where
         B::FloatElem: From<f32>,
@@ -1158,13 +1294,15 @@ where
         let probs_data = probs.to_data();
         let probs_slice = probs_data.as_slice::<f32>().unwrap();
 
-        let value_log_probs = log_softmax(value_logits.clone(), 1);
-        let value_probs = value_log_probs.exp();
-        let value_data = value_probs.to_data();
-        let value_slice = value_data.as_slice::<f32>().unwrap();
+        let value_data = value_logits.map(|logits| log_softmax(logits, 1).exp().to_data());
+        let value_slice = value_data
+            .as_ref()
+            .map(|data| data.as_slice::<f32>().unwrap());
 
-        let time_params_data = time_usage_logits.to_data();
-        let time_params_slice = time_params_data.as_slice::<f32>().unwrap();
+        let time_params_data = time_usage_logits.map(|logits| logits.to_data());
+        let time_params_slice = time_params_data
+            .as_ref()
+            .map(|data| data.as_slice::<f32>().unwrap());
 
         let mut out: Vec<OxiPrediction> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1203,17 +1341,28 @@ where
                 .collect();
 
             // WDL for row i. Ordering: [loss, draw, win].
-            let v_off = i * 3;
-            let wdl = WdlPrediction {
-                loss_prob: value_slice[v_off],
-                draw_prob: value_slice[v_off + 1],
-                win_prob: value_slice[v_off + 2],
+            let wdl = if let Some(value_slice) = value_slice {
+                let v_off = i * 3;
+                WdlPrediction {
+                    loss_prob: value_slice[v_off],
+                    draw_prob: value_slice[v_off + 1],
+                    win_prob: value_slice[v_off + 2],
+                }
+            } else {
+                WdlPrediction {
+                    loss_prob: 1.0 / 3.0,
+                    draw_prob: 1.0 / 3.0,
+                    win_prob: 1.0 / 3.0,
+                }
             };
 
             // Time usage params for row i (alpha, beta).
-            let t_off = i * 2;
-            let alpha = time_params_slice[t_off];
-            let beta = time_params_slice[t_off + 1];
+            let (alpha, beta) = if let Some(time_params_slice) = time_params_slice {
+                let t_off = i * 2;
+                (time_params_slice[t_off], time_params_slice[t_off + 1])
+            } else {
+                (0.0, 0.0)
+            };
             let denom = alpha + beta;
             let expected_fraction = if denom > 0.0 { alpha / denom } else { 0.0 };
             let expected_seconds = expected_fraction * item.globals.time_remaining_self as f32;
@@ -1257,8 +1406,9 @@ where
         let current_position = &positions[0];
         let is_black_to_move = current_position.turn() == Color::Black;
 
-        let (policy_logits, _value_logits, _side_info_logits, _time_usage_logits) =
-            self.model.forward(board_tensor, global_features_tensor);
+        let policy_logits = self
+            .model
+            .forward_policy(board_tensor, global_features_tensor);
 
         // Get legal moves mask
         let mut legal_moves_mask = vec![0.0f32; LEGAL_MOVES];
@@ -1311,16 +1461,6 @@ where
         }
 
         Ok(result)
-    }
-
-    /// Helper function to flip a chess position for Black's perspective
-    fn flip_position(&self, position: &Chess) -> anyhow::Result<Chess> {
-        let fen_string = Fen::from_position(position, EnPassantMode::Legal).to_string();
-        let mirrored_fen = mirror_fen(&fen_string);
-        let flipped_position: Chess = mirrored_fen
-            .parse::<Fen>()?
-            .into_position(shakmaty::CastlingMode::Standard)?;
-        Ok(flipped_position)
     }
 
     /// Analyze a position from FEN and return detailed information
