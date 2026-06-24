@@ -1025,13 +1025,16 @@ impl Config {
         match model_size {
             ModelSize::Full => {}
             ModelSize::Mini => {
-                // Target roughly 1/10th of the full model's parameter count.
-                // The measured policy-forward tradeoff is best with fewer
-                // layers; use the aggressive 128d/3L preset unless quality
-                // says we need to buy back width.
-                self.embed_dim = 128;
+                // 192d/3L/8H: chosen by an iso-latency architecture sweep on
+                // the decayed-58 encoding (full-Allie eval). Width dominates
+                // depth here — 192/3 was iso-latency with 128/3 at batch-1
+                // serving yet scored +2.5pt Allie top-1 (48.98% vs 46.45%),
+                // and beat the 128/4 depth variant on both accuracy and
+                // latency. Heads are ~free, so 8. Smolgen stays small — a 2x
+                // smolgen variant regressed in the same sweep.
+                self.embed_dim = 192;
                 self.num_layers = 3;
-                self.num_heads = 4;
+                self.num_heads = 8;
                 self.smolgen_hidden = 12;
                 self.smolgen_global_dim = 80;
                 self.smolgen_gen_size = 80;
@@ -1047,7 +1050,11 @@ impl Config {
                 self.calibration_loss_weight = 0.0;
                 self.policy_regret_loss_weight = 0.0;
 
-                self.physical_batch_size = 8192;
+                // 4096 fits 192/3/8 on an 80GB card with headroom for the
+                // EMA-eval forward pass; 8192 (the old 128/3 batch) peaks at
+                // ~97% and risks OOM. This is also the batch the sweep
+                // measured 192/3/8's 48.98% at.
+                self.physical_batch_size = 4096;
                 self.full_metrics_interval = 100;
                 self.checkpoint_interval = 200;
                 self.whiten_after_training = Some(true);
