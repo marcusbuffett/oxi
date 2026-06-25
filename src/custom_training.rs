@@ -1506,17 +1506,20 @@ where
                     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
                 resume_status = format!("Requested; loaded {}", legacy_path.display());
             } else {
-                tracing::warn!(
-                    "Resume requested but checkpoint {} (or legacy {}) was not found; starting fresh",
+                // Hard abort: silently "starting fresh" here used to wipe the
+                // log dir (clearing the very checkpoint the user asked to
+                // resume from, plus anything else in it). If --resume was
+                // requested, a missing checkpoint is a fatal error — never
+                // fall through to a destructive fresh start.
+                anyhow::bail!(
+                    "--resume was requested but no checkpoint was found at {} \
+                     (or legacy {}). Refusing to start fresh, which would clear \
+                     the log directory. To start a NEW run, drop --resume and use \
+                     a fresh --log-dir; to resume, point --log-dir at a directory \
+                     that already contains {MODEL_FILE_NAME}.",
                     model_file.display(),
-                    legacy_path.display()
+                    legacy_path.display(),
                 );
-                println!(
-                    "Resume requested but {} (or legacy {}) was not found; starting fresh",
-                    model_file.display(),
-                    legacy_path.display()
-                );
-                resume_status = format!("Requested; missing {}", model_file.display());
             }
         }
     }

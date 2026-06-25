@@ -872,9 +872,31 @@ async fn main() -> Result<()> {
                 let config = Config::with_overrides(overrides);
                 if let Some(ref log_dir) = config.log_dir {
                     if log_dir.exists() {
-                        tracing::info!("Clearing log directory: {}", log_dir.display());
-                        if let Err(e) = std::fs::remove_dir_all(log_dir) {
-                            eprintln!("Warning: failed to clear log directory: {}", e);
+                        // A checkpoint lives at log_dir/model/model.mpk.
+                        let checkpoint = log_dir.join("model").join("model.mpk");
+                        if config.resume.unwrap_or(false) {
+                            // Resuming: NEVER clear — the checkpoint we are about
+                            // to load lives in here. (This unconditional clear
+                            // previously wiped the very run being resumed.)
+                            tracing::info!(
+                                "Resuming; preserving existing log directory: {}",
+                                log_dir.display()
+                            );
+                        } else if checkpoint.exists() {
+                            // Fresh run, but this dir already holds a real
+                            // checkpoint. Refuse to destroy it silently.
+                            anyhow::bail!(
+                                "Refusing to clear log directory {} — it contains a \
+                                 checkpoint ({}). Pass --resume to continue that run, \
+                                 or choose a fresh --log-dir for a new one.",
+                                log_dir.display(),
+                                checkpoint.display(),
+                            );
+                        } else {
+                            tracing::info!("Clearing log directory: {}", log_dir.display());
+                            if let Err(e) = std::fs::remove_dir_all(log_dir) {
+                                eprintln!("Warning: failed to clear log directory: {}", e);
+                            }
                         }
                     }
                 }
