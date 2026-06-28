@@ -226,19 +226,8 @@ pub struct Config {
 
     pub num_devices: usize,
 
-    /// Probability of dropping positions based on ply (exponential ramp; see
-    /// `ply_keep_floor` / `ply_keep_full_at`). `Some(false)` disables it.
+    /// Probability of dropping positions based on ply (80% at ply 0, 0% at ply 10+)
     pub enable_ply_sampling: Option<bool>,
-
-    /// Keep-probability at ply 0 — the floor of the exponential ply ramp.
-    /// Lower = openings dropped harder. (linear 0.2→1.0 over 0–10 was the old behavior)
-    #[serde(default = "default_ply_keep_floor")]
-    pub ply_keep_floor: f64,
-
-    /// Ply by which keep-probability reaches ~0.95 (controls ramp length).
-    /// Larger = openings downsampled harder/longer. Mini ~10, full ~20.
-    #[serde(default = "default_ply_keep_full_at")]
-    pub ply_keep_full_at: f64,
 
     /// Maximum ply (inclusive) to include training samples for. Samples with
     /// `current_ply > max_ply` are skipped. `None` disables the upper bound.
@@ -429,14 +418,6 @@ fn default_wsd_decay_fraction() -> f64 {
 }
 fn default_ema_beta() -> f64 {
     0.999
-}
-
-fn default_ply_keep_floor() -> f64 {
-    0.2
-}
-
-fn default_ply_keep_full_at() -> f64 {
-    10.0
 }
 fn default_ema_eval_games() -> usize {
     200
@@ -675,14 +656,6 @@ pub struct ConfigOverrides {
     /// EMA decay factor for the instrumentation copy of the weights
     #[arg(long)]
     pub ema_beta: Option<f64>,
-
-    /// Keep-probability at ply 0 (exponential ply-ramp floor; lower = drop more openings)
-    #[arg(long)]
-    pub ply_keep_floor: Option<f64>,
-
-    /// Ply by which keep-probability reaches ~0.95 (mini ~10, full ~20)
-    #[arg(long)]
-    pub ply_keep_full_at: Option<f64>,
 
     /// Allie test set JSONL for checkpoint-cadence live/EMA eval
     #[arg(long)]
@@ -972,12 +945,6 @@ impl Config {
         }
         if let Some(v) = overrides.elo_priority_boost {
             config.elo_priority_boost = v;
-        }
-        if let Some(v) = overrides.ply_keep_floor {
-            config.ply_keep_floor = v;
-        }
-        if let Some(v) = overrides.ply_keep_full_at {
-            config.ply_keep_full_at = v;
         }
         if let Some(v) = overrides.puzzle_sampling_ratio {
             config.puzzle_sampling_ratio = v;
@@ -1332,8 +1299,6 @@ impl Default for Config {
             disable_training_shuffle: Some(false),
             full_metrics_interval: 50,
             elo_priority_boost: 3.0,
-            ply_keep_floor: 0.2,
-            ply_keep_full_at: 10.0,
             puzzle_sampling_ratio: 0.0,
             puzzle_path: None,
             calibration_db_path: None,
@@ -1423,17 +1388,12 @@ pub fn auto_physical_batch_size(num_params: usize) -> usize {
 /// Calculate probability of keeping a position based on ply number
 /// 80% drop at ply 0, grading down to 0% drop at ply 10+
 pub fn ply_keep_probability(ply: usize) -> f64 {
-    // Exponential ramp: keep starts at `ply_keep_floor` at ply 0 and rises toward
-    // 1.0, reaching ~0.95 by `ply_keep_full_at` (rejection = 1-keep decays
-    // exponentially). Tunable per run (mini gentle ~10, full aggressive: lower
-    // floor + larger full_at). Falls back to defaults when no global config is set
-    // (e.g. unit tests).
-    let (floor, full_at) = global_config()
-        .map(|c| (c.ply_keep_floor, c.ply_keep_full_at))
-        .unwrap_or((0.2, 10.0));
-    let full_at = full_at.max(1.0);
-    let keep = 1.0 - (1.0 - floor) * (-3.0 * ply as f64 / full_at).exp();
-    keep.clamp(floor, 1.0)
+    if ply >= 10 {
+        1.0
+    } else {
+        // Linear interpolation from 0.2 (20% keep) at ply 0 to 1.0 (100% keep) at ply 10
+        0.2 + (0.8 * ply as f64 / 10.0)
+    }
 }
 
 const ELO_DISTRIBUTION_MEAN: f64 = 1672.0;
