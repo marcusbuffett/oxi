@@ -253,30 +253,47 @@ where
 /// Top-1 move-matching accuracy of an inner-backend model over a fixed set of
 /// Allie eval positions. Used at checkpoint cadence for both the live and EMA
 /// weights so plateau-vs-hidden-progress is visible from metrics_logs.
+/// Returns `(overall_top1, opening_top1)` where `opening` is restricted to
+/// positions with `ply < OPENING_PLY_CUTOFF`. The opening number lets us see how
+/// well a model learns the opening stage under different training filters (e.g.
+/// `--max-ply`), which the overall Allie top-1 hides.
 fn checkpoint_allie_top1<B: Backend>(
     model: OXIModel<B>,
     config: &Config,
     device: &B::Device,
     items: &[crate::allie_eval::EvalItem],
-) -> anyhow::Result<f64>
+) -> anyhow::Result<(f64, f64)>
 where
     B::FloatElem: From<f32>,
     B::IntElem: From<i32>,
 {
+    const OPENING_PLY_CUTOFF: usize = 40;
     let engine = crate::inference::InferenceEngine::new(model, config.clone(), device.clone());
-    let mut matched = 0usize;
+    let (mut matched, mut total) = (0usize, 0usize);
+    let (mut open_matched, mut open_total) = (0usize, 0usize);
     for chunk in items.chunks(512) {
         let batch: Vec<_> = chunk.iter().map(|it| it.batch_item.clone()).collect();
         let predictions = engine.predict_batch(&batch)?;
         for (item, prediction) in chunk.iter().zip(&predictions) {
-            if let Some(top) = prediction.moves.first() {
-                if top.uci_move == item.target_uci {
-                    matched += 1;
+            let hit = prediction
+                .moves
+                .first()
+                .is_some_and(|top| top.uci_move == item.target_uci);
+            total += 1;
+            if hit {
+                matched += 1;
+            }
+            if item.ply < OPENING_PLY_CUTOFF {
+                open_total += 1;
+                if hit {
+                    open_matched += 1;
                 }
             }
         }
     }
-    Ok(100.0 * matched as f64 / items.len().max(1) as f64)
+    let overall = 100.0 * matched as f64 / total.max(1) as f64;
+    let opening = 100.0 * open_matched as f64 / open_total.max(1) as f64;
+    Ok((overall, opening))
 }
 
 fn save_training_state<B, OM, O1, O2, O3, O4>(
@@ -3184,26 +3201,35 @@ where
                         checkpoint_allie_top1(model.valid(), &config, &main_device, items);
                     let ema_top1 = checkpoint_allie_top1(ema_model, &config, &main_device, items);
                     match (live_top1, ema_top1) {
-                        (Ok(live), Ok(ema)) => {
+                        (Ok((live, live_open)), Ok((ema, ema_open))) => {
                             metric_logger.log("allie_top1_live", iteration, live);
                             metric_logger.log("allie_top1_ema", iteration, ema);
+                            metric_logger.log("allie_open_top1_live", iteration, live_open);
+                            metric_logger.log("allie_open_top1_ema", iteration, ema_open);
                             // `Base|series` names land both curves in one TUI chart.
-                            for (series, value) in [("live", live), ("ema", ema)] {
-                                let formatted = format!("{value:.2}%");
-                                renderer.update_train(MetricState::Numeric {
-                                    name: format!("Allie Top-1|{series}"),
-                                    entry: SerializedEntry::new(formatted.clone(), formatted),
-                                    value: NumericEntry::Value(value),
-                                });
+                            for (chart, live_v, ema_v) in [
+                                ("Allie Top-1", live, ema),
+                                ("Allie Opening Top-1 (<40)", live_open, ema_open),
+                            ] {
+                                for (series, value) in [("live", live_v), ("ema", ema_v)] {
+                                    let formatted = format!("{value:.2}%");
+                                    renderer.update_train(MetricState::Numeric {
+                                        name: format!("{chart}|{series}"),
+                                        entry: SerializedEntry::new(formatted.clone(), formatted),
+                                        value: NumericEntry::Value(value),
+                                    });
+                                }
                             }
                             // No println here: the TUI owns the terminal during
                             // training and raw stdout corrupts it. The numbers
                             // land in the TUI chart, metrics_logs, and train.log.
                             tracing::info!(
-                                "checkpoint_eval: iter={} live_top1={:.2}% ema_top1={:.2}% ({:?})",
+                                "checkpoint_eval: iter={} live_top1={:.2}% ema_top1={:.2}% live_open_top1={:.2}% ema_open_top1={:.2}% ({:?})",
                                 iteration,
                                 live,
                                 ema,
+                                live_open,
+                                ema_open,
                                 t_eval.elapsed()
                             );
                         }
