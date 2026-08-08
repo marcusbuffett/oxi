@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
 
-pub const NUM_GLOBALS: usize = 13;
+// 13 scalar features + soft two-hot Elo bins for self and opponent.
+pub const ELO_BIN_MIN: i32 = 600;
+pub const ELO_BIN_WIDTH: i32 = 100;
+pub const ELO_BINS: usize = 23; // 600..=2800
+pub const NUM_GLOBALS: usize = 13 + 2 * ELO_BINS;
 
 // Train-time grouped metadata dropout. One-off serving requests (EPD, no
 // game context) have no clock and no move history; training with the same
@@ -49,11 +53,13 @@ pub const HISTORY_DECAY: f32 = 0.8; // Exponential decay factor for historical p
 // Global config storage
 static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 
-/// Minimum Elo rating for both players to include games
-pub const MIN_ELO: i32 = 1000;
+/// Minimum Elo rating for both players to include games. Lowered from 1000
+/// (2026-08): sub-1000 was 12% of the Allie test set and the rating bands the
+/// intuition builder targets need real low-elo play, not extrapolation.
+pub const MIN_ELO: i32 = 600;
 pub const MIN_PLY: usize = 0;
 pub const MAX_ELO: i32 = 3000;
-pub const MAX_ELO_DIFF: i32 = 200;
+pub const MAX_ELO_DIFF: i32 = 400;
 /// Games qualify only with base time above this (seconds). Excludes bullet
 /// and short blitz like 2+1, whose time-scramble moves aren't worth modeling.
 pub const MIN_TIME_CONTROL: u32 = 121;
@@ -1310,7 +1316,9 @@ impl Default for Config {
             shuffle_buffer_size: 100000,
             disable_training_shuffle: Some(false),
             full_metrics_interval: 50,
-            elo_priority_boost: 3.0,
+            // Rating-fidelity default: no strength bias. Bot-strength runs
+            // that want extra 2000+ mass pass --elo-priority-boost explicitly.
+            elo_priority_boost: 0.0,
             puzzle_sampling_ratio: 0.0,
             puzzle_path: None,
             calibration_db_path: None,
@@ -1436,12 +1444,12 @@ pub fn elo_keep_probability_with_boost(avg_elo: f64, priority_boost: f64) -> f64
 
     let peak_density = ELO_DISTRIBUTION.pdf(ELO_DISTRIBUTION_MEAN);
     let relative_frequency = natural_frequency / peak_density;
-    let flatten_prob = (ELO_FLATTENING_FACTOR / relative_frequency).clamp(0.0, 1.0);
-
-    let elo_clamped = avg_elo.clamp(MIN_ELO as f64, MAX_ELO as f64);
-    let graduated_prob = (elo_clamped - MIN_ELO as f64) / (MAX_ELO - MIN_ELO) as f64;
-
-    let base_prob = flatten_prob * graduated_prob;
+    // True band-flattening: keep-probability is inverse to natural frequency,
+    // nothing else. The old linear ramp ((elo-1000)/2000) skewed effective
+    // training mass toward 2400+ and starved the low bands the products
+    // condition on — measured as rating compression at inference. Strength
+    // bias for bot-targeted runs is opt-in via --elo-priority-boost.
+    let base_prob = (ELO_FLATTENING_FACTOR / relative_frequency).clamp(0.0, 1.0);
 
     if priority_boost > 0.0 && avg_elo >= ADVANCED_ELO_THRESHOLD {
         let boost_progress = ((avg_elo - ADVANCED_ELO_THRESHOLD) / ADVANCED_ELO_RANGE).min(1.0);

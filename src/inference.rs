@@ -405,10 +405,10 @@ impl GlobalFeaturesInternal {
     /// Compute normalized global features
     pub fn to_normalized(&self) -> GlobalFeaturesNormalized {
         let base_time = self.base_time.max(1);
-        // Normalize Elo over 800..2800, clamping out-of-range ratings to the
-        // nearest end of the scale.
-        let elo_self_normalized = ((self.elo_self - 800) as f32 / 2000.0).clamp(0.0, 1.0);
-        let elo_oppo_normalized = ((self.elo_oppo - 800) as f32 / 2000.0).clamp(0.0, 1.0);
+        // Normalize Elo over 600..2800 (matches MIN_ELO and the soft-bin
+        // range), clamping out-of-range ratings to the nearest end.
+        let elo_self_normalized = ((self.elo_self - 600) as f32 / 2200.0).clamp(0.0, 1.0);
+        let elo_oppo_normalized = ((self.elo_oppo - 600) as f32 / 2200.0).clamp(0.0, 1.0);
 
         // Material imbalance: difference in total material (white - black) normalized to [0,1]
         // Max absolute imbalance ~15
@@ -442,7 +442,7 @@ impl GlobalFeaturesInternal {
         // zero-clock (flagging) state.
         let clock = if self.clock_missing { 0.0 } else { 1.0 };
         let history = if self.history_missing { 0.0 } else { 1.0 };
-        let globals = vec![
+        let mut globals = vec![
             normalized.time_self_normalized * clock,
             normalized.time_self_ratio * clock,
             normalized.time_oppo_normalized * clock,
@@ -457,9 +457,31 @@ impl GlobalFeaturesInternal {
             1.0 - clock,
             1.0 - history,
         ];
+        globals.extend_from_slice(&elo_soft_bins(self.elo_self));
+        globals.extend_from_slice(&elo_soft_bins(self.elo_oppo));
         assert_eq!(globals.len(), NUM_GLOBALS);
         globals
     }
+}
+
+/// Soft two-hot Elo embedding: triangular interpolation over
+/// [`crate::config::ELO_BIN_MIN`]..[`crate::config::ELO_BIN_MAX`] in
+/// [`crate::config::ELO_BIN_WIDTH`] steps. Gives the FiLM conditioning a
+/// high-dimensional, locally-selective skill signal (Maia-2 style) instead of
+/// only a single clamped scalar — the scalar alone measurably under-drives
+/// rating sensitivity (predictions compress toward the training-mass mode).
+pub fn elo_soft_bins(elo: i32) -> [f32; crate::config::ELO_BINS] {
+    use crate::config::{ELO_BINS, ELO_BIN_MIN, ELO_BIN_WIDTH};
+    let mut bins = [0.0f32; ELO_BINS];
+    let max = ELO_BIN_MIN + ELO_BIN_WIDTH * (ELO_BINS as i32 - 1);
+    let clamped = (elo.clamp(ELO_BIN_MIN, max) - ELO_BIN_MIN) as f32 / ELO_BIN_WIDTH as f32;
+    let lower = clamped.floor() as usize;
+    let frac = clamped - lower as f32;
+    bins[lower] = 1.0 - frac;
+    if frac > 0.0 {
+        bins[lower + 1] = frac;
+    }
+    bins
 }
 
 impl Default for GlobalFeatures {
@@ -1851,9 +1873,28 @@ mod tests {
         };
         let vec_masked = masked.to_internal(3, vec![0, 1, 3]).to_feature_vector();
         // Missing metadata: clock group + move count zeroed, indicators on,
-        // elo/material/piece features untouched.
+        // elo/material/piece features + elo bins untouched.
         assert_eq!(&vec_masked[0..6], &[0.0; 6]);
         assert_eq!(&vec_masked[11..13], &[1.0, 1.0]);
         assert_eq!(&vec_masked[6..11], &vec_full[6..11]);
+        assert_eq!(&vec_masked[13..], &vec_full[13..]);
+    }
+
+    #[test]
+    fn test_elo_soft_bins() {
+        // 1800 sits exactly on bin 12 (600 + 12*100).
+        let exact = elo_soft_bins(1800);
+        assert_eq!(exact[12], 1.0);
+        assert_eq!(exact.iter().sum::<f32>(), 1.0);
+
+        // 1830 interpolates between bins 12 and 13.
+        let mid = elo_soft_bins(1830);
+        assert!((mid[12] - 0.7).abs() < 1e-6);
+        assert!((mid[13] - 0.3).abs() < 1e-6);
+        assert!((mid.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+
+        // Out-of-range clamps to the end bins without panicking.
+        assert_eq!(elo_soft_bins(400)[0], 1.0);
+        assert_eq!(elo_soft_bins(3200)[22], 1.0);
     }
 }

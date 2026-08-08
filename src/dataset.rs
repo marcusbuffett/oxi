@@ -609,4 +609,56 @@ where
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
+
+    fn example() -> ChessExample {
+        ChessExample {
+            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".into(),
+            move_uci: "e2e4".into(),
+            elo_self: 1500,
+            elo_oppo: 1500,
+            outcome: 1.0,
+            previous_fens: vec![],
+            previous_moves: vec![],
+            time_remaining_self: 300,
+            time_remaining_oppo: 300,
+            time_used_for_move: 5,
+            original_time_control: (300, 0),
+            move_count: 0,
+            material_imbalance_history: vec![],
+            is_puzzle: false,
+        }
+    }
+
+    #[test]
+    fn metadata_dropout_rates() {
+        let _ = crate::config::set_global_config(ModelConfig::default());
+        let clean = OXIDataset::new(Vec::new(), ModelConfig::default());
+        let dropped =
+            OXIDataset::new(Vec::new(), ModelConfig::default()).with_metadata_dropout(true);
+
+        let n = 3000;
+        let mut clock = 0;
+        let mut history = 0;
+        for _ in 0..n {
+            let item = dropped.process_example(&example()).unwrap();
+            clock += item.global_features.clock_missing as usize;
+            history += item.global_features.history_missing as usize;
+        }
+        // Expect 20% each (10% group-only + 10% both); allow generous slack.
+        let clock_rate = clock as f64 / n as f64;
+        let history_rate = history as f64 / n as f64;
+        assert!(
+            (0.14..0.26).contains(&clock_rate),
+            "clock rate {clock_rate}"
+        );
+        assert!(
+            (0.14..0.26).contains(&history_rate),
+            "history rate {history_rate}"
+        );
+
+        // Dropout disabled: flags never set.
+        let item = clean.process_example(&example()).unwrap();
+        assert!(!item.global_features.clock_missing);
+        assert!(!item.global_features.history_missing);
+    }
 }
