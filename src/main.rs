@@ -946,11 +946,10 @@ async fn main() -> Result<()> {
                 #[cfg(all(target_os = "linux", feature = "backend-candle"))]
                 {
                     type Backend = Autodiff<Candle<f32, i64>>;
-                    let devices: Vec<burn::tensor::Device<Backend>> =
-                        vec![CandleDevice::Cpu; config.num_devices];
-                    println!(
-                        "Using burn-candle backend (CPU for now - CUDA device construction TBD)"
-                    );
+                    let devices: Vec<burn::tensor::Device<Backend>> = (0..config.num_devices)
+                        .map(CandleDevice::cuda)
+                        .collect();
+                    println!("Using burn-candle backend (CUDA)");
                     train_custom::<Backend>(config.clone(), devices)?;
                 }
 

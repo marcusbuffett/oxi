@@ -11,9 +11,17 @@ every device we run on:
   separate CUDA toolkit / `backend-cuda` build is needed.
 
 Do **not** use `backend-cuda`, `backend-wgpu`, `backend-metal`, `backend-candle`,
-or `backend-ndarray` — they are unmaintained and don't build/run. Plain
-`cargo build` / `cargo run` now pulls in `backend-tch`; for training add
+or `backend-ndarray`. Re-tested 2026-08-08 on an H100: `backend-cuda` and
+`backend-candle-cuda` now *build* (burn tracks main), but burn-cuda crashes at
+runtime in CubeCL's matmul autotuner on our shapes. tch remains the backend.
+Plain `cargo build` / `cargo run` now pulls in `backend-tch`; for training add
 `--features train` (so: `cargo run --release --features train -- train ...`).
+
+**Always train with `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`.** PyTorch defaults
+matmul TF32 to OFF, which leaves H100/A100 tensor cores idle for FP32 matmuls;
+the override is a measured ~1.3x end-to-end iteration speedup on the 768/8
+model (710ms -> ~530ms per batch-512 iteration) with standard TF32 training
+numerics. tch 0.22 exposes no API for this — the env var is the mechanism.
 
 ## Local Compilation Check
 
