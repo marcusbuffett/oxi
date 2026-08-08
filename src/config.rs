@@ -1444,12 +1444,19 @@ pub fn elo_keep_probability_with_boost(avg_elo: f64, priority_boost: f64) -> f64
 
     let peak_density = ELO_DISTRIBUTION.pdf(ELO_DISTRIBUTION_MEAN);
     let relative_frequency = natural_frequency / peak_density;
-    // True band-flattening: keep-probability is inverse to natural frequency,
-    // nothing else. The old linear ramp ((elo-1000)/2000) skewed effective
-    // training mass toward 2400+ and starved the low bands the products
-    // condition on — measured as rating compression at inference. Strength
-    // bias for bot-targeted runs is opt-in via --elo-priority-boost.
-    let base_prob = (ELO_FLATTENING_FACTOR / relative_frequency).clamp(0.0, 1.0);
+    // Band-flattening (inverse to natural frequency — the ~1500-1700 natural
+    // peak is suppressed, NOT majority) with a mild monotone tilt toward
+    // strength. The old ramp ((elo-1000)/2000, then a 4x default boost >=2000)
+    // tilted the flattened pool 10-20x toward 2400+ — measured as ~75% of
+    // training mass >=2150 and rating compression at inference. The 0.6->1.0
+    // tilt keeps the strongest bands sampled hardest (playing strength) at a
+    // max 1.67x ratio so low bands still carry real mass (rating fidelity).
+    // Extra strength bias for bot-targeted runs is opt-in via
+    // --elo-priority-boost.
+    let flatten_prob = (ELO_FLATTENING_FACTOR / relative_frequency).clamp(0.0, 1.0);
+    let elo_clamped = avg_elo.clamp(MIN_ELO as f64, MAX_ELO as f64);
+    let tilt = 0.6 + 0.4 * (elo_clamped - MIN_ELO as f64) / (MAX_ELO - MIN_ELO) as f64;
+    let base_prob = flatten_prob * tilt;
 
     if priority_boost > 0.0 && avg_elo >= ADVANCED_ELO_THRESHOLD {
         let boost_progress = ((avg_elo - ADVANCED_ELO_THRESHOLD) / ADVANCED_ELO_RANGE).min(1.0);
