@@ -852,8 +852,11 @@ impl<B: Backend> OXIModel<B> {
 
         // Only compute time usage loss if weight is non-zero
         let (base_time_usage_loss, time_usage_term) = if config.time_usage_loss_weight > 0.0 {
-            let time_usage_loss = self
-                .compute_time_usage_loss_impl(time_usage_logits.clone(), batch.time_usages.clone());
+            let time_usage_loss = self.compute_time_usage_loss_impl(
+                time_usage_logits.clone(),
+                batch.time_usages.clone(),
+                batch.time_usage_mask.clone(),
+            );
             let weighted = time_usage_loss.clone() * config.time_usage_loss_weight;
             (time_usage_loss, weighted)
         } else {
@@ -1474,13 +1477,16 @@ impl<B: Backend> OXIModel<B> {
     where
         B::FloatElem: From<f32>,
     {
-        self.compute_time_usage_loss_impl(time_usage_logits, targets)
+        let batch_size = time_usage_logits.dims()[0];
+        let mask = Tensor::ones([batch_size], &time_usage_logits.device());
+        self.compute_time_usage_loss_impl(time_usage_logits, targets, mask)
     }
 
     fn compute_time_usage_loss_impl(
         &self,
         time_usage_logits: Tensor<B, 2>,
         targets: Tensor<B, 2>,
+        mask: Tensor<B, 1>,
     ) -> Tensor<B, 1>
     where
         B::FloatElem: From<f32>,
@@ -1504,7 +1510,10 @@ impl<B: Backend> OXIModel<B> {
         let nll = log_pdf.neg();
         let offset_tensor = Tensor::ones_like(&nll) * offset;
 
-        (nll + offset_tensor).mean().reshape([1])
+        // Masked mean: samples with dropped clock metadata have no learnable
+        // time target, so they contribute nothing to the loss.
+        let mask_sum = mask.clone().sum().clamp_min(1e-8);
+        (((nll + offset_tensor) * mask).sum() / mask_sum).reshape([1])
     }
 
     pub fn get_uncertainties(&self) -> (f32, f32, f32, f32) {

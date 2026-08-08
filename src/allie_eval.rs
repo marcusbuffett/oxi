@@ -62,6 +62,10 @@ pub struct AllieEvalParams {
     pub limit: Option<usize>,
     /// Optional JSONL dump of per-position results.
     pub dump: Option<PathBuf>,
+    /// Evaluate under the one-off serving regime: strip clock + history
+    /// metadata (missing indicators set, no previous positions/moves).
+    /// Measures the quality the server sees for bare-EPD requests.
+    pub mask_metadata: bool,
 }
 
 /// One scoreable position, paired with everything needed to attribute the result.
@@ -196,18 +200,25 @@ fn build_game_items(
 
             // `positions` ends with the position the mover faces, so reversing
             // puts the current position first (the BatchItem convention).
-            let item_positions: Vec<Chess> = positions
-                .iter()
-                .rev()
-                .take(PREVIOUS_POSITIONS + 1)
-                .cloned()
-                .collect();
-            let previous_moves: Vec<String> = uci_moves
-                .iter()
-                .rev()
-                .take(PREVIOUS_POSITIONS)
-                .cloned()
-                .collect();
+            let (item_positions, previous_moves): (Vec<Chess>, Vec<String>) =
+                if params.mask_metadata {
+                    (vec![pos.clone()], Vec::new())
+                } else {
+                    (
+                        positions
+                            .iter()
+                            .rev()
+                            .take(PREVIOUS_POSITIONS + 1)
+                            .cloned()
+                            .collect(),
+                        uci_moves
+                            .iter()
+                            .rev()
+                            .take(PREVIOUS_POSITIONS)
+                            .cloned()
+                            .collect(),
+                    )
+                };
 
             let globals = GlobalFeatures {
                 time_remaining_self: mover_clock.max(0) as u32,
@@ -220,6 +231,8 @@ fn build_game_items(
                 is_puzzle: false,
                 is_in_check: pos.is_check(),
                 total_pieces: pos.board().occupied().count() as u32,
+                clock_missing: params.mask_metadata,
+                history_missing: params.mask_metadata,
             };
 
             items.push(EvalItem {

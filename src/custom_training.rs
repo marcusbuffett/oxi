@@ -2020,7 +2020,8 @@ where
         )
         .unwrap();
 
-        let dataset_for_processing = OXIDataset::new(Vec::new(), config.clone());
+        let dataset_for_processing =
+            OXIDataset::new(Vec::new(), config.clone()).with_metadata_dropout(true);
         let main_device = devices[0].clone();
         let device_workers = DeviceWorkers::<B>::new(&model, &devices, &main_device);
 
@@ -2242,6 +2243,7 @@ where
                 min_clock: 30,
                 limit: Some(config.ema_eval_games),
                 dump: None,
+                mask_metadata: false,
             })?;
             println!(
                 "Checkpoint eval: {} positions from {:?} (live + EMA top-1 every checkpoint)",
@@ -2252,12 +2254,32 @@ where
         }
         None => None,
     };
+    // Same positions under the one-off serving regime (no clock/history) —
+    // tracks the quality bare-EPD requests will actually see.
+    let ema_eval_items_masked: Option<Vec<crate::allie_eval::EvalItem>> =
+        match &config.ema_eval_dataset {
+            Some(path) => Some(crate::allie_eval::load_eval_items(
+                &crate::allie_eval::AllieEvalParams {
+                    dataset: path.clone(),
+                    batch_size: 512,
+                    skip_plies: 10,
+                    min_clock: 30,
+                    limit: Some(config.ema_eval_games),
+                    dump: None,
+                    mask_metadata: true,
+                },
+            )?),
+            None => None,
+        };
 
     // Process examples into ChessItems and chunk into batches
     // Only need config for process_example, not the examples themselves
-    let dataset_for_processing = OXIDataset::new(Vec::new(), config.clone());
-    let mut debug_monitor =
-        DebugPredictionMonitor::new(&dataset_for_processing, devices[0].clone())?;
+    let dataset_for_processing =
+        OXIDataset::new(Vec::new(), config.clone()).with_metadata_dropout(true);
+    // The debug monitor logs predictions on fixed positions — keep its
+    // processing deterministic by giving it a no-dropout dataset.
+    let dataset_for_debug = OXIDataset::new(Vec::new(), config.clone());
+    let mut debug_monitor = DebugPredictionMonitor::new(&dataset_for_debug, devices[0].clone())?;
 
     // Create interrupter and renderer
     let interruptor = Interrupter::new();
@@ -3199,6 +3221,40 @@ where
                     let t_eval = Instant::now();
                     let live_top1 =
                         checkpoint_allie_top1(model.valid(), &config, &main_device, items);
+                    if let Some(masked_items) = &ema_eval_items_masked {
+                        match checkpoint_allie_top1(
+                            ema_model.clone(),
+                            &config,
+                            &main_device,
+                            masked_items,
+                        ) {
+                            Ok((masked, masked_open)) => {
+                                metric_logger.log("allie_masked_top1_ema", iteration, masked);
+                                metric_logger.log(
+                                    "allie_masked_open_top1_ema",
+                                    iteration,
+                                    masked_open,
+                                );
+                                for (series, value) in [("all", masked), ("open", masked_open)] {
+                                    let formatted = format!("{value:.2}%");
+                                    renderer.update_train(MetricState::Numeric {
+                                        name: format!("Allie Masked Top-1 (EMA)|{series}"),
+                                        entry: SerializedEntry::new(formatted.clone(), formatted),
+                                        value: NumericEntry::Value(value),
+                                    });
+                                }
+                                tracing::info!(
+                                    "checkpoint_eval_masked: iter={} ema_masked_top1={:.2}% ema_masked_open_top1={:.2}%",
+                                    iteration,
+                                    masked,
+                                    masked_open
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("masked checkpoint eval failed: {e:?}");
+                            }
+                        }
+                    }
                     let ema_top1 = checkpoint_allie_top1(ema_model, &config, &main_device, items);
                     match (live_top1, ema_top1) {
                         (Ok((live, live_open)), Ok((ema, ema_open))) => {

@@ -5,7 +5,19 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::{Continuous, Normal};
 use std::sync::OnceLock;
 
-pub const NUM_GLOBALS: usize = 11;
+pub const NUM_GLOBALS: usize = 13;
+
+// Train-time grouped metadata dropout. One-off serving requests (EPD, no
+// game context) have no clock and no move history; training with the same
+// groups masked — plus explicit missing-indicator globals — teaches the
+// model a marginal policy for that regime instead of leaving it
+// off-manifold. Groups are dropped as units: zeroing individual correlated
+// features would create metadata combinations that never occur in play.
+// Sampled per example: 10% clock-only, 10% history-only, 10% both (the
+// exact one-off serving condition), 70% untouched.
+pub const METADATA_DROPOUT_BOTH_P: f32 = 0.10;
+pub const METADATA_DROPOUT_CLOCK_ONLY_P: f32 = 0.10;
+pub const METADATA_DROPOUT_HISTORY_ONLY_P: f32 = 0.10;
 pub const LEGAL_MOVES: usize = 64 * 76;
 // Per-square feature layout. Pruned aggressively after the 2026-06 channel
 // ablation study (see docs/feature_ablation_2026_06.md): pins, pinned

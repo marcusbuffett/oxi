@@ -375,6 +375,11 @@ struct AllieEvalCli {
     /// Write per-position results to this JSONL file
     #[arg(long)]
     dump: Option<PathBuf>,
+
+    /// Evaluate under the one-off serving regime: no clock/history metadata
+    /// (missing indicators set). Measures bare-EPD request quality.
+    #[arg(long, default_value = "false")]
+    mask_metadata: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -599,6 +604,7 @@ fn feature_ablation_command(cli: &FeatureAblationCli) -> Result<()> {
             min_clock: 30,
             limit: Some(cli.limit),
             dump: None,
+            mask_metadata: false,
         },
         cli.batch_size,
     )
@@ -649,6 +655,7 @@ fn evaluate_allie_command(cli: &AllieEvalCli) -> Result<()> {
             min_clock: cli.min_clock,
             limit: cli.limit,
             dump: cli.dump.clone(),
+            mask_metadata: cli.mask_metadata,
         },
     )
 }
@@ -694,6 +701,8 @@ fn compute_whitening_command(cli: &ComputeWhiteningCli) -> Result<()> {
         else {
             continue;
         };
+        // One-off positions with no game context — matches how the server
+        // requests embeddings/predictions for bare EPDs.
         let globals = GlobalFeatures {
             time_remaining_self: 300,
             time_remaining_oppo: 300,
@@ -705,6 +714,8 @@ fn compute_whitening_command(cli: &ComputeWhiteningCli) -> Result<()> {
             is_puzzle: false,
             is_in_check: chess.is_check(),
             total_pieces: chess.board().occupied().count() as u32,
+            clock_missing: true,
+            history_missing: true,
         };
         fens.push(pos.fen.clone());
         items.push(BatchItem {
@@ -1101,6 +1112,8 @@ async fn main() -> Result<()> {
                         is_puzzle: false,
                         is_in_check: chess_pos.is_check(),
                         total_pieces: chess_pos.board().occupied().count() as u32,
+                        clock_missing: true,
+                        history_missing: true,
                     };
 
                     match engine.predict_full_policy(&[chess_pos], &globals, 1.0) {
@@ -1330,6 +1343,8 @@ async fn main() -> Result<()> {
                         is_puzzle: false,
                         is_in_check: chess_pos.is_check(),
                         total_pieces: chess_pos.board().occupied().count() as u32,
+                        clock_missing: true,
+                        history_missing: true,
                     };
 
                     match engine.predict_full_policy(&[chess_pos], &globals, 1.0) {

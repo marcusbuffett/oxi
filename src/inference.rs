@@ -306,6 +306,15 @@ pub struct GlobalFeatures {
     pub is_in_check: bool,
     /// Total number of pieces on the board (game phase proxy)
     pub total_pieces: u32,
+    /// No real clock context (one-off request). Zeroes the clock feature
+    /// group and sets the clock-missing indicator; the raw time fields are
+    /// ignored by the model. Zeroing without the indicator would alias to
+    /// "both flags are about to fall" — a real, behaviorally distinct state.
+    pub clock_missing: bool,
+    /// No real game history (one-off request). Zeroes move-count and sets
+    /// the history-missing indicator; callers should also pass no previous
+    /// positions/moves so the recency planes are empty.
+    pub history_missing: bool,
 }
 
 /// Internal global features with material imbalance (used for prediction)
@@ -341,6 +350,10 @@ pub struct GlobalFeaturesInternal {
     pub is_in_check: bool,
     /// Total number of pieces on the board
     pub total_pieces: u32,
+    /// See [`GlobalFeatures::clock_missing`]
+    pub clock_missing: bool,
+    /// See [`GlobalFeatures::history_missing`]
+    pub history_missing: bool,
 }
 
 /// Normalized global features ready for model input
@@ -382,6 +395,8 @@ impl GlobalFeatures {
             is_puzzle: self.is_puzzle,
             is_in_check: self.is_in_check,
             total_pieces: self.total_pieces,
+            clock_missing: self.clock_missing,
+            history_missing: self.history_missing,
         }
     }
 }
@@ -422,18 +437,25 @@ impl GlobalFeaturesInternal {
     /// Compute global feature vector from the fields (following compute_global_features logic)
     pub fn to_feature_vector(&self) -> Vec<f32> {
         let normalized = self.to_normalized();
+        // Missing metadata groups are zeroed AND flagged: the indicator is
+        // what lets the model tell "no clock context" apart from the real
+        // zero-clock (flagging) state.
+        let clock = if self.clock_missing { 0.0 } else { 1.0 };
+        let history = if self.history_missing { 0.0 } else { 1.0 };
         let globals = vec![
-            normalized.time_self_normalized,
-            normalized.time_self_ratio,
-            normalized.time_oppo_normalized,
-            normalized.time_oppo_ratio,
-            normalized.increment_ratio,
-            normalized.move_count_normalized,
+            normalized.time_self_normalized * clock,
+            normalized.time_self_ratio * clock,
+            normalized.time_oppo_normalized * clock,
+            normalized.time_oppo_ratio * clock,
+            normalized.increment_ratio * clock,
+            normalized.move_count_normalized * history,
             normalized.elo_self_normalized,
             normalized.elo_oppo_normalized,
             if self.is_puzzle { 1.0 } else { 0.0 },
             normalized.material_imbalance_normalized,
             (self.total_pieces as f32 / 32.0).clamp(0.0, 1.0),
+            1.0 - clock,
+            1.0 - history,
         ];
         assert_eq!(globals.len(), NUM_GLOBALS);
         globals
@@ -453,6 +475,8 @@ impl Default for GlobalFeatures {
             is_puzzle: false,
             is_in_check: false,
             total_pieces: 32,
+            clock_missing: false,
+            history_missing: false,
         }
     }
 }
@@ -907,9 +931,9 @@ where
         let (batched_board, batched_globals, flipped_currents, is_black_to_move_flags, n) =
             self.build_batched_inputs(items)?;
 
-        let (policy_logits, trunk, _policy_tokens) =
-            self.model
-                .forward_policy_with_trunk(batched_board, batched_globals);
+        let (policy_logits, trunk, _policy_tokens) = self
+            .model
+            .forward_policy_with_trunk(batched_board, batched_globals);
 
         let trunk_dims = trunk.dims();
         debug_assert_eq!(trunk_dims[0], n);
@@ -1796,5 +1820,40 @@ mod tests {
             snapshot, expected_snapshot,
             "Momentum calculation snapshot changed - verify this is intentional"
         );
+    }
+
+    #[test]
+    fn test_missing_metadata_feature_masking() {
+        let full = GlobalFeatures {
+            time_remaining_self: 120,
+            time_remaining_oppo: 90,
+            base_time: 300,
+            increment: 2,
+            move_count: 30,
+            elo_self: 1800,
+            elo_oppo: 1750,
+            is_puzzle: false,
+            is_in_check: false,
+            total_pieces: 20,
+            clock_missing: false,
+            history_missing: false,
+        };
+        let vec_full = full.to_internal(3, vec![0, 1, 3]).to_feature_vector();
+        assert_eq!(vec_full.len(), NUM_GLOBALS);
+        // Full metadata: indicators off, clock + move-count features non-zero.
+        assert_eq!(&vec_full[11..13], &[0.0, 0.0]);
+        assert!(vec_full[0..6].iter().all(|&v| v > 0.0));
+
+        let masked = GlobalFeatures {
+            clock_missing: true,
+            history_missing: true,
+            ..full.clone()
+        };
+        let vec_masked = masked.to_internal(3, vec![0, 1, 3]).to_feature_vector();
+        // Missing metadata: clock group + move count zeroed, indicators on,
+        // elo/material/piece features untouched.
+        assert_eq!(&vec_masked[0..6], &[0.0; 6]);
+        assert_eq!(&vec_masked[11..13], &[1.0, 1.0]);
+        assert_eq!(&vec_masked[6..11], &vec_full[6..11]);
     }
 }

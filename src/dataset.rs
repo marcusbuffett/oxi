@@ -14,7 +14,10 @@ use crate::calibration::{
     calibration_key_for_sample, dense_move_losses, CalibrationDb, CalibrationKey, CalibrationLabel,
     RegretBin,
 };
-use crate::config::{get_global_config, ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, NUM_GLOBALS};
+use crate::config::{
+    get_global_config, ModelConfig, FEATURES_PER_TOKEN, LEGAL_MOVES, METADATA_DROPOUT_BOTH_P,
+    METADATA_DROPOUT_CLOCK_ONLY_P, METADATA_DROPOUT_HISTORY_ONLY_P, NUM_GLOBALS,
+};
 use crate::encoding::encode_position;
 use crate::inference::{compute_material_imbalance, GlobalFeatures};
 use crate::move_encoding::encode_move;
@@ -109,6 +112,10 @@ pub struct OXIDataset {
     calibration_lookup: Option<Arc<HashMap<CalibrationKey, CalibrationLabel>>>,
     calibration_hits: Arc<AtomicUsize>,
     calibration_misses: Arc<AtomicUsize>,
+    /// Train-time grouped metadata dropout (see config.rs constants). Off by
+    /// default so eval/debug processing sees full metadata; enabled only on
+    /// the training-loop dataset.
+    metadata_dropout: bool,
 }
 
 impl OXIDataset {
@@ -140,7 +147,13 @@ impl OXIDataset {
             calibration_lookup,
             calibration_hits: Arc::new(AtomicUsize::new(0)),
             calibration_misses: Arc::new(AtomicUsize::new(0)),
+            metadata_dropout: false,
         }
+    }
+
+    pub fn with_metadata_dropout(mut self, enabled: bool) -> Self {
+        self.metadata_dropout = enabled;
+        self
     }
 
     /// Load dataset from PGN file
@@ -181,15 +194,42 @@ impl OXIDataset {
         let pos: Chess = fen
             .clone()
             .into_position(shakmaty::CastlingMode::Standard)?;
-        let previous_positions = example
-            .previous_fens
-            .iter()
-            .map(|f| f.parse().unwrap())
-            .map(|f: Fen| f.into_position(shakmaty::CastlingMode::Standard).unwrap())
-            .collect::<Vec<_>>();
+        let (drop_clock, drop_history) = if self.metadata_dropout {
+            let r: f32 = rand::random();
+            if r < METADATA_DROPOUT_BOTH_P {
+                (true, true)
+            } else if r < METADATA_DROPOUT_BOTH_P + METADATA_DROPOUT_CLOCK_ONLY_P {
+                (true, false)
+            } else if r < METADATA_DROPOUT_BOTH_P
+                + METADATA_DROPOUT_CLOCK_ONLY_P
+                + METADATA_DROPOUT_HISTORY_ONLY_P
+            {
+                (false, true)
+            } else {
+                (false, false)
+            }
+        } else {
+            (false, false)
+        };
 
-        // Encode board position with previous moves
-        let previous_moves_uci: Vec<String> = example.previous_moves.clone();
+        let previous_positions = if drop_history {
+            Vec::new()
+        } else {
+            example
+                .previous_fens
+                .iter()
+                .map(|f| f.parse().unwrap())
+                .map(|f: Fen| f.into_position(shakmaty::CastlingMode::Standard).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // Encode board position with previous moves; empty history zeroes the
+        // recency planes, matching one-off (EPD) inference requests.
+        let previous_moves_uci: Vec<String> = if drop_history {
+            Vec::new()
+        } else {
+            example.previous_moves.clone()
+        };
         let board_encoded = encode_position(&pos, &previous_positions, &previous_moves_uci);
 
         let mut move_distribution = vec![0.0; LEGAL_MOVES];
@@ -245,6 +285,8 @@ impl OXIDataset {
             is_puzzle: example.is_puzzle,
             is_in_check: pos.is_check(),
             total_pieces: pos.board().occupied().count() as u32,
+            clock_missing: drop_clock,
+            history_missing: drop_history,
         };
 
         let calibration_label = self.calibration_lookup.as_ref().and_then(|lookup| {
@@ -337,6 +379,7 @@ pub struct ChessBatch<B: Backend> {
     pub board_input: Tensor<B, 3>, // [batch, 64, FEATURES_PER_TOKEN] (16 base + 4 for previous moves)
     pub move_distributions: Tensor<B, 2>, // [batch, 4096] - probability distributions
     pub time_usages: Tensor<B, 2>, // [batch, 1]
+    pub time_usage_mask: Tensor<B, 1>, // [batch] - 0.0 when clock metadata was dropped
     pub legal_moves: Tensor<B, 2>, // [batch, 4096] - 64x64 from-to matrix
     pub side_info: Tensor<B, 2, Int>, // [batch, 141]
     pub values: Tensor<B, 2>,      // [batch, 3] - win, draw, loss probabilities
@@ -358,6 +401,7 @@ impl<B: Backend> ChessBatch<B> {
             board_input: self.board_input.to_device(device),
             move_distributions: self.move_distributions.to_device(device),
             time_usages: self.time_usages.to_device(device),
+            time_usage_mask: self.time_usage_mask.to_device(device),
             legal_moves: self.legal_moves.to_device(device),
             side_info: self.side_info.to_device(device),
             values: self.values.to_device(device),
@@ -406,6 +450,7 @@ where
         let mut side_info_data = vec![0i32; batch_size * side_info_len];
         let mut values_data = vec![0.0f32; batch_size * 3];
         let mut time_usages_data = vec![0.0f32; batch_size];
+        let mut time_usage_mask_data = vec![0.0f32; batch_size];
         let mut global_features_data = vec![0.0f32; batch_size * NUM_GLOBALS];
         let mut value_weights_data = vec![0.0f32; batch_size];
         let mut material_imbalance_data = vec![0.0f32; batch_size];
@@ -439,6 +484,13 @@ where
 
             time_usages_data[i] =
                 item.time_used_for_move as f32 / item.global_features.time_remaining_self as f32;
+            // Without clock context the time-spent target is unlearnable —
+            // don't let it push gradients.
+            time_usage_mask_data[i] = if item.global_features.clock_missing {
+                0.0
+            } else {
+                1.0
+            };
 
             let global_offset = i * NUM_GLOBALS;
             let global_features_internal = item.global_features.to_internal(
@@ -529,10 +581,14 @@ where
         )
         .reshape([batch_size, LEGAL_MOVES]);
 
+        let time_usage_mask =
+            Tensor::<B, 1>::from_data(TensorData::from(time_usage_mask_data.as_slice()), device);
+
         ChessBatch {
             board_input,
             move_distributions,
             time_usages,
+            time_usage_mask,
             legal_moves,
             side_info,
             values,

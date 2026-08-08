@@ -76,6 +76,8 @@ mod tests {
             is_puzzle: chess_item.is_puzzle,
             is_in_check: chess_item.global_features.is_in_check,
             total_pieces: chess_item.global_features.total_pieces,
+            clock_missing: chess_item.global_features.clock_missing,
+            history_missing: chess_item.global_features.history_missing,
         };
 
         // Create inference engine to use the extracted method
