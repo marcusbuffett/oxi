@@ -13,7 +13,9 @@ every device we run on:
 Do **not** use `backend-cuda`, `backend-wgpu`, `backend-metal`, `backend-candle`,
 or `backend-ndarray`. Re-tested 2026-08-08 on an H100: `backend-cuda` and
 `backend-candle-cuda` now *build* (burn tracks main), but burn-cuda crashes at
-runtime in CubeCL's matmul autotuner on our shapes. tch remains the backend.
+runtime in CubeCL's matmul autotuner on our shapes, and candle-cuda trains
+with broken numerics (loss pinned at 10.0, top1 ~random). tch remains the
+backend.
 Plain `cargo build` / `cargo run` now pulls in `backend-tch`; for training add
 `--features train` (so: `cargo run --release --features train -- train ...`).
 
