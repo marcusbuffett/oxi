@@ -441,13 +441,13 @@ fn default_ema_eval_games() -> usize {
     200
 }
 fn default_aux_loss_weight() -> f32 {
-    0.06 // Was 0.04; increased to strengthen trunk-level auxiliary supervision signal
+    0.0 // Policy-only standard; research runs opt in via --aux-loss-weight
 }
 fn default_calibration_loss_weight() -> f32 {
-    0.10
+    0.0 // Policy-only standard; needs --calibration-db-path anyway
 }
 fn default_policy_regret_loss_weight() -> f32 {
-    0.01
+    0.0 // Policy-only standard
 }
 fn default_policy_regret_ref_cp() -> f32 {
     // Steady-state hinge is ~18-36cp, so 50 leaves converged training untouched
@@ -1276,9 +1276,12 @@ impl Default for Config {
             adamw_base_lr: default_adamw_base_lr(),
             embedding_base_lr: default_embedding_base_lr(),
             warmup_fraction: default_warmup_fraction(),
-            policy_loss_weight: 0.30,
+            // Policy-only is the standard training recipe: aux/value/regret
+            // heads measurably interfere with policy learning, which is the
+            // product target. Research runs opt back in via flags.
+            policy_loss_weight: 1.0,
             policy_label_smoothing: 0.0,
-            value_loss_weight: 0.10,
+            value_loss_weight: 0.0,
             value_entropy_weight: 0.0,
             // ~30M params (was 192/8/6 at ~9.7M). num_heads keeps head_dim at 32;
             // base LRs are defined at LR_REFERENCE_DIM=256 and μP-scaled to this width.
