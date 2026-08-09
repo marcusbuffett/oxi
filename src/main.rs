@@ -122,6 +122,9 @@ enum Commands {
     /// Move-matching accuracy on the Allie test set (Zhang et al., ICLR 2025),
     /// directly comparable to the paper's Allie/Maia numbers
     EvaluateAllie(AllieEvalCli),
+    /// Sweep fixed EPDs across conditioned Elo values, dumping move
+    /// distributions per (position, elo) — rating-sensitivity measurement.
+    ProbeEloSweep(EloProbeCli),
 
     /// Measure how much a trained checkpoint relies on each hand-crafted
     /// input feature by zeroing channel groups at inference time (no
@@ -625,6 +628,80 @@ fn resolve_tch_device(device: Option<&str>) -> Result<burn_tch::LibTorchDevice> 
             }
         }
     })
+}
+
+#[derive(Parser, Debug)]
+struct EloProbeCli {
+    /// Model directory (containing model.mpk and params.json)
+    #[arg(long)]
+    model_dir: PathBuf,
+
+    /// File with one EPD per line (text after a '|' is ignored)
+    #[arg(long)]
+    epds: PathBuf,
+
+    /// Comma-separated conditioned Elo values
+    #[arg(long, default_value = "800,1200,1600,2000,2400")]
+    elos: String,
+
+    /// Moves to record per (position, elo)
+    #[arg(long, default_value = "5")]
+    top_n: usize,
+
+    /// Output JSONL path
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Feed legacy fake-clock metadata instead of missing indicators
+    /// (for models trained before clock_missing/history_missing existed)
+    #[arg(long, default_value = "false")]
+    legacy_metadata: bool,
+
+    /// Device: cpu, mps, or cuda
+    #[arg(long)]
+    device: Option<String>,
+}
+
+#[cfg(not(feature = "backend-tch"))]
+fn probe_elo_sweep_command(_cli: &EloProbeCli) -> Result<()> {
+    anyhow::bail!("probe-elo-sweep requires the backend-tch feature")
+}
+
+#[cfg(feature = "backend-tch")]
+fn probe_elo_sweep_command(cli: &EloProbeCli) -> Result<()> {
+    use oxi::elo_probe::{run_elo_probe, EloProbeParams};
+
+    type EvalBackend = burn::backend::LibTorch<f32>;
+    let device = resolve_tch_device(cli.device.as_deref())?;
+
+    let config = load_config_from_model_dir(&cli.model_dir)?;
+    let _ = set_global_config(config.clone());
+    let engine = InferenceEngine::<EvalBackend>::from_checkpoint(
+        &cli.model_dir.join("model"),
+        config,
+        device,
+    )?;
+
+    let elos: Vec<i32> = cli
+        .elos
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid elo {s:?}: {e}"))
+        })
+        .collect::<Result<_>>()?;
+
+    run_elo_probe(
+        &engine,
+        &EloProbeParams {
+            epds: cli.epds.clone(),
+            elos,
+            top_n: cli.top_n,
+            out: cli.out.clone(),
+            legacy_metadata: cli.legacy_metadata,
+        },
+    )
 }
 
 #[cfg(feature = "backend-tch")]
@@ -1367,6 +1444,7 @@ async fn main() -> Result<()> {
 
         Commands::ComputeWhitening(config) => compute_whitening_command(&config),
         Commands::EvaluateAllie(config) => evaluate_allie_command(&config),
+        Commands::ProbeEloSweep(config) => probe_elo_sweep_command(&config),
         Commands::FeatureAblation(config) => feature_ablation_command(&config),
         Commands::CreateCalibrationDb(config) => {
             println!("Creating calibration DB...");

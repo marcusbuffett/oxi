@@ -3,6 +3,7 @@ pub mod calibration;
 pub mod config;
 pub mod constants;
 pub mod distribution_utils;
+pub mod elo_probe;
 pub mod encoding;
 pub mod eval_dataset;
 pub mod factorized_policy;
