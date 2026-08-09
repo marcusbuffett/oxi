@@ -1166,6 +1166,101 @@ fn open_pgn_file(path: &std::path::Path) -> Result<Box<dyn std::io::Read>> {
     Ok(reader)
 }
 
+/// Parallel streaming variant of [`process_pgn_directory_iter`]: shards the
+/// file list round-robin across reader threads, each parsing its files
+/// sequentially into a bounded channel.
+///
+/// The sequential iterator is a training-throughput bottleneck on big runs:
+/// one thread parses months in order, and modern dumps parse at roughly half
+/// the game rate of 2022-era ones ([%clk] comments on every move), so the
+/// GPU progressively starves as the reader advances through the pool
+/// (measured: 480ms -> 920ms/iter over the first 60k iterations of the
+/// 2026-08 768/8 run). Round-robin sharding also mixes months in the shuffle
+/// buffer instead of streaming one month at a time.
+pub fn process_pgn_directory_iter_parallel(
+    dir: &std::path::Path,
+    num_threads: usize,
+) -> Result<impl Iterator<Item = ChessExample>> {
+    let pgn_files = list_pgn_files(dir)?;
+
+    if pgn_files.is_empty() {
+        tracing::info!("No PGN files found in directory: {:?}", dir);
+        println!("Warning: No PGN files found in directory: {:?}", dir);
+    }
+    let num_threads = num_threads.clamp(1, pgn_files.len().max(1));
+    tracing::info!(
+        "Found {} PGN files to process across {} reader threads",
+        pgn_files.len(),
+        num_threads
+    );
+    println!(
+        "Found {} PGN files to process in {:?} ({} reader threads)",
+        pgn_files.len(),
+        dir,
+        num_threads
+    );
+
+    // Bounded for backpressure: one entry per parsed game (~0-40 examples),
+    // so the idle-side memory cap is a few hundred MB of examples.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<ChessExample>>(4096);
+
+    for shard in 0..num_threads {
+        let files: Vec<std::path::PathBuf> = pgn_files
+            .iter()
+            .skip(shard)
+            .step_by(num_threads)
+            .cloned()
+            .collect();
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name(format!("pgn-reader-{shard}"))
+            .spawn(move || {
+                for path in files {
+                    tracing::info!("Processing PGN file: {:?}", path);
+                    let reader = match open_pgn_file(&path) {
+                        Ok(reader) => reader,
+                        Err(e) => {
+                            tracing::warn!("Failed to open file {:?}: {}", path, e);
+                            continue;
+                        }
+                    };
+                    let mut buffered = BufferedReader::new(reader);
+                    let mut visitor = PgnVisitor::with_position_counts();
+                    loop {
+                        match buffered.read_game(&mut visitor) {
+                            Ok(Some(_)) => {
+                                let examples = visitor.take_examples();
+                                if !examples.is_empty() && tx.send(examples).is_err() {
+                                    // Receiver dropped: training is done.
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                let error_str = format!("{:?}", e);
+                                if error_str.contains("incomplete frame")
+                                    || error_str.contains("UnexpectedEof")
+                                {
+                                    tracing::warn!(
+                                        "Fatal decompression error in file {:?}, skipping to next file: {:?}",
+                                        path,
+                                        e
+                                    );
+                                    break;
+                                }
+                                tracing::warn!("Error reading game: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn pgn reader thread");
+    }
+    drop(tx);
+
+    Ok(rx.into_iter().flatten())
+}
+
 /// Legacy serial processing function (kept for compatibility)
 pub fn process_pgn_directory_serial(
     dir: &std::path::Path,

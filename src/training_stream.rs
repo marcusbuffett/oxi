@@ -21,7 +21,11 @@ pub fn build_human_training_stream(
             "Setting up shared human training stream from {:?}",
             data_path
         );
-        Ok(Box::new(process_pgn_directory_iter(data_path)?))
+        // 8 reader threads: a single sequential reader can't keep a batch-512
+        // 768/8 H100 run fed once it reaches modern (slower-parsing) months.
+        Ok(Box::new(
+            crate::pgn_processor::process_pgn_directory_iter_parallel(data_path, 8)?,
+        ))
     } else {
         anyhow::bail!(
             "Human training stream requires a directory path, got file: {:?}",
