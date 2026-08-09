@@ -545,20 +545,25 @@ where
 
             fens.push(item.fen.clone());
         }
-        let board_input =
-            Tensor::<B, 1>::from_data(TensorData::from(board_data.as_slice()), device).reshape([
-                batch_size,
-                64,
-                FEATURES_PER_TOKEN,
-            ]);
+        // TensorData::new takes the Vecs by ownership — TensorData::from(&[..])
+        // would re-copy ~250MB per batch-4096 on one thread.
+        let board_input = Tensor::<B, 1>::from_data(
+            TensorData::new(board_data, [batch_size * board_elem_count]),
+            device,
+        )
+        .reshape([batch_size, 64, FEATURES_PER_TOKEN]);
 
-        let move_distributions =
-            Tensor::<B, 1>::from_data(TensorData::from(move_dist_data.as_slice()), device)
-                .reshape([batch_size, LEGAL_MOVES]);
+        let move_distributions = Tensor::<B, 1>::from_data(
+            TensorData::new(move_dist_data, [batch_size * LEGAL_MOVES]),
+            device,
+        )
+        .reshape([batch_size, LEGAL_MOVES]);
 
-        let legal_moves =
-            Tensor::<B, 1>::from_data(TensorData::from(legal_moves_data.as_slice()), device)
-                .reshape([batch_size, LEGAL_MOVES]);
+        let legal_moves = Tensor::<B, 1>::from_data(
+            TensorData::new(legal_moves_data, [batch_size * LEGAL_MOVES]),
+            device,
+        )
+        .reshape([batch_size, LEGAL_MOVES]);
 
         let side_info =
             Tensor::<B, 1, Int>::from_data(TensorData::from(side_info_data.as_slice()), device)
