@@ -457,22 +457,37 @@ where
         let mut calibration_mask_data = vec![0.0f32; batch_size];
         let mut calibration_target_cp_loss_data = vec![0.0f32; batch_size];
         let mut calibration_target_bins_data = vec![0.0f32; batch_size * RegretBin::COUNT];
-        let mut calibration_move_cp_losses_data = vec![0.0f32; batch_size * LEGAL_MOVES];
+        // The dense per-move loss buffer is batch x LEGAL_MOVES (~80MB at
+        // batch 4096) — only materialize it when some item actually carries
+        // a calibration label.
+        let has_calibration = items.iter().any(|item| item.calibration_label.is_some());
+        let mut calibration_move_cp_losses_data = if has_calibration {
+            vec![0.0f32; batch_size * LEGAL_MOVES]
+        } else {
+            Vec::new()
+        };
         let mut fens = Vec::with_capacity(batch_size);
         let config = get_global_config();
 
+        // The three big per-item copies (board + two dense [LEGAL_MOVES]
+        // rows, ~60KB/item) dominate batch assembly at large batch sizes —
+        // single-threaded they cost ~395ms of a 770ms mini iteration
+        // (batch 4096) with the GPU idle behind them. Fill them in parallel.
+        {
+            use rayon::prelude::*;
+            board_data
+                .par_chunks_mut(board_elem_count)
+                .zip(move_dist_data.par_chunks_mut(LEGAL_MOVES))
+                .zip(legal_moves_data.par_chunks_mut(LEGAL_MOVES))
+                .zip(items.par_iter())
+                .for_each(|(((board, move_dist), legal), item)| {
+                    board[..item.board_encoded.len()].copy_from_slice(&item.board_encoded);
+                    move_dist.copy_from_slice(&item.move_distribution);
+                    legal.copy_from_slice(&item.legal_moves);
+                });
+        }
+
         for (i, item) in items.iter().enumerate() {
-            let board_offset = i * board_elem_count;
-            board_data[board_offset..board_offset + item.board_encoded.len()]
-                .copy_from_slice(&item.board_encoded);
-
-            let move_offset = i * LEGAL_MOVES;
-            move_dist_data[move_offset..move_offset + LEGAL_MOVES]
-                .copy_from_slice(&item.move_distribution);
-
-            legal_moves_data[move_offset..move_offset + LEGAL_MOVES]
-                .copy_from_slice(&item.legal_moves);
-
             let side_offset = i * side_info_len;
             side_info_data[side_offset..side_offset + side_info_len]
                 .copy_from_slice(&item.side_info);
@@ -526,6 +541,7 @@ where
                 calibration_move_cp_losses_data[move_loss_offset..move_loss_offset + LEGAL_MOVES]
                     .copy_from_slice(&dense_losses);
             }
+            debug_assert!(item.calibration_label.is_none() || has_calibration);
 
             fens.push(item.fen.clone());
         }
@@ -575,11 +591,15 @@ where
             device,
         )
         .reshape([batch_size, RegretBin::COUNT]);
-        let calibration_move_cp_losses = Tensor::<B, 1>::from_data(
-            TensorData::from(calibration_move_cp_losses_data.as_slice()),
-            device,
-        )
-        .reshape([batch_size, LEGAL_MOVES]);
+        let calibration_move_cp_losses = if has_calibration {
+            Tensor::<B, 1>::from_data(
+                TensorData::from(calibration_move_cp_losses_data.as_slice()),
+                device,
+            )
+            .reshape([batch_size, LEGAL_MOVES])
+        } else {
+            Tensor::zeros([batch_size, LEGAL_MOVES], device)
+        };
 
         let time_usage_mask =
             Tensor::<B, 1>::from_data(TensorData::from(time_usage_mask_data.as_slice()), device);
