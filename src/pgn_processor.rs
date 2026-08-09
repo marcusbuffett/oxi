@@ -1181,11 +1181,20 @@ pub fn process_pgn_directory_iter_parallel(
     dir: &std::path::Path,
     num_threads: usize,
 ) -> Result<impl Iterator<Item = ChessExample>> {
-    let pgn_files = list_pgn_files(dir)?;
+    let mut pgn_files = list_pgn_files(dir)?;
 
     if pgn_files.is_empty() {
         tracing::info!("No PGN files found in directory: {:?}", dir);
         println!("Warning: No PGN files found in directory: {:?}", dir);
+    }
+    // Shuffle the traversal order per process. Readers always start at file
+    // beginnings, so a fixed (sorted) order makes every restarted process
+    // re-train on the same front slices of the same months — under chunked
+    // restart-with-resume that repeats tail-band games (keep-prob ~1.0) every
+    // chunk. A per-process shuffle starts each chunk in different months.
+    {
+        use rand::seq::SliceRandom;
+        pgn_files.shuffle(&mut rand::rng());
     }
     let num_threads = num_threads.clamp(1, pgn_files.len().max(1));
     tracing::info!(
