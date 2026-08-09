@@ -31,7 +31,7 @@ use crate::aurora_optimizer::{AuroraConfig, MuonUpdateKind};
 use crate::chess_output::ChessOutput;
 use crate::config::Config;
 
-use crate::dataset::{ChessBatcher, ChessExample, ChessItem, OXIDataset};
+use crate::dataset::{ChessBatch, ChessBatcher, ChessExample, ChessItem, OXIDataset};
 use crate::debug_prediction_monitor::DebugPredictionMonitor;
 use crate::gradient_norm_metric::{
     compute_gradient_norm_with_breakdown, GradientNormBreakdown, GradientNormInput,
@@ -439,6 +439,113 @@ fn split_items_across_devices<T: Clone>(items: &[T], num_devices: usize) -> Vec<
     result
 }
 
+struct PreparedDeviceBatch<B: Backend> {
+    device_index: usize,
+    batch: ChessBatch<B>,
+}
+
+/// One micro-batch pulled from the data pipeline and assembled into
+/// per-device ChessBatches, ready to dispatch to the device workers.
+struct PreparedBatch<B: Backend> {
+    device_batches: Vec<PreparedDeviceBatch<B>>,
+    /// All processed items, in the same order as the concatenated device
+    /// outputs (splits are contiguous chunks in device order) — the per-elo /
+    /// per-stage accuracy breakdowns index into this.
+    items: Vec<ChessItem>,
+    example_count: usize,
+    calibration_labeled_count: usize,
+    source: &'static str,
+    process_time: Duration,
+    assemble_time: Duration,
+}
+
+/// Pull the next micro-batch and assemble per-device batches. Returns None
+/// when the data stream is exhausted. Pure CPU — the training loop calls this
+/// on the main thread right after dispatching the previous batch, so sampling,
+/// example processing, and batch assembly all overlap the workers'
+/// forward/backward instead of serializing with it.
+fn prepare_next_batch<B, I>(
+    pretrain_batch_iter: &mut std::vec::IntoIter<Vec<ChessExample>>,
+    shuffle_buffer: &mut ShuffleBuffer<I>,
+    rng: &mut rand::rngs::StdRng,
+    dataset_for_processing: &OXIDataset,
+    batchers: &[ChessBatcher<B>],
+    devices: &[B::Device],
+    physical_batch_size: usize,
+) -> Option<PreparedBatch<B>>
+where
+    B: AutodiffBackend,
+    B::FloatElem: From<f32>,
+    B::IntElem: From<i32>,
+    I: Iterator<Item = ChessExample>,
+{
+    loop {
+        let (batch_examples, source): (Vec<ChessExample>, &'static str) =
+            if let Some(pretrain_batch) = pretrain_batch_iter.next() {
+                // If pretrain batch is empty (e.g., last batch with 0% TCEC),
+                // fall through to shuffle_buffer
+                if pretrain_batch.is_empty() {
+                    (
+                        shuffle_buffer.sample_batch(physical_batch_size, rng),
+                        "shuffle_buffer",
+                    )
+                } else {
+                    (pretrain_batch, "pretrain")
+                }
+            } else {
+                (
+                    shuffle_buffer.sample_batch(physical_batch_size, rng),
+                    "shuffle_buffer",
+                )
+            };
+
+        if batch_examples.is_empty() {
+            return None;
+        }
+        let example_count = batch_examples.len();
+
+        let t_process = Instant::now();
+        let items_all: Vec<_> = batch_examples
+            .par_iter()
+            .filter_map(|example| dataset_for_processing.process_example(example).ok())
+            .collect();
+        let process_time = t_process.elapsed();
+
+        if items_all.is_empty() {
+            // Every example in this draw failed processing — try the next draw.
+            continue;
+        }
+
+        let calibration_labeled_count = items_all
+            .iter()
+            .filter(|item| item.calibration_label.is_some())
+            .count();
+
+        let t_assemble = Instant::now();
+        let device_splits = split_items_across_devices(&items_all, devices.len());
+        let device_batches: Vec<PreparedDeviceBatch<B>> = device_splits
+            .into_iter()
+            .enumerate()
+            .filter(|(_, items)| !items.is_empty())
+            .map(|(device_index, items)| PreparedDeviceBatch {
+                device_index,
+                batch: batchers[device_index].batch(items, &devices[device_index]),
+            })
+            .collect();
+        let assemble_time = t_assemble.elapsed();
+
+        return Some(PreparedBatch {
+            device_batches,
+            items: items_all,
+            example_count,
+            calibration_labeled_count,
+            source,
+            process_time,
+            assemble_time,
+        });
+    }
+}
+
 /// Static per-task loss weights from config.
 #[derive(Clone, Copy)]
 struct LossWeights {
@@ -748,8 +855,11 @@ fn combine_outputs<B: Backend>(outputs: &[ChessOutput<B>], device: &B::Device) -
     .detach()
 }
 
-struct WorkerRequest {
-    items: Vec<ChessItem>,
+struct WorkerRequest<B: Backend> {
+    /// Pre-assembled batch. Assembly is pure CPU (~40-100ms) and happens on
+    /// the main thread while the workers run forward/backward on the previous
+    /// batch, so the GPU never waits on it.
+    batch: ChessBatch<B>,
     weights: LossWeights,
 }
 
@@ -767,7 +877,7 @@ where
     B::FloatElem: From<f32>,
     B::IntElem: From<i32>,
 {
-    Run(WorkerRequest),
+    Run(WorkerRequest<B>),
     UpdateModel(ModelRecord<B>),
     Terminate,
 }
@@ -793,22 +903,13 @@ where
         let (response_tx, response_rx) = mpsc::channel::<WorkerResponse<B>>();
 
         let handle = thread::spawn(move || {
-            let batcher = ChessBatcher::<B>::new(device.clone());
             let mut model = initial_model;
 
             while let Ok(command) = command_rx.recv() {
                 match command {
                     WorkerCommand::Run(request) => {
-                        if request.items.is_empty() {
-                            continue;
-                        }
-
-                        let t_batch_start = Instant::now();
-                        let batch = batcher.batch(request.items, &device);
-                        let batch_time = t_batch_start.elapsed();
-
                         let t_transfer_start = Instant::now();
-                        let batch = batch.to_device(&device);
+                        let batch = request.batch.to_device(&device);
                         let transfer_time = t_transfer_start.elapsed();
 
                         let t_forward_start = Instant::now();
@@ -823,8 +924,7 @@ where
                         let backward_time = t_backward_start.elapsed();
 
                         tracing::info!(
-                            "perf_timing: batch={:?} transfer={:?} forward={:?} backward={:?}",
-                            batch_time,
+                            "perf_timing: transfer={:?} forward={:?} backward={:?}",
                             transfer_time,
                             forward_time,
                             backward_time
@@ -979,11 +1079,20 @@ impl<I: Iterator<Item = ChessExample>> ShuffleBuffer<I> {
             return Vec::new();
         }
 
-        if self.shuffle_enabled {
-            self.buffer.shuffle(rng);
-        }
         let take_count = batch_size.min(self.buffer.len());
-        self.buffer.drain(..take_count).collect()
+        if self.shuffle_enabled {
+            // Uniform sample without replacement in O(batch) via swap_remove.
+            // Shuffling the whole buffer (100k examples) and draining the front
+            // was O(buffer) of main-thread work per batch.
+            let mut sampled = Vec::with_capacity(take_count);
+            for _ in 0..take_count {
+                let idx = rng.random_range(0..self.buffer.len());
+                sampled.push(self.buffer.swap_remove(idx));
+            }
+            sampled
+        } else {
+            self.buffer.drain(..take_count).collect()
+        }
     }
 
     fn len(&self) -> usize {
@@ -2024,6 +2133,10 @@ where
             OXIDataset::new(Vec::new(), config.clone()).with_metadata_dropout(true);
         let main_device = devices[0].clone();
         let device_workers = DeviceWorkers::<B>::new(&model, &devices, &main_device);
+        let batchers: Vec<ChessBatcher<B>> = devices
+            .iter()
+            .map(|device| ChessBatcher::new(device.clone()))
+            .collect();
 
         let mut best_loss = f64::MAX;
         let mut diverged = false;
@@ -2070,10 +2183,11 @@ where
                     if device_items.is_empty() {
                         continue;
                     }
+                    let batch = batchers[device_index].batch(device_items, &devices[device_index]);
                     device_workers
                         .get(device_index)
                         .send(WorkerCommand::Run(WorkerRequest {
-                            items: device_items,
+                            batch,
                             weights: loss_weights,
                         }));
                     active_workers_rf.push(device_index);
@@ -2313,6 +2427,25 @@ where
         shuffle_buffer.len()
     );
 
+    let batchers: Vec<ChessBatcher<B>> = devices
+        .iter()
+        .map(|device| ChessBatcher::new(device.clone()))
+        .collect();
+
+    // One batch of lookahead: the batch for iteration N is assembled during
+    // iteration N-1's forward/backward. Dispatch always happens after the
+    // optimizer step + model broadcast of the previous iteration, so workers
+    // never compute on stale weights.
+    let mut pending_batch = prepare_next_batch(
+        &mut pretrain_batch_iter,
+        &mut shuffle_buffer,
+        &mut rng,
+        &dataset_for_processing,
+        &batchers,
+        &devices,
+        config.physical_batch_size,
+    );
+
     loop {
         let loop_iteration = iteration + 1;
         tracing::debug!(
@@ -2362,61 +2495,32 @@ where
 
         let t_full_iteration_start = Instant::now();
 
-        let (batch_examples, batch_source): (Vec<ChessExample>, &str) =
-            if let Some(pretrain_batch) = pretrain_batch_iter.next() {
-                // If pretrain batch is empty (e.g., last batch with 0% TCEC), fall through to shuffle_buffer
-                if pretrain_batch.is_empty() {
-                    (
-                        shuffle_buffer.sample_batch(config.physical_batch_size, &mut rng),
-                        "shuffle_buffer",
-                    )
-                } else {
-                    (pretrain_batch, "pretrain")
-                }
-            } else {
-                (
-                    shuffle_buffer.sample_batch(config.physical_batch_size, &mut rng),
-                    "shuffle_buffer",
-                )
-            };
-
-        if batch_examples.is_empty() {
+        let Some(prepared) = pending_batch.take() else {
             println!(
-                "Training stopped: data exhausted (source: {}, shuffle_buffer len: {}, exhausted: {})",
-                batch_source,
+                "Training stopped: data exhausted (shuffle_buffer len: {}, exhausted: {})",
                 shuffle_buffer.len(),
                 shuffle_buffer.is_exhausted()
             );
             tracing::info!(
-                "EXIT_CONDITION: data_exhausted at iteration {} (source={}, buffer_len={}, buffer_exhausted={})",
-                loop_iteration, batch_source, shuffle_buffer.len(), shuffle_buffer.is_exhausted()
+                "EXIT_CONDITION: data_exhausted at iteration {} (buffer_len={}, buffer_exhausted={})",
+                loop_iteration, shuffle_buffer.len(), shuffle_buffer.is_exhausted()
             );
             break;
-        }
+        };
 
         iteration += 1;
         tracing::info!(
             "Starting iteration {} with {} examples from {}",
             iteration,
-            batch_examples.len(),
-            batch_source
+            prepared.example_count,
+            prepared.source
         );
 
-        let t_process_start = Instant::now();
-        let items_all: Vec<_> = batch_examples
-            .par_iter()
-            .filter_map(|example| dataset_for_processing.process_example(example).ok())
-            .collect();
-        let process_time = t_process_start.elapsed();
+        let process_time = prepared.process_time;
+        let assemble_time = prepared.assemble_time;
+        let calibration_labeled_count = prepared.calibration_labeled_count;
+        let items_all = prepared.items;
 
-        if items_all.is_empty() {
-            continue;
-        }
-
-        let calibration_labeled_count = items_all
-            .iter()
-            .filter(|item| item.calibration_label.is_some())
-            .count();
         if iteration < 20 || iteration % 100 == 0 || calibration_labeled_count == 0 {
             tracing::info!(
                 "calibration_batch_stats: iter={} batch_size={} labeled={} unlabeled={} labeled_fraction={:.4}",
@@ -2431,25 +2535,31 @@ where
         let current_batch_size = items_all.len();
         items_processed += current_batch_size;
 
-        // Split batch across devices for parallel execution
-        let device_splits = split_items_across_devices(&items_all, devices.len());
         let mut active_workers = Vec::new();
-
-        for (device_index, device_items) in device_splits.into_iter().enumerate() {
-            if device_items.is_empty() {
-                continue;
-            }
-
-            let request = WorkerRequest {
-                items: device_items,
-                weights: loss_weights,
-            };
-
+        for device_batch in prepared.device_batches {
             device_workers
-                .get(device_index)
-                .send(WorkerCommand::Run(request));
-            active_workers.push(device_index);
+                .get(device_batch.device_index)
+                .send(WorkerCommand::Run(WorkerRequest {
+                    batch: device_batch.batch,
+                    weights: loss_weights,
+                }));
+            active_workers.push(device_batch.device_index);
         }
+
+        // Assemble the next batch while the workers run this one — this is
+        // where the CPU-side pipeline (sampling, example processing, batch
+        // assembly) hides behind GPU compute.
+        let t_prefetch_start = Instant::now();
+        pending_batch = prepare_next_batch(
+            &mut pretrain_batch_iter,
+            &mut shuffle_buffer,
+            &mut rng,
+            &dataset_for_processing,
+            &batchers,
+            &devices,
+            config.physical_batch_size,
+        );
+        let prefetch_time = t_prefetch_start.elapsed();
 
         let mut device_outputs: Vec<ChessOutput<B>> = Vec::new();
 
@@ -2485,9 +2595,11 @@ where
         let sync_time = t_sync_start.elapsed();
 
         tracing::info!(
-            "perf_main_loop: iter={} process_examples={:?} worker_wait={:?} combine={:?} sync={:?}",
+            "perf_main_loop: iter={} process_examples={:?} assemble={:?} prefetch_next={:?} worker_wait={:?} combine={:?} sync={:?}",
             iteration,
             process_time,
+            assemble_time,
+            prefetch_time,
             worker_wait_time,
             combine_time,
             sync_time
