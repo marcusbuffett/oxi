@@ -447,10 +447,17 @@ impl<'a, B: AutodiffBackend> ModuleVisitor<B> for L2PenaltyVisitor<'a, B> {
                 optimizer: OptimizerType::AdamW,
             });
 
-        // Only accumulate norm for parameters in the decay group
+        // Only accumulate norm for parameters in the decay group.
+        //
+        // Compute on the inner backend: doing this on the autodiff tensor
+        // registers op nodes in a graph that never runs backward, and burn
+        // never reaps orphan nodes whose graph still holds a referenced root —
+        // the registry grows forever and backward() (which sweeps the global
+        // registry every call) slows down linearly over the life of the
+        // process. See the 2026-08 backward-time-creep investigation.
         if group.decay == WeightDecayGroup::Decay {
             let norm_sq = tensor
-                .clone()
+                .inner()
                 .powi_scalar(2)
                 .sum()
                 .to_data()
