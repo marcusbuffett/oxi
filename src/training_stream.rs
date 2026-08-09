@@ -21,10 +21,17 @@ pub fn build_human_training_stream(
             "Setting up shared human training stream from {:?}",
             data_path
         );
-        // 8 reader threads: a single sequential reader can't keep a batch-512
-        // 768/8 H100 run fed once it reaches modern (slower-parsing) months.
+        // Parallel readers: a single sequential reader can't keep a batch-512
+        // 768/8 H100 run fed once it reaches modern (slower-parsing) months,
+        // and the mini at batch 4096 needs ~5x more samples/s than that.
+        // Default 8 suits the full model; OXI_PGN_READER_THREADS overrides
+        // (the mini needs ~20 on a 26-core box).
+        let reader_threads = std::env::var("OXI_PGN_READER_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
         Ok(Box::new(
-            crate::pgn_processor::process_pgn_directory_iter_parallel(data_path, 8)?,
+            crate::pgn_processor::process_pgn_directory_iter_parallel(data_path, reader_threads)?,
         ))
     } else {
         anyhow::bail!(
