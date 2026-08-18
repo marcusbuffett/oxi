@@ -212,7 +212,7 @@ pub struct OxiPrediction {
     pub time_usage: TimeUsagePrediction,
 }
 
-/// Position + per-square trunk embeddings, pulled to CPU.
+/// Position embedding plus optional per-square trunk embeddings, pulled to CPU.
 ///
 /// Captured from the encoder trunk path via `forward_with_attention_and_trunk`.
 /// `embedding` is the L2-normalized mean-pooled trunk (optionally whitened)
@@ -230,7 +230,8 @@ pub struct EmbeddingOutput {
     /// Position embedding, shape `[embed_dim]`.
     pub embedding: Vec<f32>,
     /// Per-square embeddings in absolute frame, shape `[64, embed_dim]` flattened
-    /// row-major. `per_square[sq * embed_dim + d]`.
+    /// row-major. `per_square[sq * embed_dim + d]`. Empty on the hot
+    /// embedding-only path; populated by the attention/debug path.
     pub per_square: Vec<f32>,
     pub embed_dim: usize,
 }
@@ -1034,6 +1035,83 @@ where
         Ok(out)
     }
 
+    /// Batched embedding-only inference for the serving hot path.
+    ///
+    /// Runs only the encoder trunk: no policy/value/time heads, legal-move
+    /// masks, softmax, or top-k post-processing. Mean pooling and L2
+    /// normalization stay on the backend device, so only `[batch, embed_dim]`
+    /// crosses to the CPU. The `OxiPrediction` half of the return value is a
+    /// wire-compatibility shell with no moves; embedding callers ignore it.
+    /// Per-square embeddings are intentionally omitted.
+    pub fn predict_embeddings_only_batch(
+        &self,
+        items: &[BatchItem],
+    ) -> anyhow::Result<Vec<(OxiPrediction, EmbeddingOutput)>>
+    where
+        B::FloatElem: From<f32>,
+    {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (batched_board, batched_globals, _flipped_currents, _is_black_to_move_flags, n) =
+            self.build_batched_inputs(items)?;
+
+        let trunk = self.model.forward_trunk(batched_board, batched_globals);
+
+        let trunk_dims = trunk.dims();
+        debug_assert_eq!(trunk_dims[0], n);
+        debug_assert_eq!(trunk_dims[1], 64);
+        let embed_dim = trunk_dims[2];
+        let pooled = trunk.mean_dim(1).reshape([n, embed_dim]);
+        let pooled_norm = pooled
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(1)
+            .sqrt()
+            .clamp_min(1e-6);
+        let normalized = pooled / pooled_norm;
+        let normalized_flat = normalized
+            .to_data()
+            .to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("Failed to convert pooled embeddings to f32: {:?}", e))?;
+        debug_assert_eq!(normalized_flat.len(), n * embed_dim);
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let row_start = i * embed_dim;
+            let normalized_embedding = &normalized_flat[row_start..row_start + embed_dim];
+            let embedding = match &self.whitening {
+                Some(whitening) => whitening.apply(normalized_embedding),
+                None => normalized_embedding.to_vec(),
+            };
+
+            out.push((
+                OxiPrediction {
+                    moves: Vec::new(),
+                    wdl: WdlPrediction {
+                        win_prob: 1.0 / 3.0,
+                        draw_prob: 1.0 / 3.0,
+                        loss_prob: 1.0 / 3.0,
+                    },
+                    time_usage: TimeUsagePrediction {
+                        alpha: 0.0,
+                        beta: 0.0,
+                        expected_fraction: 0.0,
+                        expected_seconds: 0.0,
+                    },
+                },
+                EmbeddingOutput {
+                    embedding,
+                    per_square: Vec::new(),
+                    embed_dim,
+                },
+            ));
+        }
+
+        Ok(out)
+    }
+
     /// Raw L2-normalized trunk-mean embeddings for a batch, with NO whitening
     /// applied regardless of the configured embedding source. Used by offline
     /// tooling (`compute-whitening`) that estimates whitening statistics.
@@ -1591,6 +1669,107 @@ mod tests {
         assert!(prediction.time_usage.alpha.is_finite());
         assert!(prediction.time_usage.beta.is_finite());
         assert!(prediction.time_usage.expected_fraction.is_finite());
+    }
+
+    #[test]
+    fn test_embedding_only_batch_matches_cpu_reference() {
+        let device = Device::<InferenceBackend>::default();
+        let config = Config::default();
+        let _ = crate::config::set_global_config(config.clone());
+        let model = OXIModel::<InferenceBackend>::new(&device, &config);
+        let engine = InferenceEngine::new(model, config, device);
+
+        let positions = [
+            Chess::default(),
+            san_line_to_positions(&["e4", "c5"])
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap(),
+        ];
+        let items: Vec<BatchItem> = positions
+            .into_iter()
+            .map(|position| BatchItem {
+                positions: vec![position],
+                previous_moves: Vec::new(),
+                globals: GlobalFeatures::default(),
+                temperature: 1.0,
+                top_k: 10,
+            })
+            .collect();
+
+        let cpu_reference = engine
+            .raw_trunk_mean_embeddings_batch(&items)
+            .expect("CPU-reference embedding path should succeed");
+        let embedding_only = engine
+            .predict_embeddings_only_batch(&items)
+            .expect("embedding-only path should succeed");
+
+        assert_eq!(embedding_only.len(), cpu_reference.len());
+        for ((prediction, output), expected) in embedding_only.iter().zip(cpu_reference) {
+            assert!(prediction.moves.is_empty());
+            assert!(output.per_square.is_empty());
+            assert_eq!(output.embedding.len(), expected.len());
+            let max_abs_diff = output
+                .embedding
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs_diff < 1e-4,
+                "GPU-pooled embedding differs from CPU reference by {max_abs_diff}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires OXI_TEST_MODEL_DIR checkpoint artifacts"]
+    fn test_loaded_embedding_only_batch_matches_policy_embedding() {
+        let model_dir = std::path::PathBuf::from(
+            std::env::var("OXI_TEST_MODEL_DIR").expect("set OXI_TEST_MODEL_DIR"),
+        );
+        let params = std::fs::read_to_string(model_dir.join("params.json")).unwrap();
+        let config: Config = serde_json::from_str(&params).unwrap();
+        let _ = crate::config::set_global_config(config.clone());
+        let device = Device::<InferenceBackend>::default();
+        let engine = InferenceEngine::<InferenceBackend>::from_checkpoint(
+            &model_dir.join("model.mpk"),
+            config,
+            device,
+        )
+        .expect("checkpoint should load");
+
+        let items = vec![BatchItem {
+            positions: vec![Chess::default()],
+            previous_moves: Vec::new(),
+            globals: GlobalFeatures::default(),
+            temperature: 1.0,
+            top_k: 10,
+        }];
+        let policy_embedding = engine.predict_with_embedding_batch(&items).unwrap();
+        let embedding_only = engine.predict_embeddings_only_batch(&items).unwrap();
+        let expected = &policy_embedding[0].1.embedding;
+        let actual = &embedding_only[0].1.embedding;
+        assert_eq!(actual.len(), expected.len());
+
+        let max_abs_diff = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let cosine = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| actual * expected)
+            .sum::<f32>();
+        // Device reduction order differs from the scalar CPU reference and
+        // ZCA whitening amplifies the last few ulps. Keep the bound tight
+        // enough to catch a geometry change without demanding bitwise parity.
+        assert!(
+            max_abs_diff < 3e-3 && cosine > 0.999_99,
+            "loaded embedding parity failed: max_abs_diff={max_abs_diff}, cosine={cosine}"
+        );
     }
 
     #[test]
